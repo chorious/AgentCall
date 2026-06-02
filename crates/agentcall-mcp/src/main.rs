@@ -6,7 +6,7 @@ use std::process::Command;
 
 const PROTOCOL_VERSION: &str = "2024-11-05";
 const SERVER_NAME: &str = "agentcall-mcp";
-const SERVER_VERSION: &str = "0.3.0";
+const SERVER_VERSION: &str = "0.3.1";
 
 fn main() {
     let config = match Config::from_args(env::args().skip(1).collect()) {
@@ -118,12 +118,12 @@ fn tools() -> Vec<Value> {
         }),
         json!({
             "name": "agentcall_workflow_simulate",
-            "description": "Run the small-project bounded parent/child workflow simulation.",
+            "description": "Run the small-project bounded parent/child workflow through Claude ACP by default.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "root": {"type": "string", "description": "Workspace root. Defaults to the server workspace."},
-                    "driver": {"type": "string", "enum": ["scripted", "headless-json", "acp"], "default": "scripted"},
+                    "driver": {"type": "string", "enum": ["acp", "scripted"], "default": "acp"},
                     "max_turns": {"type": "integer", "minimum": 1, "default": 1}
                 },
                 "additionalProperties": false
@@ -175,9 +175,8 @@ fn capabilities(config: &Config) -> Value {
             "driver_discovery": true
         },
         "drivers": [
-            {"kind": "scripted", "available": true, "live_model": false, "costs_tokens": false},
-            {"kind": "headless-json", "available": true, "live_model": true, "costs_tokens": true},
-            {"kind": "acp", "available": true, "live_model": true, "costs_tokens": true}
+            {"kind": "acp", "available": true, "live_model": true, "costs_tokens": true, "default": true, "transport": "stdio-json-rpc"},
+            {"kind": "scripted", "available": true, "live_model": false, "costs_tokens": false, "test_only": true}
         ],
         "tools": [
             "agentcall_capabilities",
@@ -190,7 +189,7 @@ fn capabilities(config: &Config) -> Value {
 
 fn workflow_simulate(config: &Config, args: Value) -> Result<Value, String> {
     let root = root_from_args(config, &args);
-    let driver = args.get("driver").and_then(Value::as_str).unwrap_or("scripted");
+    let driver = args.get("driver").and_then(Value::as_str).unwrap_or("acp");
     let max_turns = args.get("max_turns").and_then(Value::as_i64).unwrap_or(1).to_string();
     let output = run_agentcall(
         config,

@@ -305,6 +305,7 @@ def test_v2_acp_driver_reads_structured_report_from_stdio_agent(tmp_path):
             def send(message):
                 print(json.dumps(message), flush=True)
 
+            current_mode = "execute"
             for line in sys.stdin:
                 msg = json.loads(line)
                 method = msg.get("method")
@@ -333,6 +334,7 @@ def test_v2_acp_driver_reads_structured_report_from_stdio_agent(tmp_path):
                             "update": {"sessionUpdate": "current_mode_update", "modeId": msg["params"]["modeId"]}
                         }
                     })
+                    current_mode = msg["params"]["modeId"]
                     send({"jsonrpc": "2.0", "id": req_id, "result": {}})
                 elif method == "session/prompt":
                     send({
@@ -356,12 +358,12 @@ def test_v2_acp_driver_reads_structured_report_from_stdio_agent(tmp_path):
                         "agent": "fake-acp",
                         "status": "done",
                         "summary": "ACP fake completed one bounded lifecycle.",
-                        "changed_files": ["mini_project/calculator.py"],
-                        "commands_run": ["pytest"],
-                        "tests": ["pytest passed"],
+                        "changed_files": [] if current_mode == "plan" else ["mini_project/calculator.py"],
+                        "commands_run": [] if current_mode == "plan" else ["pytest"],
+                        "tests": ["plan mode returned no file changes"] if current_mode == "plan" else ["pytest passed"],
                         "risks": [],
                         "open_questions": [],
-                        "next_recommended_action": "accept",
+                        "next_recommended_action": "execute approved plan" if current_mode == "plan" else "accept",
                         "turns_used": 1,
                         "metadata": {}
                     }
@@ -394,5 +396,6 @@ def test_v2_acp_driver_reads_structured_report_from_stdio_agent(tmp_path):
 
     assert outcome.accepted is True
     assert len(outcome.reports) == 2
-    assert all(report.agent == "fake-acp" for report in outcome.reports)
+    assert outcome.reports[0].changed_files == []
+    assert all(report.agent == "claude-acp" for report in outcome.reports)
     assert all(report.metadata["stopReason"] == "end_turn" for report in outcome.reports)

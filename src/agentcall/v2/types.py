@@ -47,6 +47,31 @@ class ChildCallSpec:
     def to_prompt(self) -> str:
         allowed = "\n".join(f"- {item}" for item in self.allowed_paths) or "- Entire workspace"
         criteria = "\n".join(f"- {item}" for item in self.acceptance_criteria) or "- Produce a valid report"
+        mode_rules = ""
+        if self.mode == ChildMode.PLAN:
+            mode_rules = (
+                "## Mode Rules\n\n"
+                "- This is PLAN mode.\n"
+                "- Do not modify files.\n"
+                "- Do not run commands that change files.\n"
+                "- In the report, `changed_files` must be an empty array.\n"
+                "- `commands_run` and `tests` must describe only checks actually performed.\n"
+                "- If you need execution, set `next_recommended_action` to `execute approved plan`.\n\n"
+            )
+        elif self.mode == ChildMode.EXECUTE:
+            mode_rules = (
+                "## Mode Rules\n\n"
+                "- This is EXECUTE mode.\n"
+                "- Make only the scoped changes needed to satisfy the acceptance criteria.\n"
+                "- `changed_files` must list only files actually changed in this lifecycle.\n\n"
+            )
+        elif self.mode == ChildMode.REVIEW:
+            mode_rules = (
+                "## Mode Rules\n\n"
+                "- This is REVIEW mode.\n"
+                "- Do not modify files.\n"
+                "- Return findings only when revision or blocker handling is needed.\n\n"
+            )
         return (
             f"# AgentCall Child Invocation: {self.call_id}\n\n"
             f"Task: `{self.task_id}`\n"
@@ -60,6 +85,7 @@ class ChildCallSpec:
             f"{allowed}\n\n"
             "## Acceptance Criteria\n\n"
             f"{criteria}\n\n"
+            f"{mode_rules}"
             "## Required Report Contract\n\n"
             "Return exactly one structured report with status, summary, changed_files, "
             "commands_run, tests, risks, open_questions, and next_recommended_action. "

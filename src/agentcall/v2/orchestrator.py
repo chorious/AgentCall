@@ -50,6 +50,8 @@ class ParentOrchestrator:
         )
         reports.append(plan)
         plan_findings = self._validate(plan, allowed_paths=(), max_turns=max_turns)
+        if plan.changed_files:
+            plan_findings.append("planner reported changed_files; plan mode must not modify files")
         if plan_findings:
             return self._fail(task.id, reports, plan_findings, event_type="parent.plan_rejected")
 

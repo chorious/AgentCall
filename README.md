@@ -2,7 +2,7 @@
 
 AgentCall is an orchestration layer for supervising coding agents through bounded child lifecycles, structured reports, feedback gates, and process-aware delegation.
 
-The first version proved an SOP loop in one shared workspace. The v2 direction is protocol-first: a parent process owns project context, calls bounded child agents through drivers such as Claude ACP/SDK, requires a report at the end of every child lifecycle, and accepts clean work without ceremonial reviews.
+The first version proved an SOP loop in one shared workspace. The v2 direction is protocol-first: a parent process owns project context, calls bounded child agents through Claude ACP/SDK-style drivers, requires a report at the end of every child lifecycle, and accepts clean work without ceremonial reviews.
 
 ## v2.0 Direction
 
@@ -24,22 +24,22 @@ python -m agentcall --root .agentcall-demo workflow inspect task-0001
 
 The simulation creates a tiny calculator project under `.agentcall-demo/.agentcall/simulations/`, runs a planner child, runs an executor child, validates the report and allowed scope, then records parent acceptance without writing `review.md`.
 
-The ACP path is now represented by a tested stdio JSON-RPC driver boundary. The
-simulation uses a deterministic child driver; live Claude ACP execution is the
-next integration step.
+The default live path is Claude ACP over stdio JSON-RPC. A deterministic
+`scripted` driver remains available for free smoke tests.
 
 Driver choices:
 
 ```powershell
 python -m agentcall --root .agentcall-demo workflow simulate --driver scripted
-python -m agentcall --root .agentcall-demo workflow simulate --driver headless-json
 python -m agentcall --root .agentcall-demo workflow simulate --driver acp
 ```
 
-`scripted` is deterministic and free. `headless-json` and `acp` are live Claude
-paths and should be used only when you intend to spend a bounded child lifecycle.
+`scripted` is deterministic and free. `acp` launches
+`@agentclientprotocol/claude-agent-acp` and should be used only when you intend
+to spend a bounded child lifecycle. The MCP surface does not advertise the
+legacy `claude -p` path.
 
-## v3.0 MCP Surface
+## v3.1 MCP Surface
 
 AgentCall now includes a Rust MCP server so other processes can discover and
 call the v2 runtime:
@@ -124,7 +124,7 @@ Invoke-RestMethod `
 
 The Rust daemon streams PTY bytes over a WebSocket, and the browser renders them
 with xterm.js. This remains useful for attach/debug/fallback work. The v2 runtime
-focus is protocol-first child orchestration through ACP/SDK/headless drivers.
+focus is protocol-first child orchestration through ACP/SDK-style drivers.
 
 ## Directory Layout
 

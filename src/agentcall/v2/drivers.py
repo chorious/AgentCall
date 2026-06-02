@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import json
+import os
 import re
+import shutil
 import subprocess
 from collections.abc import Callable
 from pathlib import Path
@@ -41,7 +43,7 @@ class AcpClaudeDriver:
     name = "claude-acp"
 
     def __init__(self, command: list[str] | None = None, timeout_seconds: int = 900) -> None:
-        self.command = command or ["npx", "-y", "@agentclientprotocol/claude-agent-acp"]
+        self.command = resolve_command(command or ["npx", "-y", "@agentclientprotocol/claude-agent-acp"])
         self.timeout_seconds = timeout_seconds
 
     def command_line(self) -> list[str]:
@@ -87,7 +89,7 @@ class AcpClaudeDriver:
             )
         data.setdefault("task_id", spec.task_id)
         data.setdefault("call_id", spec.call_id)
-        data.setdefault("agent", self.name)
+        data["agent"] = self.name
         data.setdefault("metadata", {})
         data["metadata"].setdefault("stopReason", result.stop_reason)
         data["metadata"].setdefault("acpUpdates", len(result.updates))
@@ -167,7 +169,7 @@ class HeadlessJsonClaudeDriver:
             )
         data.setdefault("task_id", spec.task_id)
         data.setdefault("call_id", spec.call_id)
-        data.setdefault("agent", self.name)
+        data["agent"] = self.name
         data.setdefault("metadata", {})
         validation = validate_report_dict(data)
         if not validation.ok:
@@ -195,3 +197,19 @@ def extract_json_object(text: str) -> dict[str, Any]:
     if not isinstance(data, dict):
         raise ValueError("JSON report must be an object")
     return data
+
+
+def resolve_command(command: list[str]) -> list[str]:
+    if not command:
+        return command
+    executable = command[0]
+    if os.path.isabs(executable) or any(sep in executable for sep in ("\\", "/")):
+        return command
+    candidates = [executable]
+    if os.name == "nt":
+        candidates = [executable, f"{executable}.cmd", f"{executable}.exe", f"{executable}.ps1"]
+    for candidate in candidates:
+        resolved = shutil.which(candidate)
+        if resolved:
+            return [resolved, *command[1:]]
+    return command
