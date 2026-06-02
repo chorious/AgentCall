@@ -1,12 +1,14 @@
-# Session Supervisor
+# Session Supervisor Archive
 
-AgentCall can now start and supervise a named PTY session, similar to a tiny
-workspace-local tmux pane. The important difference from the failed window
-injection route is ownership: AgentCall creates the PTY process, so it can write
-stdin, capture output, and keep process metadata from the start.
+This is a v1.0 archive note. AgentCall can start and supervise a named PTY
+session, similar to a tiny workspace-local tmux pane. The important difference
+from the failed window injection route is ownership: AgentCall creates the PTY
+process, so it can write stdin, capture output, and keep process metadata from
+the start.
 
-This is the preferred first-version control plane for visible or semi-visible
-CLI agents when `claude -p` is too opaque.
+This is no longer the short-term v2 development direction. v2 is protocol-first:
+bounded child lifecycles, ACP/SDK/headless drivers, structured reports, and
+parent validation. PTY remains useful for attach/debug/fallback scenarios.
 
 ## Commands
 

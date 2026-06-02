@@ -1,11 +1,16 @@
 # AgentAPI Adapter
 
-AgentAPI is the most practical first control plane for AgentCall version 1.
-It starts Claude Code inside a PTY and exposes HTTP endpoints for sending
-messages, reading status, and observing terminal output.
+This is a v1.0 archive note. AgentAPI was the most practical first control
+plane for AgentCall version 1. It starts Claude Code inside a PTY and exposes
+HTTP endpoints for sending messages, reading status, and observing terminal
+output.
 
 This avoids the failed route of injecting input into an already-open Windows
 Terminal tab.
+
+It is not the short-term v2 development direction. v2 now focuses on bounded
+parent/child lifecycles, structured reports, and protocol-first drivers such as
+Claude ACP/SDK or headless JSON.
 
 ## Install
 
@@ -207,8 +212,10 @@ report.md: written
 review.md: accepted
 ```
 
-This proves the first-version SOP path:
+This proved the first-version SOP path:
 
 ```text
 AgentCall task -> AgentAPI HTTP -> Claude PTY -> report.md -> review.md
 ```
+
+For the active v2 direction, see `docs/v2.0-architecture.md`.

@@ -1,7 +1,12 @@
-# Rust Daemon Architecture
+# Rust PTY Daemon Archive
 
-The Python PTY worker proves the control plane, but it should not be the final
-runtime. The production AgentCall daemon should be Rust-first.
+This is a v1.0 archive note for the PTY/tmux-style daemon. The Python PTY worker
+and Rust daemon prototype proved the terminal control plane, but this is no
+longer the short-term v2 development direction.
+
+The active v2 runtime is protocol-first: parent orchestration, bounded child
+lifecycles, ACP/SDK/headless drivers, structured reports, and code-owned
+validators. The PTY daemon remains a fallback for attach/debug behavior.
 
 ## Split
 

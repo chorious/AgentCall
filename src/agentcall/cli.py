@@ -9,6 +9,8 @@ from .models import ReviewDecision, TaskStatus, Worker
 from .sessions import SessionManager
 from .store import AgentCallError, Store
 from .supervisor import Supervisor
+from .v2.inspection import inspect_workflow
+from .v2.workflows import run_small_project_workflow_with_driver
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -43,6 +45,25 @@ def build_parser() -> argparse.ArgumentParser:
 
     events = sub.add_parser("events", help="Show events.")
     events.add_argument("task_id", nargs="?")
+
+    workflow = sub.add_parser("workflow", help="Run v2 bounded parent/child workflows.")
+    workflow_sub = workflow.add_subparsers(dest="workflow_command", required=True)
+    workflow_simulate = workflow_sub.add_parser("simulate", help="Run a small-project v2 lifecycle simulation.")
+    workflow_simulate.add_argument(
+        "--driver",
+        choices=["scripted", "headless-json", "acp"],
+        default="scripted",
+        help="Child driver to use. Defaults to deterministic scripted simulation.",
+    )
+    workflow_simulate.add_argument(
+        "--acp-command",
+        default=None,
+        help="ACP stdio command string. Used only with --driver acp.",
+    )
+    workflow_simulate.add_argument("--claude-bin", default="claude", help="Claude CLI path for headless-json.")
+    workflow_simulate.add_argument("--max-turns", type=int, default=1, help="Lifecycle turn limit per child call.")
+    workflow_inspect = workflow_sub.add_parser("inspect", help="Inspect a v2 workflow task.")
+    workflow_inspect.add_argument("task_id")
 
     worker = sub.add_parser("worker", help="Register and inspect external workers.")
     worker_sub = worker.add_subparsers(dest="worker_command", required=True)
@@ -104,6 +125,9 @@ def main(argv: list[str] | None = None) -> int:
 
         if args.command == "events":
             return handle_events(args, store)
+
+        if args.command == "workflow":
+            return handle_workflow(args, store)
 
         if args.command == "worker":
             return handle_worker(args, store)
@@ -203,6 +227,37 @@ def handle_events(args: argparse.Namespace, store: Store) -> int:
             bits.append(event["message"])
         print("\t".join(bits))
     return 0
+
+
+def handle_workflow(args: argparse.Namespace, store: Store) -> int:
+    if args.workflow_command == "simulate":
+        try:
+            outcome = run_small_project_workflow_with_driver(
+                store.root,
+                driver_kind=args.driver,
+                acp_command=args.acp_command,
+                claude_bin=args.claude_bin,
+                max_turns=args.max_turns,
+            )
+        except ValueError as exc:
+            raise AgentCallError(str(exc)) from exc
+        status = "accepted" if outcome.accepted else "needs_revision"
+        print(f"task_id: {outcome.task_id}")
+        print(f"status: {status}")
+        print(f"reports: {len(outcome.reports)}")
+        if outcome.findings:
+            print("findings:")
+            for finding in outcome.findings:
+                print(f"- {finding}")
+        return 0 if outcome.accepted else 1
+
+    if args.workflow_command == "inspect":
+        inspection = inspect_workflow(store, args.task_id)
+        for line in inspection.to_lines():
+            print(line)
+        return 0
+
+    raise AgentCallError(f"Unknown workflow command: {args.workflow_command}")
 
 
 def handle_worker(args: argparse.Namespace, store: Store) -> int:

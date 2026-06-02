@@ -1,8 +1,43 @@
 # AgentCall
 
-AgentCall is an orchestration layer for supervising CLI-based coding agents through task artifacts, feedback gates, and process-aware delegation.
+AgentCall is an orchestration layer for supervising coding agents through bounded child lifecycles, structured reports, feedback gates, and process-aware delegation.
 
-The first version is deliberately small: it proves an SOP loop in one shared workspace. An orchestra creates a task, starts a supervised worker process, records PID and events, captures logs, waits for a standardized report, and records acceptance or feedback.
+The first version proved an SOP loop in one shared workspace. The v2 direction is protocol-first: a parent process owns project context, calls bounded child agents through drivers such as Claude ACP/SDK, requires a report at the end of every child lifecycle, and accepts clean work without ceremonial reviews.
+
+## v2.0 Direction
+
+- Parent owns context, orchestration, validation, and task state.
+- Child agents are bounded lifecycle calls, not long-running project owners.
+- Every child call must return a structured report.
+- Reviews are delegated only when parent validation finds risk, drift, blockers, or low confidence.
+- SOP behavior moves into code: report validation, scope checks, lifecycle limits, and acceptance policy.
+- ACP/SDK is the flagship driver path.
+- PTY/tmux is parked as a v1.0 archive and fallback, not the short-term development direction.
+
+Run the current v2 simulation:
+
+```powershell
+$env:PYTHONPATH='src'
+python -m agentcall --root .agentcall-demo workflow simulate
+python -m agentcall --root .agentcall-demo workflow inspect task-0001
+```
+
+The simulation creates a tiny calculator project under `.agentcall-demo/.agentcall/simulations/`, runs a planner child, runs an executor child, validates the report and allowed scope, then records parent acceptance without writing `review.md`.
+
+The ACP path is now represented by a tested stdio JSON-RPC driver boundary. The
+simulation uses a deterministic child driver; live Claude ACP execution is the
+next integration step.
+
+Driver choices:
+
+```powershell
+python -m agentcall --root .agentcall-demo workflow simulate --driver scripted
+python -m agentcall --root .agentcall-demo workflow simulate --driver headless-json
+python -m agentcall --root .agentcall-demo workflow simulate --driver acp
+```
+
+`scripted` is deterministic and free. `headless-json` and `acp` are live Claude
+paths and should be used only when you intend to spend a bounded child lifecycle.
 
 ## v1.0 Scope
 
@@ -27,13 +62,13 @@ python -m agentcall run start task-0001 -- python -c "from pathlib import Path; 
 python -m agentcall task status task-0001
 ```
 
-For interactive agents, see `docs/session-supervisor.md`.
-For the browser-based pane prototype, run `viewer/tmux_server.py`.
-For the planned Rust runtime split, see `docs/rust-daemon-architecture.md`.
+For the archived PTY/tmux prototype, see `docs/v1.0-tmux-pty-archive.md`.
 
-## Rust Daemon MVP
+## v1.0 PTY/tmux Archive
 
-The current higher-fidelity path is the Rust daemon plus xterm.js UI:
+The Rust daemon plus xterm.js UI was the v1.0 high-fidelity prototype. It is
+kept as an archive and fallback, but it is no longer the short-term development
+direction.
 
 ```powershell
 npm install
@@ -64,10 +99,9 @@ Invoke-RestMethod `
   -Body $body
 ```
 
-The Rust daemon streams PTY bytes over a WebSocket, and the browser renders
-them with xterm.js. Keyboard input, terminal control responses, and resize
-events use the same WebSocket, so the pane behaves like a real terminal instead
-of a polling log viewer.
+The Rust daemon streams PTY bytes over a WebSocket, and the browser renders them
+with xterm.js. This remains useful for attach/debug/fallback work. The v2 runtime
+focus is protocol-first child orchestration through ACP/SDK/headless drivers.
 
 ## Directory Layout
 
