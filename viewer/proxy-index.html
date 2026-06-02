@@ -1,0 +1,118 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>AgentCall Live</title>
+  <style>
+    :root { color-scheme: dark; font-family: Segoe UI, system-ui, sans-serif; background: #101418; color: #eef2f4; }
+    body { margin: 0; height: 100vh; display: grid; grid-template-rows: auto 1fr auto; }
+    header, footer { background: #151b21; border-color: #2b323a; padding: 10px 14px; }
+    header { display: flex; gap: 14px; align-items: center; border-bottom: 1px solid #2b323a; }
+    footer { display: grid; grid-template-columns: 1fr auto auto; gap: 10px; border-top: 1px solid #2b323a; }
+    button, textarea { font: inherit; border-radius: 6px; border: 1px solid #43515f; }
+    button { background: #263441; color: #f4f7f9; padding: 8px 12px; cursor: pointer; }
+    textarea { background: #0c1116; color: #eef2f4; padding: 8px; min-height: 46px; resize: vertical; }
+    main { overflow: auto; padding: 14px; }
+    #status { color: #9fd3ff; }
+    #error { color: #ffb0a8; }
+    .message { background: #141a20; border: 1px solid #2b323a; border-radius: 6px; margin-bottom: 12px; }
+    .meta { padding: 8px 10px; border-bottom: 1px solid #2b323a; color: #b7c6d1; font-size: 13px; }
+    pre { margin: 0; padding: 10px; white-space: pre-wrap; overflow-wrap: anywhere; line-height: 1.35; max-height: 42vh; overflow: auto; }
+  </style>
+</head>
+<body>
+  <header>
+    <strong>AgentCall Live</strong>
+    <span id="status">connecting...</span>
+    <span id="error"></span>
+    <label><input id="auto" type="checkbox" checked> auto-refresh</label>
+    <button id="refresh">Refresh</button>
+  </header>
+  <main id="messages"></main>
+  <footer>
+    <textarea id="input" placeholder="Send a user message. Ctrl+Enter sends."></textarea>
+    <button id="send">Send</button>
+    <button id="approve">Approve</button>
+  </footer>
+  <script>
+    const statusEl = document.getElementById('status');
+    const errorEl = document.getElementById('error');
+    const messagesEl = document.getElementById('messages');
+    const inputEl = document.getElementById('input');
+    const autoEl = document.getElementById('auto');
+
+    async function json(path, options) {
+      const res = await fetch(path, options);
+      if (!res.ok) throw new Error(`${res.status} ${await res.text()}`);
+      return res.json();
+    }
+
+    function compact(content) {
+      if (!content) return '';
+      const lines = content.split('\n');
+      if (lines.length <= 80) return content;
+      return [
+        ...lines.slice(0, 24),
+        '',
+        `... ${lines.length - 48} lines omitted ...`,
+        '',
+        ...lines.slice(-24),
+      ].join('\n');
+    }
+
+    async function refresh() {
+      try {
+        errorEl.textContent = '';
+        const [status, messages] = await Promise.all([
+          json('/api/status'),
+          json('/api/messages'),
+        ]);
+        statusEl.textContent = `${status.agent_type} / ${status.transport} / ${status.status}`;
+        render(messages.messages || []);
+      } catch (err) {
+        errorEl.textContent = err.message;
+      }
+    }
+
+    function render(messages) {
+      messagesEl.innerHTML = '';
+      for (const msg of messages.slice(-8)) {
+        const item = document.createElement('section');
+        item.className = 'message';
+        const meta = document.createElement('div');
+        meta.className = 'meta';
+        meta.textContent = `#${msg.id} ${msg.role} ${msg.time}`;
+        const pre = document.createElement('pre');
+        pre.textContent = compact(msg.content);
+        item.append(meta, pre);
+        messagesEl.append(item);
+      }
+      messagesEl.scrollTop = messagesEl.scrollHeight;
+    }
+
+    async function post(type, content) {
+      if (!content && type === 'user') return;
+      await json('/api/message', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ type, content }),
+      });
+      inputEl.value = '';
+      await refresh();
+    }
+
+    document.getElementById('refresh').onclick = refresh;
+    document.getElementById('send').onclick = () => post('user', inputEl.value);
+    document.getElementById('approve').onclick = () => post('raw', 'y\r');
+    inputEl.addEventListener('keydown', (event) => {
+      if (event.ctrlKey && event.key === 'Enter') {
+        event.preventDefault();
+        post('user', inputEl.value);
+      }
+    });
+    setInterval(() => { if (autoEl.checked) refresh(); }, 2000);
+    refresh();
+  </script>
+</body>
+</html>

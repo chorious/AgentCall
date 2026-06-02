@@ -1,0 +1,21 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "agentcall"
+version = "0.1.0"
+description = "SOP orchestration for supervised CLI coding agents"
+readme = "README.md"
+requires-python = ">=3.11"
+authors = [{ name = "AgentCall" }]
+dependencies = []
+
+[project.scripts]
+agentcall = "agentcall.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]

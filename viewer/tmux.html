@@ -1,0 +1,389 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>AgentCall Tmux</title>
+  <style>
+    :root {
+      color-scheme: dark;
+      --bg: #070707;
+      --pane: #0c0c0c;
+      --pane-2: #111;
+      --line: #3a3a3a;
+      --soft: #8d8d8d;
+      --text: #eeeeee;
+      --accent: #ff7a59;
+      --ok: #2ee179;
+      --warn: #ffd166;
+      --bad: #ff5d73;
+    }
+
+    * {
+      box-sizing: border-box;
+    }
+
+    body {
+      margin: 0;
+      min-height: 100vh;
+      background: var(--bg);
+      color: var(--text);
+      font-family: ui-monospace, SFMono-Regular, Consolas, "Cascadia Mono", "Microsoft YaHei UI", monospace;
+      overflow: hidden;
+    }
+
+    .shell {
+      height: 100vh;
+      display: grid;
+      grid-template-rows: 38px 1fr;
+    }
+
+    .bar {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      padding: 0 12px;
+      border-bottom: 1px solid var(--line);
+      background: #151515;
+      min-width: 0;
+    }
+
+    .brand {
+      color: #fff;
+      font-weight: 700;
+      white-space: nowrap;
+    }
+
+    .tabs {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      min-width: 0;
+      overflow: hidden;
+    }
+
+    .tab {
+      border: 1px solid #444;
+      background: #222;
+      color: #ddd;
+      height: 26px;
+      padding: 0 10px;
+      font: inherit;
+      cursor: pointer;
+      max-width: 170px;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+
+    .tab.active {
+      border-color: var(--accent);
+      color: #fff;
+      background: #303030;
+    }
+
+    .grid {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      grid-template-rows: 1fr 1fr;
+      height: calc(100vh - 38px);
+      gap: 1px;
+      background: var(--line);
+    }
+
+    .pane {
+      min-width: 0;
+      min-height: 0;
+      background: var(--pane);
+      display: grid;
+      grid-template-rows: 32px 1fr 38px;
+    }
+
+    .pane-head {
+      display: flex;
+      align-items: center;
+      gap: 9px;
+      padding: 0 9px;
+      border-bottom: 1px solid #292929;
+      background: #1d1d1d;
+      min-width: 0;
+    }
+
+    .term-icon {
+      width: 15px;
+      height: 15px;
+      display: grid;
+      place-items: center;
+      background: #177ddc;
+      color: #fff;
+      font-size: 11px;
+      line-height: 1;
+    }
+
+    .pane-title {
+      font-weight: 700;
+      min-width: 0;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+
+    .spacer {
+      flex: 1;
+    }
+
+    .pid {
+      color: var(--soft);
+      font-size: 12px;
+      white-space: nowrap;
+    }
+
+    .status {
+      font-size: 12px;
+      font-weight: 700;
+      color: #111;
+      background: var(--soft);
+      padding: 2px 6px;
+    }
+
+    .status.running {
+      background: var(--ok);
+    }
+
+    .status.starting {
+      background: var(--warn);
+    }
+
+    .status.stopped {
+      background: #777;
+    }
+
+    .terminal {
+      min-height: 0;
+      overflow: auto;
+      padding: 10px 8px 12px;
+      background: #050505;
+      scrollbar-color: #777 #111;
+    }
+
+    pre {
+      margin: 0;
+      color: #e7e7e7;
+      font-size: 14px;
+      line-height: 1.28;
+      white-space: pre-wrap;
+      overflow-wrap: anywhere;
+      letter-spacing: 0;
+    }
+
+    .empty {
+      color: #777;
+      padding: 12px;
+    }
+
+    .composer {
+      display: grid;
+      grid-template-columns: 1fr 62px;
+      gap: 6px;
+      padding: 6px 8px;
+      border-top: 1px solid #333;
+      background: var(--pane-2);
+    }
+
+    .composer input {
+      min-width: 0;
+      height: 26px;
+      border: 0;
+      outline: 1px solid #444;
+      background: #050505;
+      color: #eee;
+      padding: 0 8px;
+      font: inherit;
+    }
+
+    .composer button {
+      height: 26px;
+      border: 1px solid #575757;
+      background: #252525;
+      color: #fff;
+      font: inherit;
+      cursor: pointer;
+    }
+
+    .composer button:hover,
+    .tab:hover {
+      border-color: #aaa;
+    }
+
+    @media (max-width: 900px) {
+      .grid {
+        grid-template-columns: 1fr;
+        grid-template-rows: repeat(4, 50vh);
+        overflow-y: auto;
+      }
+    }
+  </style>
+</head>
+<body>
+  <main class="shell">
+    <header class="bar">
+      <div class="brand">AgentCall</div>
+      <nav class="tabs" id="tabs"></nav>
+      <div class="spacer"></div>
+      <div class="pid" id="clock"></div>
+    </header>
+    <section class="grid" id="grid"></section>
+  </main>
+
+  <script>
+    const grid = document.querySelector("#grid");
+    const tabs = document.querySelector("#tabs");
+    const clock = document.querySelector("#clock");
+    const outputs = new Map();
+    const paneByName = new Map();
+    let renderedNames = "";
+    let sessions = [];
+
+    function escapeHtml(value) {
+      return value.replace(/[&<>"']/g, (ch) => ({
+        "&": "&amp;",
+        "<": "&lt;",
+        ">": "&gt;",
+        "\"": "&quot;",
+        "'": "&#39;"
+      }[ch]));
+    }
+
+    function pickSessions(items) {
+      const running = items.filter((item) => item.status === "running");
+      const rest = items.filter((item) => item.status !== "running" && !isCmdSession(item));
+      return [...running, ...rest].slice(0, 4);
+    }
+
+    function isCmdSession(item) {
+      return (item.command || []).some((part) => String(part).toLowerCase().includes("cmd.exe"));
+    }
+
+    async function refreshSessions() {
+      const res = await fetch("/api/sessions");
+      const data = await res.json();
+      sessions = pickSessions(data.sessions || []);
+      renderTabs(data.sessions || []);
+      ensureGrid();
+      updatePaneMeta();
+      await Promise.all(sessions.map(loadTail));
+      updateOutputs();
+    }
+
+    function renderTabs(items) {
+      tabs.innerHTML = items.map((item) => (
+        `<button class="tab ${item.status === "running" ? "active" : ""}" title="${escapeHtml((item.command || []).join(" "))}">
+          ${escapeHtml(item.name)}
+        </button>`
+      )).join("");
+    }
+
+    function ensureGrid() {
+      const names = sessions.map((item) => item.name).join("\u0000");
+      if (names === renderedNames) return;
+      renderedNames = names;
+      paneByName.clear();
+      grid.innerHTML = "";
+      for (let index = 0; index < 4; index += 1) {
+        const item = sessions[index];
+        const pane = document.createElement("article");
+        pane.className = "pane";
+        if (!item) {
+          pane.innerHTML = `
+            <div class="pane-head"><span class="term-icon">›</span><span class="pane-title">empty</span></div>
+            <div class="terminal"><div class="empty">No session</div></div>
+            <div class="composer"><input disabled><button disabled>send</button></div>`;
+          grid.appendChild(pane);
+          continue;
+        }
+        pane.innerHTML = `
+          <div class="pane-head">
+            <span class="term-icon">›</span>
+            <span class="pane-title"></span>
+            <span class="spacer"></span>
+            <span class="pid"></span>
+            <span class="status"></span>
+          </div>
+          <div class="terminal" data-terminal="${escapeHtml(item.name)}"><pre></pre></div>
+          <form class="composer" data-session="${escapeHtml(item.name)}">
+            <input name="text" autocomplete="off" placeholder="send to ${escapeHtml(item.name)}">
+            <button>send</button>
+          </form>`;
+        grid.appendChild(pane);
+        paneByName.set(item.name, pane);
+      }
+      for (const form of document.querySelectorAll(".composer[data-session]")) {
+        form.addEventListener("submit", sendInput);
+      }
+    }
+
+    function updatePaneMeta() {
+      for (const item of sessions) {
+        const pane = paneByName.get(item.name);
+        if (!pane) continue;
+        const status = item.status || "unknown";
+        pane.querySelector(".pane-title").textContent = item.name;
+        pane.querySelector(".pid").textContent = `pid ${item.child_pid || item.worker_pid || "-"}`;
+        const statusEl = pane.querySelector(".status");
+        statusEl.textContent = status;
+        statusEl.className = `status ${status}`;
+      }
+    }
+
+    async function loadTail(item) {
+      const name = encodeURIComponent(item.name);
+      const res = await fetch(`/api/sessions/${name}/tail?lines=220`);
+      const data = await res.json();
+      outputs.set(item.name, data.text || "");
+    }
+
+    function updateOutputs() {
+      for (const pane of document.querySelectorAll("[data-terminal]")) {
+        const name = pane.getAttribute("data-terminal");
+        const pre = pane.querySelector("pre");
+        const text = outputs.get(name) || "";
+        const next = text || "waiting for output...";
+        if (pre.dataset.rawText !== next) {
+          const wasNearBottom = pane.scrollTop + pane.clientHeight >= pane.scrollHeight - 24;
+          pre.dataset.rawText = next;
+          pre.innerHTML = escapeHtml(next);
+          if (wasNearBottom) pane.scrollTop = pane.scrollHeight;
+        }
+      }
+      clock.textContent = new Date().toLocaleTimeString();
+    }
+
+    async function sendInput(event) {
+      event.preventDefault();
+      const form = event.currentTarget;
+      const input = form.elements.text;
+      const text = input.value.trim();
+      if (!text) return;
+      const name = encodeURIComponent(form.getAttribute("data-session"));
+      input.value = "";
+      await fetch(`/api/sessions/${name}/send`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ text, enter: true })
+      });
+      await refreshSessions();
+    }
+
+    async function tick() {
+      try {
+        await refreshSessions();
+      } catch (error) {
+        console.error(error);
+      }
+    }
+
+    tick();
+    setInterval(tick, 1800);
+  </script>
+</body>
+</html>

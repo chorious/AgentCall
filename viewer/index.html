@@ -1,0 +1,176 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>AgentCall Viewer</title>
+  <style>
+    :root {
+      color-scheme: light dark;
+      font-family: Segoe UI, system-ui, sans-serif;
+      background: #101418;
+      color: #eef2f4;
+    }
+    body {
+      margin: 0;
+      min-height: 100vh;
+      display: grid;
+      grid-template-rows: auto 1fr auto;
+    }
+    header {
+      display: flex;
+      gap: 12px;
+      align-items: center;
+      padding: 10px 14px;
+      border-bottom: 1px solid #2b323a;
+      background: #151b21;
+    }
+    input, button, textarea {
+      font: inherit;
+    }
+    input, textarea {
+      background: #0c1116;
+      color: #eef2f4;
+      border: 1px solid #38424c;
+      border-radius: 6px;
+      padding: 8px;
+    }
+    #baseUrl {
+      width: 280px;
+    }
+    button {
+      border: 1px solid #4a5967;
+      background: #25313c;
+      color: #f4f7f9;
+      border-radius: 6px;
+      padding: 8px 12px;
+      cursor: pointer;
+    }
+    button:hover {
+      background: #30404e;
+    }
+    #status {
+      color: #9fd3ff;
+      white-space: nowrap;
+    }
+    main {
+      overflow: auto;
+      padding: 14px;
+    }
+    .message {
+      border: 1px solid #2b323a;
+      border-radius: 6px;
+      margin-bottom: 12px;
+      background: #141a20;
+    }
+    .meta {
+      display: flex;
+      justify-content: space-between;
+      gap: 12px;
+      padding: 8px 10px;
+      border-bottom: 1px solid #2b323a;
+      color: #b7c6d1;
+      font-size: 13px;
+    }
+    pre {
+      margin: 0;
+      padding: 10px;
+      white-space: pre-wrap;
+      overflow-wrap: anywhere;
+      line-height: 1.35;
+    }
+    footer {
+      display: grid;
+      grid-template-columns: 1fr auto auto;
+      gap: 10px;
+      padding: 10px 14px;
+      border-top: 1px solid #2b323a;
+      background: #151b21;
+    }
+    textarea {
+      min-height: 44px;
+      resize: vertical;
+    }
+  </style>
+</head>
+<body>
+  <header>
+    <strong>AgentCall Viewer</strong>
+    <input id="baseUrl" value="http://localhost:3287" aria-label="AgentAPI URL">
+    <button id="refresh">Refresh</button>
+    <label><input id="auto" type="checkbox" checked> Auto</label>
+    <span id="status">Connecting...</span>
+  </header>
+  <main id="messages"></main>
+  <footer>
+    <textarea id="input" placeholder="Send a user message to AgentAPI"></textarea>
+    <button id="send">Send</button>
+    <button id="approve">Approve</button>
+  </footer>
+  <script>
+    const baseUrl = document.getElementById('baseUrl');
+    const statusEl = document.getElementById('status');
+    const messagesEl = document.getElementById('messages');
+    const inputEl = document.getElementById('input');
+    const autoEl = document.getElementById('auto');
+
+    function api(path) {
+      return baseUrl.value.replace(/\/$/, '') + path;
+    }
+
+    async function refresh() {
+      try {
+        const [status, messages] = await Promise.all([
+          fetch(api('/status')).then(r => r.json()),
+          fetch(api('/messages')).then(r => r.json()),
+        ]);
+        statusEl.textContent = `${status.agent_type} / ${status.transport} / ${status.status}`;
+        render(messages.messages || []);
+      } catch (err) {
+        statusEl.textContent = `error: ${err.message}`;
+      }
+    }
+
+    function render(messages) {
+      messagesEl.innerHTML = '';
+      for (const msg of messages.slice(-20)) {
+        const item = document.createElement('section');
+        item.className = 'message';
+        const meta = document.createElement('div');
+        meta.className = 'meta';
+        meta.textContent = `#${msg.id} ${msg.role} ${msg.time}`;
+        const pre = document.createElement('pre');
+        pre.textContent = msg.content || '';
+        item.append(meta, pre);
+        messagesEl.append(item);
+      }
+      messagesEl.scrollTop = messagesEl.scrollHeight;
+    }
+
+    async function post(type, content) {
+      await fetch(api('/message'), {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ type, content }),
+      });
+      inputEl.value = '';
+      await refresh();
+    }
+
+    document.getElementById('refresh').addEventListener('click', refresh);
+    document.getElementById('send').addEventListener('click', () => post('user', inputEl.value));
+    document.getElementById('approve').addEventListener('click', () => post('raw', 'y\r'));
+    inputEl.addEventListener('keydown', (event) => {
+      if (event.ctrlKey && event.key === 'Enter') {
+        event.preventDefault();
+        post('user', inputEl.value);
+      }
+    });
+
+    setInterval(() => {
+      if (autoEl.checked) refresh();
+    }, 2000);
+    refresh();
+  </script>
+</body>
+</html>
