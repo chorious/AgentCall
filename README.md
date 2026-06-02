@@ -4,6 +4,15 @@ AgentCall is an orchestration layer for supervising coding agents through bounde
 
 The first version proved an SOP loop in one shared workspace. The v2 direction is protocol-first: a parent process owns project context, calls bounded child agents through Claude ACP/SDK-style drivers, requires a report at the end of every child lifecycle, and accepts clean work without ceremonial reviews.
 
+## v0.4 编排层
+
+v0.4 已经把双运行时编排层落成可测试后端：ACP 负责短生命周期
+agents-as-tools，可观测 Claude Code 会话负责长生命周期 handoffs，MCP 负责
+给 Codex/外部进程提供控制面。见：
+
+- `docs/v0.4-orchestration-roadmap.md`
+- `docs/v0.4-implementation.md`
+
 ## v2.0 Direction
 
 - Parent owns context, orchestration, validation, and task state.

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import re
 import sys
 from pathlib import Path
@@ -9,7 +10,10 @@ from .models import ReviewDecision, TaskStatus, Worker
 from .sessions import SessionManager
 from .store import AgentCallError, Store
 from .supervisor import Supervisor
+from .v2.context import ContextPacket
+from .v2.hooks import ClaudeCodeHookReceiver
 from .v2.inspection import inspect_workflow
+from .v2.router import route_task
 from .v2.workflows import run_small_project_workflow_with_driver
 
 
@@ -45,6 +49,44 @@ def build_parser() -> argparse.ArgumentParser:
 
     events = sub.add_parser("events", help="Show events.")
     events.add_argument("task_id", nargs="?")
+    events.add_argument("--json", action="store_true", help="Print events as JSON.")
+    events.add_argument("--limit", type=int, default=None)
+
+    route = sub.add_parser("route", help="Recommend ACP vs Claude Code session runtime.")
+    route.add_argument("objective")
+    route.add_argument("--task-type", default=None)
+    route.add_argument("--estimated-files", type=int, default=None)
+    route.add_argument("--needs-continuity", action="store_true")
+
+    context = sub.add_parser("context", help="Create and inspect v0.4 context packets.")
+    context_sub = context.add_subparsers(dest="context_command", required=True)
+    context_create = context_sub.add_parser("create", help="Create a context packet.")
+    context_create.add_argument("--task-id", required=True)
+    context_create.add_argument("--call-id", required=True)
+    context_create.add_argument("--phase", default="execute")
+    context_create.add_argument("--role", default="executor")
+    context_create.add_argument("--runtime", default="acp")
+    context_create.add_argument("--objective", required=True)
+    context_create.add_argument("--allowed-path", action="append", default=[])
+    context_create.add_argument("--acceptance-criterion", action="append", default=[])
+    context_create.add_argument("--persist", action="store_true")
+
+    reports = sub.add_parser("reports", help="List structured child reports.")
+    reports.add_argument("task_id", nargs="?")
+
+    board = sub.add_parser("board", help="Show unified v0.4 task/session/report state.")
+    board.add_argument("--json", action="store_true")
+
+    hook = sub.add_parser("hook", help="Ingest Claude Code hook payloads.")
+    hook_sub = hook.add_subparsers(dest="hook_command", required=True)
+    hook_ingest = hook_sub.add_parser("ingest", help="Ingest one hook event as JSON.")
+    hook_ingest.add_argument("event")
+    hook_ingest.add_argument("--payload-json", default="{}")
+
+    checkpoint = sub.add_parser("checkpoint", help="Request a Claude Code session checkpoint.")
+    checkpoint_sub = checkpoint.add_subparsers(dest="checkpoint_command", required=True)
+    checkpoint_request = checkpoint_sub.add_parser("request", help="Mark a session as needing a checkpoint.")
+    checkpoint_request.add_argument("session_id")
 
     workflow = sub.add_parser("workflow", help="Run v2 bounded parent/child workflows.")
     workflow_sub = workflow.add_subparsers(dest="workflow_command", required=True)
@@ -125,6 +167,24 @@ def main(argv: list[str] | None = None) -> int:
 
         if args.command == "events":
             return handle_events(args, store)
+
+        if args.command == "route":
+            return handle_route(args)
+
+        if args.command == "context":
+            return handle_context(args, store)
+
+        if args.command == "reports":
+            return handle_reports(args, store)
+
+        if args.command == "board":
+            return handle_board(args, store)
+
+        if args.command == "hook":
+            return handle_hook(args, store)
+
+        if args.command == "checkpoint":
+            return handle_checkpoint(args, store)
 
         if args.command == "workflow":
             return handle_workflow(args, store)
@@ -217,7 +277,13 @@ def handle_review(args: argparse.Namespace, store: Store) -> int:
 
 
 def handle_events(args: argparse.Namespace, store: Store) -> int:
-    for event in store.events(args.task_id):
+    events = store.events(args.task_id)
+    if args.limit is not None:
+        events = events[-args.limit :]
+    if args.json:
+        print(json.dumps(events, ensure_ascii=False, indent=2))
+        return 0
+    for event in events:
         bits = [event["id"], event["ts"], event["type"]]
         if event.get("task_id"):
             bits.append(event["task_id"])
@@ -226,6 +292,102 @@ def handle_events(args: argparse.Namespace, store: Store) -> int:
         if event.get("message"):
             bits.append(event["message"])
         print("\t".join(bits))
+    return 0
+
+
+def handle_route(args: argparse.Namespace) -> int:
+    recommendation = route_task(
+        args.objective,
+        task_type=args.task_type,
+        estimated_files=args.estimated_files,
+        needs_continuity=args.needs_continuity,
+    )
+    print(json.dumps(recommendation.to_dict(), ensure_ascii=False, indent=2))
+    return 0
+
+
+def handle_context(args: argparse.Namespace, store: Store) -> int:
+    if args.context_command != "create":
+        raise AgentCallError(f"Unknown context command: {args.context_command}")
+    store.init()
+    packet = ContextPacket(
+        task_id=args.task_id,
+        call_id=args.call_id,
+        phase=args.phase,
+        role=args.role,
+        runtime=args.runtime,
+        objective=args.objective,
+        workspace=str(store.root),
+        allowed_paths=args.allowed_path,
+        acceptance_criteria=args.acceptance_criterion,
+    )
+    if args.persist:
+        call_dir = store.write_call_artifacts(
+            args.task_id,
+            args.call_id,
+            input_data={"context_packet": packet.to_dict(), "created_by": "agentcall context create"},
+            prompt=packet.to_prompt_section(),
+            context=packet.to_dict(),
+        )
+        store.append_context_index(
+            {
+                "task_id": args.task_id,
+                "call_id": args.call_id,
+                "role": args.role,
+                "mode": args.phase,
+                "runtime": args.runtime,
+                "path": str(call_dir.relative_to(store.root)),
+            }
+        )
+    print(json.dumps(packet.to_dict(), ensure_ascii=False, indent=2))
+    return 0
+
+
+def handle_reports(args: argparse.Namespace, store: Store) -> int:
+    print(json.dumps(store.reports(args.task_id), ensure_ascii=False, indent=2))
+    return 0
+
+
+def handle_board(args: argparse.Namespace, store: Store) -> int:
+    state = store.board_state()
+    if args.json:
+        print(json.dumps(state, ensure_ascii=False, indent=2))
+        return 0
+    print(f"workspace: {state['workspace']}")
+    print(f"tasks: {len(state['tasks'])}")
+    print(f"active_sessions: {len(state['active_sessions'])}")
+    print(f"reports: {len(state['reports'])}")
+    print(f"recent_events: {len(state['recent_events'])}")
+    return 0
+
+
+def handle_hook(args: argparse.Namespace, store: Store) -> int:
+    if args.hook_command != "ingest":
+        raise AgentCallError(f"Unknown hook command: {args.hook_command}")
+    try:
+        payload = json.loads(args.payload_json)
+    except json.JSONDecodeError as exc:
+        raise AgentCallError(f"Invalid --payload-json: {exc}") from exc
+    result = ClaudeCodeHookReceiver(store).ingest(args.event, payload)
+    print(json.dumps(result.to_dict(), ensure_ascii=False, indent=2))
+    return 0
+
+
+def handle_checkpoint(args: argparse.Namespace, store: Store) -> int:
+    if args.checkpoint_command != "request":
+        raise AgentCallError(f"Unknown checkpoint command: {args.checkpoint_command}")
+    sessions = {session["session_id"]: session for session in store.list_active_sessions()}
+    session = sessions.get(args.session_id)
+    if session is None:
+        session = {"session_id": args.session_id, "runtime": "claude-code-session"}
+    session["status"] = "checkpoint_requested"
+    store.upsert_active_session(args.session_id, session)
+    store.append_event(
+        "checkpoint.requested",
+        message=f"Checkpoint requested for {args.session_id}.",
+        data={"session_id": args.session_id},
+    )
+    print(json.dumps(session, ensure_ascii=False, indent=2))
     return 0
 
 

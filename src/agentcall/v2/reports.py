@@ -27,6 +27,15 @@ REPORT_JSON_SCHEMA: dict[str, Any] = {
         "risks": {"type": "array", "items": {"type": "string"}},
         "open_questions": {"type": "array", "items": {"type": "string"}},
         "next_recommended_action": {"type": "string"},
+        "context_sufficiency": {
+            "type": "object",
+            "properties": {
+                "status": {"type": "string"},
+                "missing": {"type": "array", "items": {"type": "string"}},
+                "can_parent_resolve": {"type": "boolean"},
+                "recommended_parent_action": {"type": "string"},
+            },
+        },
         "turns_used": {"type": "integer", "minimum": 1},
         "metadata": {"type": "object"},
     },
@@ -42,6 +51,7 @@ REPORT_JSON_SCHEMA: dict[str, Any] = {
         "risks",
         "open_questions",
         "next_recommended_action",
+        "context_sufficiency",
         "turns_used",
         "metadata",
     ],
@@ -76,6 +86,14 @@ class ChildReport:
     risks: list[str] = field(default_factory=list)
     open_questions: list[str] = field(default_factory=list)
     next_recommended_action: str = ""
+    context_sufficiency: dict[str, Any] = field(
+        default_factory=lambda: {
+            "status": "enough_to_act",
+            "missing": [],
+            "can_parent_resolve": True,
+            "recommended_parent_action": "",
+        }
+    )
     turns_used: int = 1
     metadata: dict[str, Any] = field(default_factory=dict)
 
@@ -92,6 +110,7 @@ class ChildReport:
             "risks": self.risks,
             "open_questions": self.open_questions,
             "next_recommended_action": self.next_recommended_action,
+            "context_sufficiency": self.context_sufficiency,
             "turns_used": self.turns_used,
             "metadata": self.metadata,
         }
@@ -110,6 +129,7 @@ class ChildReport:
             risks=[str(item) for item in data.get("risks", [])],
             open_questions=[str(item) for item in data.get("open_questions", [])],
             next_recommended_action=str(data.get("next_recommended_action", "")),
+            context_sufficiency=normalize_context_sufficiency(data.get("context_sufficiency")),
             turns_used=int(data.get("turns_used", 1)),
             metadata=dict(data.get("metadata", {})),
         )
@@ -154,11 +174,24 @@ def validate_report_dict(data: dict[str, Any]) -> ReportValidation:
     for field_name in ("changed_files", "commands_run", "tests", "risks", "open_questions"):
         if field_name in data and not isinstance(data[field_name], list):
             findings.append(f"{field_name} must be a list")
+    if "context_sufficiency" in data and not isinstance(data["context_sufficiency"], dict):
+        findings.append("context_sufficiency must be an object")
     if "status" in data and data["status"] not in {item.value for item in ReportStatus}:
         findings.append(f"invalid report status: {data['status']}")
     if "turns_used" in data and (not isinstance(data["turns_used"], int) or data["turns_used"] < 1):
         findings.append("turns_used must be a positive integer")
     return ReportValidation(ok=not findings, findings=findings)
+
+
+def normalize_context_sufficiency(value: Any) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        value = {}
+    return {
+        "status": str(value.get("status", "enough_to_act")),
+        "missing": [str(item) for item in value.get("missing", [])],
+        "can_parent_resolve": bool(value.get("can_parent_resolve", True)),
+        "recommended_parent_action": str(value.get("recommended_parent_action", "")),
+    }
 
 
 def validate_scope(report: ChildReport, allowed_paths: tuple[str, ...]) -> ReportValidation:

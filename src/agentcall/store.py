@@ -17,12 +17,15 @@ class Store:
         self.agent_dir = self.root / ".agentcall"
         self.tasks_dir = self.agent_dir / "tasks"
         self.workers_dir = self.agent_dir / "workers"
+        self.state_dir = self.agent_dir / "state"
         self.events_path = self.agent_dir / "events.ndjson"
 
     def init(self) -> None:
         self.tasks_dir.mkdir(parents=True, exist_ok=True)
         self.workers_dir.mkdir(parents=True, exist_ok=True)
+        self.state_dir.mkdir(parents=True, exist_ok=True)
         self.events_path.touch(exist_ok=True)
+        self._ensure_state_files()
 
     def require_initialized(self) -> None:
         if not self.agent_dir.exists():
@@ -130,6 +133,56 @@ class Store:
     def review_path(self, task_id: str) -> Path:
         return self.task_path(task_id) / "review.md"
 
+    def calls_dir(self, task_id: str) -> Path:
+        return self.task_path(task_id) / "calls"
+
+    def call_path(self, task_id: str, call_id: str) -> Path:
+        return self.calls_dir(task_id) / call_id
+
+    def write_call_artifacts(
+        self,
+        task_id: str,
+        call_id: str,
+        *,
+        input_data: dict[str, Any],
+        prompt: str,
+        context: dict[str, Any],
+    ) -> Path:
+        call_dir = self.call_path(task_id, call_id)
+        call_dir.mkdir(parents=True, exist_ok=True)
+        (call_dir / "input.json").write_text(
+            json.dumps(input_data, ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
+        )
+        (call_dir / "prompt.md").write_text(prompt, encoding="utf-8")
+        (call_dir / "context.json").write_text(
+            json.dumps(context, ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
+        )
+        return call_dir
+
+    def list_call_artifacts(self, task_id: str) -> list[dict[str, Any]]:
+        self.require_initialized()
+        calls = []
+        calls_dir = self.calls_dir(task_id)
+        if not calls_dir.exists():
+            return calls
+        for path in sorted(calls_dir.iterdir()):
+            if not path.is_dir():
+                continue
+            input_path = path / "input.json"
+            context_path = path / "context.json"
+            calls.append(
+                {
+                    "call_id": path.name,
+                    "input_path": str(input_path.relative_to(self.root)) if input_path.exists() else None,
+                    "prompt_path": str((path / "prompt.md").relative_to(self.root)) if (path / "prompt.md").exists() else None,
+                    "context_path": str(context_path.relative_to(self.root)) if context_path.exists() else None,
+                    "context": json.loads(context_path.read_text(encoding="utf-8")) if context_path.exists() else {},
+                }
+            )
+        return calls
+
     def append_event(
         self,
         event_type: str,
@@ -176,6 +229,81 @@ class Store:
                 if task_id is None or event.get("task_id") == task_id:
                     items.append(event)
         return items
+
+    def events_tail(self, limit: int = 50, task_id: str | None = None) -> list[dict[str, Any]]:
+        return self.events(task_id)[-limit:]
+
+    def reports(self, task_id: str | None = None) -> list[dict[str, Any]]:
+        self.require_initialized()
+        reports = []
+        task_dirs = [self.task_path(task_id)] if task_id else sorted(self.tasks_dir.glob("task-*"))
+        for task_dir in task_dirs:
+            reports_dir = task_dir / "reports"
+            if not reports_dir.exists():
+                continue
+            for path in sorted(reports_dir.glob("*.json")):
+                report = json.loads(path.read_text(encoding="utf-8"))
+                report["_path"] = str(path.relative_to(self.root))
+                reports.append(report)
+        return reports
+
+    def _ensure_state_files(self) -> None:
+        self.state_dir.mkdir(parents=True, exist_ok=True)
+        defaults: dict[str, Any] = {
+            "project.json": {"version": 1, "decisions": [], "risks": [], "memory": []},
+            "file_claims.json": {},
+            "active_sessions.json": {},
+            "context_index.json": {"calls": []},
+        }
+        for name, value in defaults.items():
+            path = self.state_dir / name
+            if not path.exists():
+                path.write_text(json.dumps(value, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+
+    def state_json_path(self, name: str) -> Path:
+        self.init()
+        return self.state_dir / name
+
+    def read_state_json(self, name: str, default: Any) -> Any:
+        path = self.state_json_path(name)
+        if not path.exists():
+            return default
+        return json.loads(path.read_text(encoding="utf-8"))
+
+    def write_state_json(self, name: str, value: Any) -> None:
+        path = self.state_json_path(name)
+        path.write_text(json.dumps(value, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+
+    def project_state(self) -> dict[str, Any]:
+        return dict(self.read_state_json("project.json", {"version": 1, "decisions": [], "risks": [], "memory": []}))
+
+    def append_context_index(self, item: dict[str, Any]) -> None:
+        index = self.read_state_json("context_index.json", {"calls": []})
+        calls = list(index.get("calls", []))
+        calls.append(item)
+        index["calls"] = calls
+        self.write_state_json("context_index.json", index)
+
+    def upsert_active_session(self, session_id: str, session: dict[str, Any]) -> None:
+        sessions = self.read_state_json("active_sessions.json", {})
+        sessions[session_id] = session
+        self.write_state_json("active_sessions.json", sessions)
+
+    def list_active_sessions(self) -> list[dict[str, Any]]:
+        sessions = self.read_state_json("active_sessions.json", {})
+        return [dict(value) for value in sessions.values()]
+
+    def board_state(self) -> dict[str, Any]:
+        self.require_initialized()
+        tasks = [task.to_dict() for task in self.list_tasks()]
+        return {
+            "workspace": str(self.root),
+            "tasks": tasks,
+            "active_sessions": self.list_active_sessions(),
+            "recent_events": self.events_tail(20),
+            "reports": self.reports(),
+            "project_state": self.project_state(),
+        }
 
     def worker_json_path(self, worker_id: str) -> Path:
         return self.workers_dir / f"{worker_id}.json"

@@ -5,6 +5,7 @@ from pathlib import Path
 
 from ..models import TaskStatus
 from ..store import Store
+from .context import ContextPacket
 from .drivers import AgentDriver
 from .reports import ChildReport, ReportStatus, validate_report_contract, validate_scope
 from .state import AgentLifecycleState, snapshot_from_report, snapshot_from_spec
@@ -71,7 +72,7 @@ class ParentOrchestrator:
             allowed_paths=allowed_paths,
             acceptance_criteria=acceptance_criteria,
             max_turns=max_turns,
-            context={"plan_call_id": plan.call_id},
+            context={"prior_reports": [plan.to_dict()], "plan_call_id": plan.call_id},
         )
         reports.append(execute)
         findings = self._validate(execute, allowed_paths=allowed_paths, max_turns=max_turns)
@@ -124,11 +125,17 @@ class ParentOrchestrator:
             max_turns=max_turns,
             context=context or {},
         )
+        spec = self._prepare_child_call(spec, runtime=self.driver.name)
         self.store.append_event(
             "child.call_started",
             task_id=task_id,
             message=f"{role.value} child started in {mode.value} mode.",
-            data={"call_id": call_id, "driver": self.driver.name, "max_turns": max_turns},
+            data={
+                "call_id": call_id,
+                "driver": self.driver.name,
+                "max_turns": max_turns,
+                "context_packet": str(self.store.call_path(task_id, call_id).relative_to(self.store.root)),
+            },
         )
         self.store.append_event(
             "agent.state_changed",
@@ -176,13 +183,18 @@ class ParentOrchestrator:
             allowed_paths=allowed_paths,
             acceptance_criteria=acceptance_criteria,
             max_turns=max_turns,
-            context={"executor_report": execute.to_dict(), "parent_findings": findings},
+            context={"prior_reports": [execute.to_dict()], "executor_report": execute.to_dict(), "parent_findings": findings},
         )
+        spec = self._prepare_child_call(spec, runtime=self.reviewer.name)
         self.store.append_event(
             "reviewer.call_started",
             task_id=task_id,
             message="Parent delegated audit to reviewer child.",
-            data={"call_id": call_id, "driver": self.reviewer.name},
+            data={
+                "call_id": call_id,
+                "driver": self.reviewer.name,
+                "context_packet": str(self.store.call_path(task_id, call_id).relative_to(self.store.root)),
+            },
         )
         self.store.append_event(
             "agent.state_changed",
@@ -206,14 +218,62 @@ class ParentOrchestrator:
         )
         return report
 
+    def _prepare_child_call(self, spec: ChildCallSpec, *, runtime: str) -> ChildCallSpec:
+        packet = ContextPacket.from_spec(spec, runtime=runtime)
+        context = {**spec.context, "context_packet": packet.to_dict()}
+        prepared = ChildCallSpec(
+            task_id=spec.task_id,
+            call_id=spec.call_id,
+            role=spec.role,
+            mode=spec.mode,
+            objective=spec.objective,
+            workspace=spec.workspace,
+            allowed_paths=spec.allowed_paths,
+            acceptance_criteria=spec.acceptance_criteria,
+            max_turns=spec.max_turns,
+            max_seconds=spec.max_seconds,
+            budget_usd=spec.budget_usd,
+            context=context,
+        )
+        prompt = prepared.to_prompt()
+        call_dir = self.store.write_call_artifacts(
+            spec.task_id,
+            spec.call_id,
+            input_data={"spec": spec_to_dict(prepared), "driver": runtime},
+            prompt=prompt,
+            context=packet.to_dict(),
+        )
+        self.store.append_context_index(
+            {
+                "task_id": spec.task_id,
+                "call_id": spec.call_id,
+                "role": spec.role.value,
+                "mode": spec.mode.value,
+                "runtime": runtime,
+                "path": str(call_dir.relative_to(self.store.root)),
+            }
+        )
+        return prepared
+
     def _validate(self, report: ChildReport, *, allowed_paths: tuple[str, ...], max_turns: int) -> list[str]:
         findings = []
         findings.extend(validate_report_contract(report, max_turns=max_turns).findings)
         findings.extend(validate_scope(report, allowed_paths).findings)
         findings.extend(self._validate_changed_files_exist(report))
+        findings.extend(self._validate_context_sufficiency(report))
         if report.status == ReportStatus.DONE.value and not report.tests and report.changed_files:
             findings.append("changed files reported without tests/checks")
         return findings
+
+    def _validate_context_sufficiency(self, report: ChildReport) -> list[str]:
+        sufficiency = report.context_sufficiency or {}
+        status = str(sufficiency.get("status", "enough_to_act"))
+        if status == "enough_to_act":
+            return []
+        missing = ", ".join(str(item) for item in sufficiency.get("missing", [])) or "unspecified context"
+        if sufficiency.get("can_parent_resolve", True):
+            return [f"child needs parent-resolvable context before acceptance: {missing}"]
+        return [f"child requires human clarification before acceptance: {missing}"]
 
     def _validate_changed_files_exist(self, report: ChildReport) -> list[str]:
         findings = []
@@ -266,3 +326,20 @@ class ParentOrchestrator:
             review_report=review_report,
             findings=findings,
         )
+
+
+def spec_to_dict(spec: ChildCallSpec) -> dict:
+    return {
+        "task_id": spec.task_id,
+        "call_id": spec.call_id,
+        "role": spec.role.value,
+        "mode": spec.mode.value,
+        "objective": spec.objective,
+        "workspace": str(spec.workspace),
+        "allowed_paths": list(spec.allowed_paths),
+        "acceptance_criteria": list(spec.acceptance_criteria),
+        "max_turns": spec.max_turns,
+        "max_seconds": spec.max_seconds,
+        "budget_usd": spec.budget_usd,
+        "context": spec.context,
+    }

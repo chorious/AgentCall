@@ -87,9 +87,10 @@ class AcpClaudeDriver:
                 metadata={"stopReason": result.stop_reason, "initialize": initialize},
                 next_recommended_action="Retry with a stricter report prompt or JSON schema.",
             )
-        data.setdefault("task_id", spec.task_id)
-        data.setdefault("call_id", spec.call_id)
+        data["task_id"] = spec.task_id
+        data["call_id"] = spec.call_id
         data["agent"] = self.name
+        data.setdefault("context_sufficiency", default_context_sufficiency())
         data.setdefault("metadata", {})
         data["metadata"].setdefault("stopReason", result.stop_reason)
         data["metadata"].setdefault("acpUpdates", len(result.updates))
@@ -167,9 +168,10 @@ class HeadlessJsonClaudeDriver:
                 risks=[process.stdout[:1000]],
                 next_recommended_action="Retry with stricter JSON schema.",
             )
-        data.setdefault("task_id", spec.task_id)
-        data.setdefault("call_id", spec.call_id)
+        data["task_id"] = spec.task_id
+        data["call_id"] = spec.call_id
         data["agent"] = self.name
+        data.setdefault("context_sufficiency", default_context_sufficiency())
         data.setdefault("metadata", {})
         validation = validate_report_dict(data)
         if not validation.ok:
@@ -197,6 +199,15 @@ def extract_json_object(text: str) -> dict[str, Any]:
     if not isinstance(data, dict):
         raise ValueError("JSON report must be an object")
     return data
+
+
+def default_context_sufficiency() -> dict[str, Any]:
+    return {
+        "status": "enough_to_act",
+        "missing": [],
+        "can_parent_resolve": True,
+        "recommended_parent_action": "",
+    }
 
 
 def resolve_command(command: list[str]) -> list[str]:

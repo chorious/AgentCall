@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass, field
 from enum import StrEnum
 from pathlib import Path
@@ -47,6 +48,16 @@ class ChildCallSpec:
     def to_prompt(self) -> str:
         allowed = "\n".join(f"- {item}" for item in self.allowed_paths) or "- Entire workspace"
         criteria = "\n".join(f"- {item}" for item in self.acceptance_criteria) or "- Produce a valid report"
+        context_packet = self.context.get("context_packet") if self.context else None
+        context_section = ""
+        if context_packet:
+            context_section = (
+                "## Context Packet\n\n"
+                "Use this packet as the authoritative project context for this lifecycle.\n\n"
+                "```json\n"
+                f"{json.dumps(context_packet, ensure_ascii=False, indent=2)}\n"
+                "```\n\n"
+            )
         mode_rules = ""
         if self.mode == ChildMode.PLAN:
             mode_rules = (
@@ -85,9 +96,12 @@ class ChildCallSpec:
             f"{allowed}\n\n"
             "## Acceptance Criteria\n\n"
             f"{criteria}\n\n"
+            f"{context_section}"
             f"{mode_rules}"
             "## Required Report Contract\n\n"
             "Return exactly one structured report with status, summary, changed_files, "
             "commands_run, tests, risks, open_questions, and next_recommended_action. "
+            "Include context_sufficiency with status, missing, can_parent_resolve, "
+            "and recommended_parent_action. "
             "Do not continue beyond this lifecycle.\n"
         )

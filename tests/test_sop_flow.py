@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import sys
 import textwrap
 
@@ -274,6 +275,39 @@ def test_v2_parent_rejects_reported_file_that_does_not_exist(tmp_path):
     assert store.review_path(outcome.task_id).exists()
 
 
+def test_v04_parent_rejects_child_with_insufficient_context(tmp_path):
+    store = Store(tmp_path)
+    store.init()
+
+    def child_handler(spec):
+        return ChildReport(
+            task_id=spec.task_id,
+            call_id=spec.call_id,
+            agent="scripted-claude",
+            status=ReportStatus.DONE.value,
+            summary="I cannot safely act without a product decision.",
+            context_sufficiency={
+                "status": "need_context",
+                "missing": ["product risk preference"],
+                "can_parent_resolve": False,
+                "recommended_parent_action": "ask user",
+            },
+        )
+
+    outcome = ParentOrchestrator(
+        store,
+        FunctionAgentDriver("scripted-claude", child_handler),
+    ).run_bounded_task(
+        objective="Make an ambiguous product decision",
+        allowed_paths=("mini_project",),
+        acceptance_criteria=("decision is explicit",),
+    )
+
+    assert outcome.accepted is False
+    assert "child requires human clarification before acceptance: product risk preference" in outcome.findings
+    assert store.review_path(outcome.task_id).exists()
+
+
 def test_v2_workflow_simulation_cli(tmp_path, capsys):
     assert main(["--root", str(tmp_path), "workflow", "simulate"]) == 0
 
@@ -289,6 +323,97 @@ def test_v2_workflow_simulation_cli(tmp_path, capsys):
     assert "reports: 2" in output
     assert "review: no" in output
     assert "executor\treported" in output
+
+    calls_dir = tmp_path / ".agentcall" / "tasks" / tasks[0].id / "calls"
+    planner_context = calls_dir / f"{tasks[0].id}-planner-01" / "context.json"
+    executor_prompt = calls_dir / f"{tasks[0].id}-executor-02" / "prompt.md"
+    assert planner_context.exists()
+    assert executor_prompt.exists()
+    context = json.loads(planner_context.read_text(encoding="utf-8"))
+    assert context["runtime"] == "simulated-claude-acp"
+    assert context["sufficiency"]["status"] == "enough_to_act"
+    assert "Context Packet" in executor_prompt.read_text(encoding="utf-8")
+    report = json.loads(
+        (tmp_path / ".agentcall" / "tasks" / tasks[0].id / "reports" / f"{tasks[0].id}-executor-02.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert report["context_sufficiency"]["status"] == "enough_to_act"
+
+
+def test_v04_route_context_hook_board_and_checkpoint_cli(tmp_path, capsys):
+    assert main(["--root", str(tmp_path), "init"]) == 0
+    capsys.readouterr()
+
+    assert main(["--root", str(tmp_path), "route", "Review a focused diff for risk"]) == 0
+    route = json.loads(capsys.readouterr().out)
+    assert route["recommended_runtime"] == "acp"
+    assert route["expected_output"] == "ChildReport"
+
+    assert (
+        main(
+            [
+                "--root",
+                str(tmp_path),
+                "route",
+                "Large exploratory migration across many modules",
+                "--needs-continuity",
+            ]
+        )
+        == 0
+    )
+    route = json.loads(capsys.readouterr().out)
+    assert route["recommended_runtime"] == "claude-code-session"
+    assert route["expected_output"] == "CheckpointReport"
+
+    assert (
+        main(
+            [
+                "--root",
+                str(tmp_path),
+                "context",
+                "create",
+                "--task-id",
+                "task-ctx",
+                "--call-id",
+                "call-ctx",
+                "--objective",
+                "Create a persisted context packet",
+                "--allowed-path",
+                "src",
+                "--acceptance-criterion",
+                "packet exists",
+                "--persist",
+            ]
+        )
+        == 0
+    )
+    packet = json.loads(capsys.readouterr().out)
+    assert packet["call_id"] == "call-ctx"
+    assert (tmp_path / ".agentcall" / "tasks" / "task-ctx" / "calls" / "call-ctx" / "input.json").exists()
+
+    payload = json.dumps(
+        {
+            "session_id": "sess-1",
+            "agent": "Claude Code",
+            "pid": 1234,
+            "transcript_path": "transcript.jsonl",
+        }
+    )
+    assert main(["--root", str(tmp_path), "hook", "ingest", "SessionStart", "--payload-json", payload]) == 0
+    hook = json.loads(capsys.readouterr().out)
+    assert hook["session_id"] == "sess-1"
+    assert hook["status"] == "running"
+    assert "AgentCall Context" in hook["context_injection"]
+
+    assert main(["--root", str(tmp_path), "checkpoint", "request", "sess-1"]) == 0
+    checkpoint = json.loads(capsys.readouterr().out)
+    assert checkpoint["status"] == "checkpoint_requested"
+
+    assert main(["--root", str(tmp_path), "board", "--json"]) == 0
+    board = json.loads(capsys.readouterr().out)
+    assert board["active_sessions"][0]["session_id"] == "sess-1"
+    assert board["active_sessions"][0]["status"] == "checkpoint_requested"
 
 
 def test_v2_acp_driver_reads_structured_report_from_stdio_agent(tmp_path):
