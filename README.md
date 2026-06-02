@@ -39,6 +39,29 @@ python -m agentcall --root .agentcall-demo workflow simulate --driver acp
 `scripted` is deterministic and free. `headless-json` and `acp` are live Claude
 paths and should be used only when you intend to spend a bounded child lifecycle.
 
+## v3.0 MCP Surface
+
+AgentCall now includes a Rust MCP server so other processes can discover and
+call the v2 runtime:
+
+```powershell
+cargo build -p agentcall-mcp
+target\debug\agentcall-mcp.exe --workspace E:\Project\AgentCall
+```
+
+It exposes:
+
+```text
+agentcall_capabilities
+agentcall_report_schema
+agentcall_workflow_simulate
+agentcall_workflow_inspect
+```
+
+The local Codex app config is registered with `[mcp_servers.agentcall]`. New
+Codex sessions can load the server and call these tools through MCP. See
+`docs/v3.0-mcp.md`.
+
 ## v1.0 Scope
 
 - File-based SOP artifacts under `.agentcall/`

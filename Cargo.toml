@@ -1,4 +1,3 @@
 [workspace]
-members = ["crates/agentcall-daemon"]
+members = ["crates/agentcall-daemon", "crates/agentcall-mcp"]
 resolver = "3"
-
