@@ -53,11 +53,11 @@ pub(crate) struct StreamEvent {
 
 #[derive(Deserialize)]
 pub(crate) struct StartRequest {
-    name: String,
-    command: Vec<String>,
-    cwd: Option<String>,
-    cols: Option<u16>,
-    rows: Option<u16>,
+    pub(crate) name: String,
+    pub(crate) command: Vec<String>,
+    pub(crate) cwd: Option<String>,
+    pub(crate) cols: Option<u16>,
+    pub(crate) rows: Option<u16>,
 }
 
 #[derive(Deserialize)]
@@ -205,7 +205,8 @@ pub(crate) fn spawn_reader(
                         }
                     }
                     control_tail.clear();
-                    control_tail.extend_from_slice(&control_scan[control_scan.len().saturating_sub(3)..]);
+                    control_tail
+                        .extend_from_slice(&control_scan[control_scan.len().saturating_sub(3)..]);
                     session.updated_at.store(now_ms(), Ordering::Relaxed);
                     let data = {
                         let mut health = session.decode_health.lock().unwrap();
@@ -364,11 +365,7 @@ pub(crate) fn resize_session(
 
 pub(crate) fn stop_session(state: &AppState, name: &str) -> Result<(), String> {
     let session = get_session(state, name).ok_or_else(|| "session not found".to_string())?;
-    let kill_result = session
-        .killer
-        .lock()
-        .unwrap()
-        .kill();
+    let kill_result = session.killer.lock().unwrap().kill();
     if let Err(err) = kill_result {
         if err.raw_os_error() != Some(0) {
             return Err(err.to_string());

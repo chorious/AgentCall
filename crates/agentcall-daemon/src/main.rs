@@ -1,5 +1,6 @@
 mod hooks;
 mod http;
+mod routes;
 mod session;
 mod state;
 mod summary;

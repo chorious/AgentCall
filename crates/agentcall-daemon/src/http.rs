@@ -2,6 +2,10 @@ use crate::hooks::{
     EventAppendRequest, HookIngestRequest, append_event_request, file_claims_state, ingest_hook,
     unmatched_hooks_state,
 };
+use crate::routes::{
+    ContextRequest, RouteRequest, TranscriptIndexRequest, checkpoint_session, create_context,
+    handle_route, index_transcript, route_state,
+};
 use crate::session::{
     InputRequest, ResizeRequest, Session, StartRequest, StreamEvent, get_session, list_sessions,
     resize_session, start_session, stop_session, write_input,
@@ -156,6 +160,26 @@ pub(crate) fn route(request: Request, state: Arc<AppState>) -> Response {
             Ok(result) => json_response(&result),
             Err(err) => error_response(400, &err),
         },
+        ("POST", "/api/routes") => match parse_json::<RouteRequest>(&request.body)
+            .and_then(|req| handle_route(&state, req))
+        {
+            Ok(result) => json_response(&result),
+            Err(err) => error_response(400, &err),
+        },
+        ("POST", "/api/context") => match parse_json::<ContextRequest>(&request.body)
+            .and_then(|req| create_context(&state, req))
+        {
+            Ok(result) => json_response(&result),
+            Err(err) => error_response(400, &err),
+        },
+        ("POST", "/api/transcripts/index") => {
+            match parse_json::<TranscriptIndexRequest>(&request.body)
+                .and_then(|req| index_transcript(&state, req))
+            {
+                Ok(result) => json_response(&result),
+                Err(err) => error_response(400, &err),
+            }
+        }
         ("POST", "/api/sessions") => match parse_json::<StartRequest>(&request.body)
             .and_then(|req| start_session(&state, req))
         {
@@ -168,6 +192,14 @@ pub(crate) fn route(request: Request, state: Arc<AppState>) -> Response {
 
 pub(crate) fn dynamic_route(request: Request, state: Arc<AppState>) -> Response {
     let path = request.path.split('?').next().unwrap_or("/");
+    if let Some(rest) = path.strip_prefix("/api/routes/") {
+        let id = url_decode(rest);
+        return match (request.method.as_str(), route_state(&state, &id)) {
+            ("GET", Some(value)) => json_response(&value),
+            ("GET", None) => error_response(404, "route not found"),
+            _ => error_response(404, "not found"),
+        };
+    }
     let Some(rest) = path.strip_prefix("/api/sessions/") else {
         return error_response(404, "not found");
     };
@@ -217,6 +249,10 @@ pub(crate) fn dynamic_route(request: Request, state: Arc<AppState>) -> Response 
         },
         ("POST", "stop") => match stop_session(&state, &name) {
             Ok(()) => json_response(&serde_json::json!({"ok": true})),
+            Err(err) => error_response(400, &err),
+        },
+        ("POST", "checkpoint") => match checkpoint_session(&state, &name) {
+            Ok(result) => json_response(&result),
             Err(err) => error_response(400, &err),
         },
         _ => error_response(404, "not found"),

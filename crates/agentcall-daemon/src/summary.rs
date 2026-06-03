@@ -1,4 +1,5 @@
 use crate::hooks::runtime_bindings_state;
+use crate::routes::routes_state;
 use crate::session::{Session, default_claude_workspace, list_sessions};
 use crate::state::{AppState, read_events, read_json_file};
 use crate::terminal::{clean_terminal_text, tail_lines};
@@ -32,6 +33,7 @@ pub(crate) fn board_state(
         serde_json::json!({}),
     );
     let reports = read_reports(&agent_dir.join("tasks"));
+    let routes = routes_state(state);
     let live_daemon_sessions = list_sessions(state);
     let legacy_sessions = legacy_detached_sessions(&agent_dir.join("sessions"));
     let attention = attention_items(state);
@@ -46,6 +48,7 @@ pub(crate) fn board_state(
         "file_claims": file_claims,
         "transcripts": transcripts,
         "reports": reports,
+        "routes": routes,
         "recent_events": events,
         "project_state": project_state
     });
@@ -60,6 +63,7 @@ pub(crate) fn board_state(
             serde_json::json!({"workspace": state.workspace, "recent_events": full["recent_events"]})
         }
         "reports" => serde_json::json!({"workspace": state.workspace, "reports": full["reports"]}),
+        "routes" => serde_json::json!({"workspace": state.workspace, "routes": full["routes"]}),
         "claims" => {
             serde_json::json!({"workspace": state.workspace, "file_claims": full["file_claims"]})
         }
