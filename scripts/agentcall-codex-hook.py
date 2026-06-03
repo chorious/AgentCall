@@ -10,6 +10,7 @@ from pathlib import Path
 
 
 def main() -> int:
+    configure_stdio()
     parser = argparse.ArgumentParser()
     parser.add_argument("--root", required=True)
     parser.add_argument("--event", default=None)
@@ -43,7 +44,7 @@ def main() -> int:
 
 
 def read_payload() -> dict:
-    text = sys.stdin.read()
+    text = sys.stdin.buffer.read().decode("utf-8-sig", errors="replace")
     if not text.strip():
         return {}
     try:
@@ -88,6 +89,14 @@ def sanitize(value):
     if isinstance(value, dict):
         return {sanitize(key): sanitize(item) for key, item in value.items()}
     return value
+
+
+def configure_stdio() -> None:
+    for stream_name in ("stdout", "stderr"):
+        stream = getattr(sys, stream_name, None)
+        reconfigure = getattr(stream, "reconfigure", None)
+        if reconfigure is not None:
+            reconfigure(encoding="utf-8", errors="replace")
 
 
 if __name__ == "__main__":

@@ -34,7 +34,7 @@ pub(crate) fn board_state(
     let reports = read_reports(&agent_dir.join("tasks"));
     let live_daemon_sessions = list_sessions(state);
     let legacy_sessions = legacy_detached_sessions(&agent_dir.join("sessions"));
-    let attention = attention_items(state, &legacy_sessions);
+    let attention = attention_items(state);
 
     let full = serde_json::json!({
         "workspace": state.workspace,
@@ -74,7 +74,7 @@ pub(crate) fn board_state(
             "workspace": state.workspace,
             "view": view.unwrap_or("full"),
             "filter": "attention",
-            "attention": selected.get("attention").cloned().unwrap_or_else(|| attention_items(state, &legacy_detached_sessions(&agent_dir.join("sessions")))),
+            "attention": selected.get("attention").cloned().unwrap_or_else(|| attention_items(state)),
         });
     }
     if view == Some("compact") {
@@ -357,10 +357,7 @@ pub(crate) fn legacy_detached_sessions(sessions_dir: &Path) -> serde_json::Value
     serde_json::json!(sessions)
 }
 
-fn attention_items(
-    state: &AppState,
-    legacy_detached_sessions: &serde_json::Value,
-) -> serde_json::Value {
+fn attention_items(state: &AppState) -> serde_json::Value {
     let mut items = vec![];
     let live_sessions: Vec<Arc<Session>> =
         state.sessions.lock().unwrap().values().cloned().collect();
@@ -382,17 +379,6 @@ fn attention_items(
                 "status_source": summary.get("status_source").cloned().unwrap_or(serde_json::Value::Null),
                 "binding_source": summary.get("binding_source").cloned().unwrap_or(serde_json::Value::Null),
                 "needs_attention": true,
-            }));
-        }
-    }
-    if let Some(legacy) = legacy_detached_sessions.as_array() {
-        for session in legacy {
-            items.push(serde_json::json!({
-                "kind": "legacy_detached_session",
-                "session": session.get("name").cloned().unwrap_or(serde_json::Value::Null),
-                "status": session.get("status").cloned().unwrap_or(serde_json::Value::Null),
-                "needs_attention": true,
-                "reason": "legacy Python PTY is not a live daemon session"
             }));
         }
     }

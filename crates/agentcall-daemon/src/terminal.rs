@@ -70,6 +70,10 @@ pub(crate) fn strip_ansi(text: &str) -> String {
     let mut output = String::with_capacity(text.len());
     let mut chars = text.chars().peekable();
     while let Some(ch) = chars.next() {
+        if ch == '\r' {
+            push_newline(&mut output);
+            continue;
+        }
         if ch != '\x1b' {
             output.push(ch);
             continue;
@@ -77,10 +81,19 @@ pub(crate) fn strip_ansi(text: &str) -> String {
         match chars.peek().copied() {
             Some('[') => {
                 chars.next();
+                let mut final_char = None;
                 for next in chars.by_ref() {
                     if ('@'..='~').contains(&next) {
+                        final_char = Some(next);
                         break;
                     }
+                }
+                match final_char {
+                    Some('H' | 'f' | 'E' | 'F' | 'A' | 'B' | 'J' | 'K') => {
+                        push_newline(&mut output)
+                    }
+                    Some('C' | 'G') => push_space(&mut output),
+                    _ => {}
                 }
             }
             Some(']') => {
@@ -99,6 +112,21 @@ pub(crate) fn strip_ansi(text: &str) -> String {
         }
     }
     output
+}
+
+fn push_space(output: &mut String) {
+    if !output.chars().last().is_some_and(|ch| ch.is_whitespace()) {
+        output.push(' ');
+    }
+}
+
+fn push_newline(output: &mut String) {
+    while output.ends_with(' ') || output.ends_with('\t') {
+        output.pop();
+    }
+    if !output.ends_with('\n') {
+        output.push('\n');
+    }
 }
 
 pub(crate) fn clean_terminal_text(text: &str) -> String {
@@ -137,5 +165,10 @@ mod tests {
     #[test]
     fn clean_text_strips_ansi() {
         assert_eq!(clean_terminal_text("\x1b[31mhello\x1b[m\n"), "hello");
+    }
+
+    #[test]
+    fn clean_text_preserves_cursor_position_separators() {
+        assert_eq!(clean_terminal_text("left\x1b[2;10Hright"), "left\nright");
     }
 }

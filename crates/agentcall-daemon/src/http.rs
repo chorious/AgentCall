@@ -15,7 +15,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs;
 use std::io::{BufRead, BufReader, Read, Write};
-use std::net::TcpStream;
+use std::net::{Shutdown, TcpStream};
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::mpsc;
@@ -565,12 +565,15 @@ pub(crate) fn write_fixed(
     };
     stream.write_all(
         format!(
-            "HTTP/1.1 {status} {reason}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nAccess-Control-Allow-Origin: *\r\n\r\n",
+            "HTTP/1.1 {status} {reason}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\nAccess-Control-Allow-Origin: *\r\n\r\n",
             body.len()
         )
         .as_bytes(),
     )?;
-    stream.write_all(body)
+    stream.write_all(body)?;
+    stream.flush()?;
+    let _ = stream.shutdown(Shutdown::Write);
+    Ok(())
 }
 
 pub(crate) fn parse_json<T: for<'de> Deserialize<'de>>(body: &[u8]) -> Result<T, String> {

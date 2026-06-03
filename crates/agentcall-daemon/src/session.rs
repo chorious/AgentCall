@@ -1,7 +1,7 @@
 use crate::state::{AppState, append_agent_event};
 use crate::terminal::{DecodeHealth, append_limited_text, decode_utf8_stream};
 use crate::util::{now_ms, safe_name};
-use portable_pty::{Child, CommandBuilder, MasterPty, PtySize, native_pty_system};
+use portable_pty::{Child, ChildKiller, CommandBuilder, MasterPty, PtySize, native_pty_system};
 use serde::{Deserialize, Serialize};
 use std::env;
 use std::io::{Read, Write};
@@ -21,6 +21,7 @@ pub(crate) struct Session {
     pub(crate) master: Mutex<Box<dyn MasterPty + Send>>,
     pub(crate) writer: Mutex<Box<dyn Write + Send>>,
     pub(crate) child: Mutex<Box<dyn Child + Send>>,
+    pub(crate) killer: Mutex<Box<dyn ChildKiller + Send + Sync>>,
     pub(crate) status: Mutex<String>,
     pub(crate) created_at: u64,
     pub(crate) updated_at: AtomicU64,
@@ -123,6 +124,7 @@ pub(crate) fn start_session(
         .slave
         .spawn_command(command)
         .map_err(|err| err.to_string())?;
+    let killer = child.clone_killer();
     let reader = pair
         .master
         .try_clone_reader()
@@ -136,6 +138,7 @@ pub(crate) fn start_session(
         master: Mutex::new(pair.master),
         writer: Mutex::new(writer),
         child: Mutex::new(child),
+        killer: Mutex::new(killer),
         status: Mutex::new("running".to_string()),
         created_at: now_ms(),
         updated_at: AtomicU64::new(now_ms()),
@@ -176,6 +179,7 @@ pub(crate) fn spawn_reader(
     thread::spawn(move || {
         let mut buf = [0u8; 8192];
         let mut pending = Vec::<u8>::new();
+        let mut control_tail = Vec::<u8>::new();
         loop {
             match reader.read(&mut buf) {
                 Ok(0) => break,
@@ -189,6 +193,19 @@ pub(crate) fn spawn_reader(
                             replay.drain(..drop);
                         }
                     }
+                    let mut control_scan = control_tail.clone();
+                    control_scan.extend_from_slice(bytes);
+                    for _ in control_scan
+                        .windows(4)
+                        .filter(|window| *window == b"\x1b[6n")
+                    {
+                        if let Ok(mut writer) = session.writer.lock() {
+                            let _ = writer.write_all(b"\x1b[1;1R");
+                            let _ = writer.flush();
+                        }
+                    }
+                    control_tail.clear();
+                    control_tail.extend_from_slice(&control_scan[control_scan.len().saturating_sub(3)..]);
                     session.updated_at.store(now_ms(), Ordering::Relaxed);
                     let data = {
                         let mut health = session.decode_health.lock().unwrap();
@@ -347,12 +364,18 @@ pub(crate) fn resize_session(
 
 pub(crate) fn stop_session(state: &AppState, name: &str) -> Result<(), String> {
     let session = get_session(state, name).ok_or_else(|| "session not found".to_string())?;
-    session
-        .child
+    let kill_result = session
+        .killer
         .lock()
         .unwrap()
-        .kill()
-        .map_err(|err| err.to_string())?;
+        .kill();
+    if let Err(err) = kill_result {
+        if err.raw_os_error() != Some(0) {
+            return Err(err.to_string());
+        }
+    }
+    *session.status.lock().unwrap() = "stopping".to_string();
+    session.updated_at.store(now_ms(), Ordering::Relaxed);
     append_agent_event(
         state,
         "pty.stop_requested",

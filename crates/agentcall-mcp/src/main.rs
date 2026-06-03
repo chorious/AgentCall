@@ -1,9 +1,10 @@
 use serde_json::{Value, json};
 use std::env;
-use std::io::{self, BufRead, Read, Write};
+use std::io::{self, BufRead, BufReader, Read, Write};
 use std::net::TcpStream;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::time::Duration;
 
 const PROTOCOL_VERSION: &str = "2024-11-05";
 const SERVER_NAME: &str = "agentcall-mcp";
@@ -452,6 +453,12 @@ fn daemon_request(
     let (host, port) = parse_daemon_url(&config.daemon_url)?;
     let mut stream = TcpStream::connect((host.as_str(), port))
         .map_err(|err| format!("failed to connect daemon {}: {err}", config.daemon_url))?;
+    stream
+        .set_read_timeout(Some(Duration::from_secs(8)))
+        .map_err(|err| format!("failed to set daemon read timeout: {err}"))?;
+    stream
+        .set_write_timeout(Some(Duration::from_secs(8)))
+        .map_err(|err| format!("failed to set daemon write timeout: {err}"))?;
     let body_text = body
         .map(|value| serde_json::to_string(&value).unwrap_or_else(|_| "{}".to_string()))
         .unwrap_or_default();
@@ -467,20 +474,51 @@ fn daemon_request(
     stream
         .write_all(request.as_bytes())
         .map_err(|err| format!("failed to write daemon request: {err}"))?;
-    let mut response = String::new();
     stream
-        .read_to_string(&mut response)
-        .map_err(|err| format!("failed to read daemon response: {err}"))?;
-    let Some((head, body)) = response.split_once("\r\n\r\n") else {
-        return Err("invalid daemon response".to_string());
-    };
+        .flush()
+        .map_err(|err| format!("failed to flush daemon request: {err}"))?;
+    let mut reader = BufReader::new(stream);
+    let mut head = String::new();
+    loop {
+        let mut line = String::new();
+        let read = reader
+            .read_line(&mut line)
+            .map_err(|err| format!("failed to read daemon response head: {err}"))?;
+        if read == 0 {
+            return Err("daemon closed connection before response head".to_string());
+        }
+        if line == "\r\n" || line == "\n" {
+            break;
+        }
+        head.push_str(&line);
+    }
     if !head.starts_with("HTTP/1.1 200") {
         return Err(format!(
             "daemon returned non-200 response: {}",
-            head.lines().next().unwrap_or(head)
+            head.lines().next().unwrap_or(&head)
         ));
     }
-    serde_json::from_str(body).map_err(|err| format!("invalid daemon JSON: {err}"))
+    let content_length = content_length_from_head(&head)?;
+    let mut body = vec![0u8; content_length];
+    reader
+        .read_exact(&mut body)
+        .map_err(|err| format!("failed to read daemon response body: {err}"))?;
+    serde_json::from_slice(&body).map_err(|err| format!("invalid daemon JSON: {err}"))
+}
+
+fn content_length_from_head(head: &str) -> Result<usize, String> {
+    for line in head.lines() {
+        let Some((name, value)) = line.split_once(':') else {
+            continue;
+        };
+        if name.trim().eq_ignore_ascii_case("content-length") {
+            return value
+                .trim()
+                .parse::<usize>()
+                .map_err(|err| format!("invalid daemon Content-Length: {err}"));
+        }
+    }
+    Err("daemon response missing Content-Length".to_string())
 }
 
 fn parse_daemon_url(url: &str) -> Result<(String, u16), String> {
