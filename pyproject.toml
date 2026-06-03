@@ -19,3 +19,5 @@ where = ["src"]
 
 [tool.pytest.ini_options]
 pythonpath = ["src"]
+addopts = "--basetemp=.agentcall_pytest -p no:cacheprovider"
+cache_dir = ".agentcall_pytest/cache"

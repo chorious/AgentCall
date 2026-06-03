@@ -1,4 +1,7 @@
 .agentcall/
+.agentcall_build/
+.agentcall_hook_smoke/
+.agentcall_pytest/
 .pytest_cache/
 .pytest_tmp/
 .pytest_tmp*/

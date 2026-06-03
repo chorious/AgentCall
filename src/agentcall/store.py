@@ -219,15 +219,32 @@ class Store:
     def events(self, task_id: str | None = None) -> list[dict[str, Any]]:
         self.require_initialized()
         items = []
+        skipped = 0
         if not self.events_path.exists():
             return items
         with self.events_path.open("r", encoding="utf-8") as handle:
             for line in handle:
                 if not line.strip():
                     continue
-                event = json.loads(line)
+                try:
+                    event = json.loads(line)
+                except json.JSONDecodeError:
+                    skipped += 1
+                    continue
                 if task_id is None or event.get("task_id") == task_id:
                     items.append(event)
+        if skipped and task_id is None:
+            items.append(
+                {
+                    "id": "evt-warning-invalid-json",
+                    "ts": utc_now(),
+                    "type": "events.invalid_json_skipped",
+                    "task_id": None,
+                    "run_id": None,
+                    "message": f"Skipped {skipped} invalid event log line(s).",
+                    "data": {"skipped": skipped},
+                }
+            )
         return items
 
     def events_tail(self, limit: int = 50, task_id: str | None = None) -> list[dict[str, Any]]:

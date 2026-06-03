@@ -1,3 +1,7 @@
 [workspace]
-members = ["crates/agentcall-daemon", "crates/agentcall-mcp"]
+members = [
+    "crates/agentcall-daemon",
+    "crates/agentcall-hook",
+    "crates/agentcall-mcp",
+]
 resolver = "3"

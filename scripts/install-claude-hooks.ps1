@@ -1,6 +1,6 @@
 param(
   [string]$Root = (Get-Location).Path,
-  [string]$Python = "python",
+  [string]$HookCommand = "",
   [ValidateSet("project-local", "project", "user")]
   [string]$Scope = "project-local",
   [switch]$WhatIfOnly
@@ -8,9 +8,12 @@ param(
 
 $ErrorActionPreference = "Stop"
 $rootPath = (Resolve-Path -LiteralPath $Root).Path
-$hookScript = Join-Path $rootPath "scripts\agentcall-claude-hook.py"
-if (-not (Test-Path -LiteralPath $hookScript)) {
-  throw "Hook script not found: $hookScript"
+$hookExe = Join-Path $rootPath "target\debug\agentcall-hook.exe"
+if ([string]::IsNullOrWhiteSpace($HookCommand)) {
+  if (-not (Test-Path -LiteralPath $hookExe)) {
+    throw "Rust hook binary not found: $hookExe. Run: cargo build -p agentcall-hook"
+  }
+  $HookCommand = $hookExe
 }
 
 if ($Scope -eq "user") {
@@ -56,15 +59,14 @@ foreach ($event in $events) {
     hooks = @(
       [ordered]@{
         type = "command"
-        command = $Python
+        command = $HookCommand
         args = @(
-          $hookScript,
           "--root",
           $rootPath,
           "--event",
           $event.Name,
-          "--python",
-          $Python
+          "--runtime",
+          "claude-code-session"
         )
         timeout = 30
       }

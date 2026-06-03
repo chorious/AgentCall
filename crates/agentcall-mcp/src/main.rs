@@ -162,6 +162,19 @@ fn tools() -> Vec<Value> {
             }
         }),
         json!({
+            "name": "agentcall_codex_preflight",
+            "description": "Codex turn-start preflight: inspect AgentCall state and return required next checks/actions.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "root": {"type": "string"},
+                    "objective": {"type": "string"},
+                    "phase": {"type": "string", "default": "turn_start"}
+                },
+                "additionalProperties": false
+            }
+        }),
+        json!({
             "name": "agentcall_context_packet_create",
             "description": "Create a v0.4 context packet and optionally persist call input artifacts.",
             "inputSchema": {
@@ -366,6 +379,7 @@ fn handle_tool_call(config: &Config, id: Value, params: Value) -> Value {
         "agentcall_report_schema" => python_json(config, &config.workspace, &["-c", REPORT_SCHEMA_SNIPPET]),
         "agentcall_workflow_simulate" => workflow_simulate(config, args),
         "agentcall_workflow_inspect" => workflow_inspect(config, args),
+        "agentcall_codex_preflight" => codex_preflight(config, args),
         "agentcall_route_task" => route_task_tool(config, args),
         "agentcall_context_packet_create" => context_packet_create(config, args),
         "agentcall_delegate_acp" => delegate_acp(config, args),
@@ -405,6 +419,7 @@ fn capabilities(config: &Config) -> Value {
             "route_task": true,
             "context_packet_create": true,
             "hook_ingest": true,
+            "codex_preflight": true,
             "checkpoint_request": true,
             "board": true,
             "session_control": true,
@@ -420,6 +435,7 @@ fn capabilities(config: &Config) -> Value {
             "agentcall_report_schema",
             "agentcall_workflow_simulate",
             "agentcall_workflow_inspect",
+            "agentcall_codex_preflight",
             "agentcall_route_task",
             "agentcall_context_packet_create",
             "agentcall_delegate_acp",
@@ -467,6 +483,123 @@ fn workflow_inspect(config: &Config, args: Value) -> Result<Value, String> {
         .ok_or("missing required argument: task_id")?;
     let output = run_agentcall(config, &root, &["workflow", "inspect", task_id])?;
     Ok(json!({"root": root.to_string_lossy(), "task_id": task_id, "output": output, "summary": parse_key_value_output(&output)}))
+}
+
+fn codex_preflight(config: &Config, args: Value) -> Result<Value, String> {
+    let root = root_from_args(config, &args);
+    let phase = args
+        .get("phase")
+        .and_then(Value::as_str)
+        .unwrap_or("turn_start");
+    let objective = args
+        .get("objective")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    let board = board(config, json!({"root": root.to_string_lossy()}))?;
+    let active_sessions = board
+        .get("active_sessions")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let file_claims = board
+        .get("file_claims")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let reports = board
+        .get("reports")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+
+    let active_claims: Vec<Value> = file_claims
+        .iter()
+        .filter(|claim| claim.get("status").and_then(Value::as_str) == Some("active"))
+        .cloned()
+        .collect();
+    let sessions_needing_attention: Vec<Value> = active_sessions
+        .iter()
+        .filter(|session| {
+            matches!(
+                session.get("status").and_then(Value::as_str),
+                Some("needs_permission" | "checkpoint_requested" | "checkpoint_due" | "blocked")
+            )
+        })
+        .cloned()
+        .collect();
+
+    let mut required_checks = vec!["agentcall_board"];
+    let mut next_actions = Vec::new();
+    let mut warnings = Vec::new();
+
+    if !objective.is_empty() && phase == "turn_start" {
+        required_checks.push("agentcall_route_task");
+        next_actions.push(json!({
+            "tool": "agentcall_route_task",
+            "reason": "choose ACP bounded child call vs PTY handoff route before delegating",
+            "objective": objective,
+        }));
+    }
+
+    if !active_claims.is_empty() || phase == "before_edit" {
+        required_checks.push("agentcall_file_claims");
+        next_actions.push(json!({
+            "tool": "agentcall_file_claims",
+            "reason": "avoid cross-agent edits to claimed files",
+        }));
+    }
+
+    if phase == "before_final" || !sessions_needing_attention.is_empty() {
+        required_checks.push("agentcall_reports_list");
+        required_checks.push("agentcall_events_tail");
+        next_actions.push(json!({
+            "tool": "agentcall_reports_list",
+            "reason": "accept clean child reports directly; write review only when drift/blockers need revision",
+        }));
+    }
+
+    if !sessions_needing_attention.is_empty() {
+        warnings.push(json!({
+            "kind": "session_attention",
+            "message": "Some child/handoff sessions need permission, checkpoint, or blocker handling.",
+            "sessions": sessions_needing_attention,
+        }));
+    }
+    if !active_claims.is_empty() {
+        warnings.push(json!({
+            "kind": "active_file_claims",
+            "message": "There are active file claims; inspect before editing overlapping files.",
+            "claims": active_claims,
+        }));
+    }
+
+    required_checks.sort();
+    required_checks.dedup();
+
+    Ok(json!({
+        "root": root.to_string_lossy(),
+        "phase": phase,
+        "objective": objective,
+        "required_checks": required_checks,
+        "next_actions": next_actions,
+        "warnings": warnings,
+        "summary": {
+            "active_sessions": active_sessions.len(),
+            "file_claims": file_claims.len(),
+            "reports": reports.len(),
+        },
+        "route_model": {
+            "shared_lifecycle": [
+                "context_packet",
+                "bounded_execution_or_handoff",
+                "events_hooks",
+                "structured_report",
+                "parent_validation",
+                "board_update"
+            ],
+            "only_difference": "route/runtime adapter: acp for agents-as-tools, pty for visible handoff/debug"
+        }
+    }))
 }
 
 fn route_task_tool(config: &Config, args: Value) -> Result<Value, String> {
@@ -851,6 +984,7 @@ mod tests {
         assert!(names.contains(&"agentcall_capabilities".to_string()));
         assert!(names.contains(&"agentcall_workflow_simulate".to_string()));
         assert!(names.contains(&"agentcall_workflow_inspect".to_string()));
+        assert!(names.contains(&"agentcall_codex_preflight".to_string()));
         assert!(names.contains(&"agentcall_route_task".to_string()));
         assert!(names.contains(&"agentcall_context_packet_create".to_string()));
         assert!(names.contains(&"agentcall_hook_ingest".to_string()));

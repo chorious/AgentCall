@@ -1,93 +1,43 @@
 # AgentCall
 
-AgentCall is an orchestration layer for supervising coding agents through bounded child lifecycles, structured reports, feedback gates, and process-aware delegation.
+AgentCall is an orchestration layer for supervising coding agents through bounded child lifecycles, structured reports, feedback gates, hooks, and process-aware delegation.
 
-The first version proved an SOP loop in one shared workspace. The v2 direction is protocol-first: a parent process owns project context, calls bounded child agents through Claude ACP/SDK-style drivers, requires a report at the end of every child lifecycle, and accepts clean work without ceremonial reviews.
+第一版证明了 SOP：多个 agent 能在同一个 workspace 下通过标准任务、报告、审查文件协作。现在的主线是 v2：主程拥有项目上下文、阶段组织和验收；子 Agent 通过 ACP/SDK 或 PTY handoff 执行一段有边界的生命周期；完成后必须交付结构化 report；没有问题就直接接受，不机械写 review。
 
-## v0.4 编排层
+## v0.5.1 Codex Hooks 与架构收敛
 
-v0.4 已经把双运行时编排层落成可测试后端：ACP 负责短生命周期
-agents-as-tools，可观测 Claude Code 会话负责长生命周期 handoffs，MCP 负责
-给 Codex/外部进程提供控制面。见：
+v0.5.1 把 Codex 自己也接入 AgentCall 的 hook/preflight 体系：Codex hooks 负责在回合开始、用户输入、停止和 compact 前后记录状态并注入提醒；Rust MCP 提供 `agentcall_codex_preflight`，返回主程下一步应该检查的 board、route、claims、reports。
+
+架构收敛为：
+
+- `web/`：CSS/JS/HTML 前端与状态看板。
+- `src/agentcall/`：Python 胶水层，保留 CLI、ACP adapter、workflow 测试入口。
+- `crates/`：Rust 后端层，包含 MCP server、hook receiver、PTY daemon。
+
+ACP 与 PTY 共享同一生命周期，只有 route/runtime adapter 不同。详见 `docs/v0.5.1-architecture.md`。
+
+## v0.5 Handoff 可观察性
+
+v0.5 增加 Claude Code hooks、file claim 冲突保护、transcript 索引、增强 route，以及可视化 board。
+
+- `docs/v0.5-implementation.md`
+
+## v0.4 编排控制面
+
+v0.4 建立了 AgentCall 的控制面：MCP 暴露能力、route 区分 ACP agents-as-tools 与 Claude Code handoff、context packet 约束子任务输入。
 
 - `docs/v0.4-orchestration-roadmap.md`
 - `docs/v0.4-implementation.md`
 
-## v0.5 Handoff 可观测性
-
-v0.5 补上真实 Claude Code hook 安装脚本、file claim 冲突策略、transcript 索引、
-更强 router，以及状态 board 前端。见 `docs/v0.5-implementation.md`。
-
-## v2.0 Direction
+## v2 Direction
 
 - Parent owns context, orchestration, validation, and task state.
 - Child agents are bounded lifecycle calls, not long-running project owners.
 - Every child call must return a structured report.
 - Reviews are delegated only when parent validation finds risk, drift, blockers, or low confidence.
-- SOP behavior moves into code: report validation, scope checks, lifecycle limits, and acceptance policy.
-- ACP/SDK is the flagship driver path.
-- PTY/tmux is parked as a v1.0 archive and fallback, not the short-term development direction.
-
-Run the current v2 simulation:
-
-```powershell
-$env:PYTHONPATH='src'
-python -m agentcall --root .agentcall-demo workflow simulate
-python -m agentcall --root .agentcall-demo workflow inspect task-0001
-```
-
-The simulation creates a tiny calculator project under `.agentcall-demo/.agentcall/simulations/`, runs a planner child, runs an executor child, validates the report and allowed scope, then records parent acceptance without writing `review.md`.
-
-The default live path is Claude ACP over stdio JSON-RPC. A deterministic
-`scripted` driver remains available for free smoke tests.
-
-Driver choices:
-
-```powershell
-python -m agentcall --root .agentcall-demo workflow simulate --driver scripted
-python -m agentcall --root .agentcall-demo workflow simulate --driver acp
-```
-
-`scripted` is deterministic and free. `acp` launches
-`@agentclientprotocol/claude-agent-acp` and should be used only when you intend
-to spend a bounded child lifecycle. The MCP surface does not advertise the
-legacy `claude -p` path.
-
-## v3.1 MCP Surface
-
-AgentCall now includes a Rust MCP server so other processes can discover and
-call the v2 runtime:
-
-```powershell
-cargo build -p agentcall-mcp
-target\debug\agentcall-mcp.exe --workspace E:\Project\AgentCall
-```
-
-It exposes:
-
-```text
-agentcall_capabilities
-agentcall_report_schema
-agentcall_workflow_simulate
-agentcall_workflow_inspect
-```
-
-The local Codex app config is registered with `[mcp_servers.agentcall]`. New
-Codex sessions can load the server and call these tools through MCP. See
-`docs/v3.0-mcp.md`.
-
-## v1.0 Scope
-
-- File-based SOP artifacts under `.agentcall/`
-- Append-only event log for auditability
-- Task lifecycle tracking
-- Worker run records with PID, command, stdout, stderr, and exit code
-- Standard `task.md` and `report.md` handoff files
-- `review.md` only when feedback, revision, or blocker handling is needed
-- A local CLI that can run without a daemon
-- Named PTY sessions for tmux-like stdin/output control
-
-This version is not yet large-scale parent/child agent collaboration. That comes after the SOP and process-supervision loop is solid.
+- SOP behavior moves into code: report validation, scope checks, lifecycle limits, route policy, hooks, and file claims.
+- ACP/SDK is the flagship child-call path.
+- PTY/tmux is retained as a visible handoff/debug route and archived v1.0 prototype.
 
 ## Quick Start
 
@@ -95,69 +45,116 @@ This version is not yet large-scale parent/child agent collaboration. That comes
 $env:PYTHONPATH='src'
 python -m agentcall init
 python -m agentcall task create "Build a minimal game loop"
-python -m agentcall run start task-0001 -- python -c "from pathlib import Path; Path('.agentcall/tasks/task-0001/report.md').write_text('status: done\nsummary: ok\n', encoding='utf-8')"
 python -m agentcall task status task-0001
 ```
 
-For the archived PTY/tmux prototype, see `docs/v1.0-tmux-pty-archive.md`.
-
-## v1.0 PTY/tmux Archive
-
-The Rust daemon plus xterm.js UI was the v1.0 high-fidelity prototype. It is
-kept as an archive and fallback, but it is no longer the short-term development
-direction.
+Run the current bounded workflow simulation:
 
 ```powershell
-npm install
-cargo build -p agentcall-daemon
+$env:PYTHONPATH='src'
+python -m agentcall --root .agentcall-demo workflow simulate --driver scripted
+python -m agentcall --root .agentcall-demo workflow inspect task-0001
+```
+
+The default live child route is Claude ACP over stdio JSON-RPC. A deterministic `scripted` driver remains available for free smoke tests.
+
+## Rust Backends
+
+Build all Rust backends:
+
+```powershell
+cargo build
+```
+
+MCP server:
+
+```powershell
+target\debug\agentcall-mcp.exe --workspace E:\Project\AgentCall
+```
+
+Hook receiver:
+
+```powershell
+target\debug\agentcall-hook.exe --root E:\Project\AgentCall --event UserPromptSubmit --runtime codex
+```
+
+PTY daemon and board:
+
+```powershell
 target\debug\agentcall-daemon.exe --port 3293 --workspace .
 ```
 
 Then open:
 
 ```text
-http://localhost:3293
+http://localhost:3293/board
 ```
 
-Start a PowerShell pane from the UI, or by API:
+## Hooks
+
+Install Codex hooks:
 
 ```powershell
-$body = @{
-  name = 'rps1'
-  command = @('powershell.exe', '-NoLogo')
-  cols = 100
-  rows = 36
-} | ConvertTo-Json -Depth 5
-
-Invoke-RestMethod `
-  -Uri http://localhost:3293/api/sessions `
-  -Method Post `
-  -ContentType 'application/json' `
-  -Body $body
+cargo build -p agentcall-hook
+.\scripts\install-codex-hooks.ps1 -Root E:\Project\AgentCall
 ```
 
-The Rust daemon streams PTY bytes over a WebSocket, and the browser renders them
-with xterm.js. This remains useful for attach/debug/fallback work. The v2 runtime
-focus is protocol-first child orchestration through ACP/SDK-style drivers.
+Install Claude Code hooks:
+
+```powershell
+cargo build -p agentcall-hook
+.\scripts\install-claude-hooks.ps1 -Root E:\Project\AgentCall
+```
+
+Claude Code hooks include `PreToolUse/PostToolUse` file claim protection. Codex hooks currently focus on state recording and context/preflight reminders.
+
+## MCP Surface
+
+AgentCall exposes a Rust MCP server so Codex or other parent processes can discover and call orchestration tools:
+
+```text
+agentcall_capabilities
+agentcall_report_schema
+agentcall_codex_preflight
+agentcall_route_task
+agentcall_context_packet_create
+agentcall_workflow_simulate
+agentcall_workflow_inspect
+agentcall_board
+agentcall_file_claims
+agentcall_reports_list
+agentcall_events_tail
+agentcall_hook_ingest
+agentcall_session_*
+```
+
+See `docs/v3.0-mcp.md`.
 
 ## Directory Layout
 
 ```text
 .agentcall/
   events.ndjson
+  state/
+    active_sessions.json
+    file_claims.json
+    transcripts.json
   tasks/
     task-0001/
       task.json
       task.md
-      report.md
+      reports/
+      calls/
       review.md        # only when feedback is needed
-      runs/
-        run-0001/
-          run.json
-          stdout.log
-          stderr.log
 ```
 
-## Design Bias
+## Tests
 
-AgentCall treats agents as supervised workers, not synchronous function calls. The SOP files are the contract; the process supervisor owns execution facts such as PID, command, exit code, and logs. This keeps the first version boring enough to trust.
+```powershell
+python -m pytest -q
+cargo test -p agentcall-mcp
+cargo test -p agentcall-hook
+cargo test -p agentcall-daemon
+```
+
+pytest temp output is configured under `.agentcall_pytest/` so root does not get flooded by `.pytest_tmp*` directories.
