@@ -19,7 +19,9 @@ $hooksPath = Join-Path $codexDir "hooks.json"
 New-Item -ItemType Directory -Path $codexDir -Force | Out-Null
 
 function New-Hook($eventName, $statusMessage, $matcher = $null) {
-  $command = "`"$HookCommand`" --root `"$rootPath`" --event $eventName --runtime codex"
+  $escapedHook = $HookCommand.Replace("'", "''")
+  $escapedRoot = $rootPath.Replace("'", "''")
+  $command = "powershell.exe -NoProfile -ExecutionPolicy Bypass -Command `"& '$escapedHook' --root '$escapedRoot' --event $eventName --runtime codex`""
   $entry = [ordered]@{
     hooks = @(
       [ordered]@{
