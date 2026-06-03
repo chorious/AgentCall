@@ -261,7 +261,7 @@ fn tools() -> Vec<Value> {
                 "properties": {
                     "root": {"type": "string"},
                     "name": {"type": "string"},
-                    "cwd": {"type": "string", "default": "D:\\guKimi", "description": "PTY child working directory. Defaults to the Claude Code workspace."},
+                    "cwd": {"type": "string", "description": "PTY child working directory. If omitted, daemon uses AGENTCALL_CLAUDE_WORKSPACE or its current directory."},
                     "command": {"type": "array", "items": {"type": "string"}},
                     "cols": {"type": "integer", "default": 100},
                     "rows": {"type": "integer", "default": 40}
@@ -927,7 +927,7 @@ fn session_status(config: &Config, args: Value) -> Result<Value, String> {
 fn session_tail(config: &Config, args: Value) -> Result<Value, String> {
     let _ = config;
     let _ = args;
-    Err("agentcall_session_tail is disabled in v0.6 daemon-single-writer mode; use session_summary or the viewer stream".to_string())
+    Err("agentcall_session_tail is disabled in current summary-first mode; use agentcall_session or the viewer stream".to_string())
 }
 
 fn session_send(config: &Config, args: Value) -> Result<Value, String> {

@@ -1,11 +1,11 @@
 # AgentCall Docs
 
-本文档目录按用途分层，避免 README 继续承载版本史、计划、review 和实现说明。
+这里是 AgentCall 的文档索引。README 只保留当前可用入口，版本演进放在 CHANGELOG，历史计划和 review 归档到 `docs/arch`。
 
 ## 当前入口
 
-- 项目当前说明：[../README.md](../README.md)
-- 版本演进：[../CHANGELOG.md](../CHANGELOG.md)
+- 项目说明：[../README.md](../README.md)
+- 版本历史：[../CHANGELOG.md](../CHANGELOG.md)
 
 ## 架构与协议
 
@@ -15,9 +15,9 @@
 - [sop-protocol.md](sop-protocol.md)：SOP 协作协议。
 - [v2.0-architecture.md](v2.0-architecture.md)：Parent/child Agent 协作方向。
 - [v3.0-mcp.md](v3.0-mcp.md)：MCP 接入说明。
-- [agentapi-adapter.md](agentapi-adapter.md)：agentapi adapter 调研与原型。
+- [agentapi-adapter.md](agentapi-adapter.md)：agentapi adapter 调研记录。
 
-## 版本实现说明
+## 历史实现说明
 
 - [v0.4-orchestration-roadmap.md](v0.4-orchestration-roadmap.md)
 - [v0.4-implementation.md](v0.4-implementation.md)
@@ -26,8 +26,11 @@
 - [v1.0-release-notes.md](v1.0-release-notes.md)
 - [v1.0-tmux-pty-archive.md](v1.0-tmux-pty-archive.md)
 
-## 计划与评审
+## 计划与 Review 归档
 
-- 计划文档放在 [arch/plan](arch/plan)。
-- review 和阶段报告放在 [arch/review](arch/review)。
-- 已完成但仍有参考价值的历史文档保留在原位；README 不再重复这些版本细节。
+- 计划归档：[arch/plan](arch/plan)
+- Review 与阶段报告归档：[arch/review](arch/review)
+
+## 当前版本提示
+
+当前主线版本是 `v0.7.1`：Hook-aware summary binding、daemon-first hooks、Windows ConPTY DSR 修复、stop 修复、UTF-8 hook 修复和 readable wrapper。
