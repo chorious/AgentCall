@@ -90,6 +90,7 @@ def build_parser() -> argparse.ArgumentParser:
     hook_ingest = hook_sub.add_parser("ingest", help="Ingest one hook event as JSON.")
     hook_ingest.add_argument("event")
     hook_ingest.add_argument("--payload-json", default="{}")
+    hook_ingest.add_argument("--runtime", default="claude-code-session")
 
     checkpoint = sub.add_parser("checkpoint", help="Request a Claude Code session checkpoint.")
     checkpoint_sub = checkpoint.add_subparsers(dest="checkpoint_command", required=True)
@@ -404,7 +405,7 @@ def handle_hook(args: argparse.Namespace, store: Store) -> int:
         payload = json.loads(args.payload_json)
     except json.JSONDecodeError as exc:
         raise AgentCallError(f"Invalid --payload-json: {exc}") from exc
-    result = ClaudeCodeHookReceiver(store).ingest(args.event, payload)
+    result = ClaudeCodeHookReceiver(store, runtime=args.runtime).ingest(args.event, payload)
     print(json.dumps(result.to_dict(), ensure_ascii=False, indent=2))
     return 0
 

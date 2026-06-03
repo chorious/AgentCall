@@ -218,7 +218,7 @@ def resolve_command(command: list[str]) -> list[str]:
         return command
     candidates = [executable]
     if os.name == "nt":
-        candidates = [executable, f"{executable}.cmd", f"{executable}.exe", f"{executable}.ps1"]
+        candidates = [executable, f"{executable}.cmd", f"{executable}.exe"]
     for candidate in candidates:
         resolved = shutil.which(candidate)
         if resolved:

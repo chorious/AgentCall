@@ -30,8 +30,9 @@ class HookIngestionResult:
 
 
 class ClaudeCodeHookReceiver:
-    def __init__(self, store: Store) -> None:
+    def __init__(self, store: Store, *, runtime: str = "claude-code-session") -> None:
         self.store = store
+        self.runtime = runtime
 
     def ingest(self, hook_event: str, payload: dict[str, Any]) -> HookIngestionResult:
         session_id = str(
@@ -55,7 +56,7 @@ class ClaudeCodeHookReceiver:
         decision = self._apply_policy(hook_event, payload)
         session = {
             "session_id": session_id,
-            "runtime": "claude-code-session",
+            "runtime": self.runtime,
             "status": status,
             "agent": normalized["agent"] or "claude-code",
             "pid": normalized["pid"],

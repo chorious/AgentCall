@@ -95,18 +95,16 @@ http://localhost:3293/board
 Install Codex hooks:
 
 ```powershell
-cargo build -p agentcall-hook
-.\scripts\install-codex-hooks.ps1 -Root E:\Project\AgentCall
+python scripts\install_codex_hooks.py --root E:\Project\AgentCall
 ```
 
 Install Claude Code hooks:
 
 ```powershell
-cargo build -p agentcall-hook
-.\scripts\install-claude-hooks.ps1 -Root E:\Project\AgentCall
+python scripts\install_claude_hooks.py --root E:\Project\AgentCall
 ```
 
-Claude Code hooks include `PreToolUse/PostToolUse` file claim protection. Codex hooks currently focus on state recording and context/preflight reminders.
+Claude Code hooks include `PreToolUse/PostToolUse` file claim protection. Codex hooks use a Python command path and currently focus on state recording and context/preflight reminders.
 
 ## MCP Surface
 
