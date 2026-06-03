@@ -137,7 +137,7 @@ def test_hook_script_daemon_first_concurrent_same_file(tmp_path, daemon_binary_p
             completed.append((returncode, stdout, stderr))
 
         assert all(returncode == 0 for returncode, _, _ in completed)
-        assert not any("falling back to legacy Python hook ingest" in stderr for _, _, stderr in completed)
+        assert not any("AgentCall daemon ingest failed" in stderr for _, _, stderr in completed)
 
         denied = [
             parse_hook_stdout(stdout)
@@ -191,7 +191,7 @@ def test_hook_script_daemon_first_read_does_not_claim(tmp_path, daemon_binary_pa
         }
         result = run_hook_process(tmp_path, base_url, "PostToolUse", payload)
         assert result.returncode == 0
-        assert "falling back to legacy Python hook ingest" not in result.stderr
+        assert "AgentCall daemon ingest failed" not in result.stderr
         assert read_json_url(f"{base_url}/api/file-claims") == {}
     finally:
         daemon.terminate()

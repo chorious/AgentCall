@@ -298,9 +298,6 @@ class Store:
     def file_claims(self) -> dict[str, Any]:
         return dict(self.read_state_json("file_claims.json", {}))
 
-    def write_file_claims(self, claims: dict[str, Any]) -> None:
-        self.write_state_json("file_claims.json", claims)
-
     def append_context_index(self, item: dict[str, Any]) -> None:
         index = self.read_state_json("context_index.json", {"calls": []})
         calls = list(index.get("calls", []))

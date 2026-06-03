@@ -53,8 +53,6 @@ def main() -> int:
                         str(root),
                         "--event",
                         event,
-                        "--python",
-                        args.python,
                     ],
                     "timeout": 30,
                 }

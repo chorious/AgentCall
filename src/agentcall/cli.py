@@ -11,7 +11,6 @@ from .sessions import SessionManager
 from .store import AgentCallError, Store
 from .supervisor import Supervisor
 from .v2.context import ContextPacket
-from .v2.hooks import ClaudeCodeHookReceiver
 from .v2.inspection import inspect_workflow
 from .v2.router import route_task
 from .v2.transcripts import index_transcript
@@ -93,13 +92,6 @@ def build_parser() -> argparse.ArgumentParser:
 
     board = sub.add_parser("board", help="Show unified v0.4 task/session/report state.")
     board.add_argument("--json", action="store_true")
-
-    hook = sub.add_parser("hook", help="Ingest Claude Code hook payloads.")
-    hook_sub = hook.add_subparsers(dest="hook_command", required=True)
-    hook_ingest = hook_sub.add_parser("ingest", help="Legacy fallback: ingest one hook event as JSON.")
-    hook_ingest.add_argument("event")
-    hook_ingest.add_argument("--payload-json", default="{}")
-    hook_ingest.add_argument("--runtime", default="claude-code-session")
 
     checkpoint = sub.add_parser("checkpoint", help="Request a Claude Code session checkpoint.")
     checkpoint_sub = checkpoint.add_subparsers(dest="checkpoint_command", required=True)
@@ -216,9 +208,6 @@ def main(argv: list[str] | None = None) -> int:
 
         if args.command == "board":
             return handle_board(args, store)
-
-        if args.command == "hook":
-            return handle_hook(args, store)
 
         if args.command == "checkpoint":
             return handle_checkpoint(args, store)
@@ -433,22 +422,6 @@ def handle_board(args: argparse.Namespace, store: Store) -> int:
     print(f"active_sessions: {len(state['active_sessions'])}")
     print(f"reports: {len(state['reports'])}")
     print(f"recent_events: {len(state['recent_events'])}")
-    return 0
-
-
-def handle_hook(args: argparse.Namespace, store: Store) -> int:
-    if args.hook_command != "ingest":
-        raise AgentCallError(f"Unknown hook command: {args.hook_command}")
-    print(
-        "AgentCall hook ingest CLI is legacy fallback; live v0.6.1 hook writes must POST daemon /api/hooks/ingest.",
-        file=sys.stderr,
-    )
-    try:
-        payload = json.loads(args.payload_json)
-    except json.JSONDecodeError as exc:
-        raise AgentCallError(f"Invalid --payload-json: {exc}") from exc
-    result = ClaudeCodeHookReceiver(store, runtime=args.runtime).ingest(args.event, payload)
-    print(json.dumps(result.to_dict(), ensure_ascii=False, indent=2))
     return 0
 
 

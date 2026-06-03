@@ -1,8 +1,6 @@
 from __future__ import annotations
 
 import json
-import os
-import subprocess
 import sys
 import textwrap
 from pathlib import Path
@@ -395,20 +393,6 @@ def test_v04_route_context_hook_board_and_checkpoint_cli(tmp_path, capsys):
     assert packet["call_id"] == "call-ctx"
     assert (tmp_path / ".agentcall" / "tasks" / "task-ctx" / "calls" / "call-ctx" / "input.json").exists()
 
-    payload = json.dumps(
-        {
-            "session_id": "sess-1",
-            "agent": "Claude Code",
-            "pid": 1234,
-            "transcript_path": "transcript.jsonl",
-        }
-    )
-    assert main(["--root", str(tmp_path), "hook", "ingest", "SessionStart", "--payload-json", payload]) == 0
-    hook = json.loads(capsys.readouterr().out)
-    assert hook["session_id"] == "sess-1"
-    assert hook["status"] == "running"
-    assert "AgentCall Context" in hook["context_injection"]
-
     assert main(["--root", str(tmp_path), "checkpoint", "request", "sess-1"]) == 0
     checkpoint = json.loads(capsys.readouterr().out)
     assert checkpoint["status"] == "checkpoint_requested"
@@ -419,34 +403,9 @@ def test_v04_route_context_hook_board_and_checkpoint_cli(tmp_path, capsys):
     assert board["active_sessions"][0]["status"] == "checkpoint_requested"
 
 
-def test_v05_file_claim_conflict_and_transcript_index(tmp_path, capsys):
+def test_v05_transcript_index(tmp_path, capsys):
     assert main(["--root", str(tmp_path), "init"]) == 0
     capsys.readouterr()
-
-    payload_a = json.dumps(
-        {
-            "session_id": "sess-a",
-            "hook_event_name": "PreToolUse",
-            "tool_name": "Write",
-            "tool_input": {"file_path": "src/app.py"},
-        }
-    )
-    assert main(["--root", str(tmp_path), "hook", "ingest", "PreToolUse", "--payload-json", payload_a]) == 0
-    first = json.loads(capsys.readouterr().out)
-    assert first["decision"]["allowed"] is True
-
-    payload_b = json.dumps(
-        {
-            "session_id": "sess-b",
-            "hook_event_name": "PreToolUse",
-            "tool_name": "Write",
-            "tool_input": {"file_path": "src/app.py"},
-        }
-    )
-    assert main(["--root", str(tmp_path), "hook", "ingest", "PreToolUse", "--payload-json", payload_b]) == 0
-    second = json.loads(capsys.readouterr().out)
-    assert second["decision"]["allowed"] is False
-    assert second["decision"]["conflicts"][0]["file"] == "src/app.py"
 
     transcript = tmp_path / "transcript.jsonl"
     transcript.write_text(
@@ -465,10 +424,6 @@ def test_v05_file_claim_conflict_and_transcript_index(tmp_path, capsys):
     assert summary["messages"] == 3
     assert summary["tool_uses"] == 1
     assert summary["tool_results"] == 1
-
-    assert main(["--root", str(tmp_path), "claims", "--json"]) == 0
-    claims = json.loads(capsys.readouterr().out)
-    assert claims[0]["file"] == "src/app.py"
 
 
 def test_v05_router_uses_richer_signals(tmp_path, capsys):
@@ -491,64 +446,6 @@ def test_v05_router_uses_richer_signals(tmp_path, capsys):
     assert route["recommended_runtime"] == "claude-code-session"
     assert route["confidence"] >= 0.7
     assert route["alternatives"]
-
-
-def test_v05_hook_handler_outputs_claude_deny_on_claim_conflict(tmp_path):
-    assert main(["--root", str(tmp_path), "init"]) == 0
-    script = Path(__file__).resolve().parents[1] / "scripts" / "agentcall-claude-hook.py"
-    env = os.environ.copy()
-    env["PYTHONPATH"] = str(Path(__file__).resolve().parents[1] / "src")
-    first = {
-        "session_id": "sess-a",
-        "hook_event_name": "PreToolUse",
-        "tool_name": "Write",
-        "tool_input": {"file_path": "src/app.py"},
-    }
-    second = {
-        "session_id": "sess-b",
-        "hook_event_name": "PreToolUse",
-        "tool_name": "Write",
-        "tool_input": {"file_path": "src/app.py"},
-    }
-    subprocess.run(
-        [sys.executable, str(script), "--root", str(tmp_path), "--event", "PreToolUse", "--python", sys.executable],
-        input=json.dumps(first),
-        text=True,
-        capture_output=True,
-        env=env,
-        check=True,
-    )
-    denied = subprocess.run(
-        [sys.executable, str(script), "--root", str(tmp_path), "--event", "PreToolUse", "--python", sys.executable],
-        input=json.dumps(second),
-        text=True,
-        capture_output=True,
-        env=env,
-        check=True,
-    )
-    payload = json.loads(denied.stdout)
-    output = payload["hookSpecificOutput"]
-    assert output["hookEventName"] == "PreToolUse"
-    assert output["permissionDecision"] == "deny"
-
-
-def test_v05_hook_handler_outputs_additional_context(tmp_path):
-    assert main(["--root", str(tmp_path), "init"]) == 0
-    script = Path(__file__).resolve().parents[1] / "scripts" / "agentcall-claude-hook.py"
-    env = os.environ.copy()
-    env["PYTHONPATH"] = str(Path(__file__).resolve().parents[1] / "src")
-    payload = {"session_id": "sess-context", "hook_event_name": "SessionStart"}
-    result = subprocess.run(
-        [sys.executable, str(script), "--root", str(tmp_path), "--event", "SessionStart", "--python", sys.executable],
-        input=json.dumps(payload),
-        text=True,
-        capture_output=True,
-        env=env,
-        check=True,
-    )
-    output = json.loads(result.stdout)["hookSpecificOutput"]
-    assert output["hookEventName"] == "SessionStart"
-    assert "AgentCall Context" in output["additionalContext"]
 
 
 def test_v2_acp_driver_reads_structured_report_from_stdio_agent(tmp_path):

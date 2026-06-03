@@ -111,7 +111,7 @@ Install Claude Code hooks:
 python scripts\install_claude_hooks.py --root E:\Project\AgentCall
 ```
 
-Claude Code and Codex hooks are daemon-first in v0.6.1: live hook writes POST `/api/hooks/ingest` through `AGENTCALL_DAEMON_URL` or `http://127.0.0.1:3293`. Python `agentcall hook ingest` is retained only as fail-open legacy fallback.
+Claude Code and Codex hooks are daemon-first in v0.6.1: live hook writes POST `/api/hooks/ingest` through `AGENTCALL_DAEMON_URL` or `http://127.0.0.1:3293`. If the daemon is unavailable, hook scripts fail open without writing shared state.
 
 ## MCP Surface
 

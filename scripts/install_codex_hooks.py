@@ -38,8 +38,6 @@ def main() -> int:
                 shell_token(str(root)),
                 "--event",
                 event,
-                "--python",
-                shell_token(args.python),
             ]
         )
         entry = {
