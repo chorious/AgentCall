@@ -1,0 +1,46 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>AgentCall Board</title>
+  <link rel="stylesheet" href="/board.css">
+</head>
+<body>
+  <main class="board">
+    <header class="bar">
+      <div>
+        <h1>AgentCall Board</h1>
+        <p id="workspace"></p>
+      </div>
+      <button id="refresh">刷新</button>
+    </header>
+    <section class="metrics" id="metrics"></section>
+    <section class="columns">
+      <section>
+        <h2>Claude Code Sessions</h2>
+        <div id="sessions" class="list"></div>
+      </section>
+      <section>
+        <h2>File Claims</h2>
+        <div id="claims" class="list"></div>
+      </section>
+      <section>
+        <h2>Reports</h2>
+        <div id="reports" class="list"></div>
+      </section>
+    </section>
+    <section class="columns lower">
+      <section>
+        <h2>Transcripts</h2>
+        <div id="transcripts" class="list"></div>
+      </section>
+      <section class="wide">
+        <h2>Recent Events</h2>
+        <div id="events" class="list mono"></div>
+      </section>
+    </section>
+  </main>
+  <script src="/board.js"></script>
+</body>
+</html>

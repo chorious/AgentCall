@@ -215,12 +215,16 @@ fn route(request: Request, state: Arc<AppState>) -> Response {
     let path = request.path.split('?').next().unwrap_or("/");
     match (request.method.as_str(), path) {
         ("GET", "/") => static_file("web/index.html"),
+        ("GET", "/board") => static_file("web/board.html"),
         ("GET", "/app.js") => static_file("web/app.js"),
+        ("GET", "/board.js") => static_file("web/board.js"),
+        ("GET", "/board.css") => static_file("web/board.css"),
         ("GET", "/styles.css") => static_file("web/styles.css"),
         ("GET", "/vendor/xterm.js") => static_file("web/vendor/xterm.js"),
         ("GET", "/vendor/xterm.css") => static_file("web/vendor/xterm.css"),
         ("GET", "/vendor/fit-addon.js") => static_file("web/vendor/fit-addon.js"),
         ("GET", "/api/sessions") => json_response(&list_sessions(&state)),
+        ("GET", "/api/board") => json_response(&board_state(&state)),
         ("POST", "/api/sessions") => match parse_json::<StartRequest>(&request.body)
             .and_then(|req| start_session(&state, req))
         {
@@ -400,6 +404,67 @@ fn list_sessions(state: &AppState) -> Vec<SessionInfo> {
         .collect();
     sessions.sort_by(|a, b| a.name.cmp(&b.name));
     sessions
+}
+
+fn board_state(state: &AppState) -> serde_json::Value {
+    let agent_dir = state.workspace.join(".agentcall");
+    let events = read_events(&agent_dir.join("events.ndjson"));
+    let project_state = read_json_file(&agent_dir.join("state").join("project.json"), serde_json::json!({}));
+    let active_sessions = read_json_file(&agent_dir.join("state").join("active_sessions.json"), serde_json::json!({}));
+    let file_claims = read_json_file(&agent_dir.join("state").join("file_claims.json"), serde_json::json!({}));
+    let transcripts = read_json_file(&agent_dir.join("state").join("transcripts.json"), serde_json::json!({}));
+    let reports = read_reports(&agent_dir.join("tasks"));
+    serde_json::json!({
+        "workspace": state.workspace,
+        "pty_sessions": list_sessions(state),
+        "active_sessions": active_sessions,
+        "file_claims": file_claims,
+        "transcripts": transcripts,
+        "reports": reports,
+        "recent_events": events,
+        "project_state": project_state
+    })
+}
+
+fn read_json_file(path: &Path, default: serde_json::Value) -> serde_json::Value {
+    let Ok(text) = fs::read_to_string(path) else {
+        return default;
+    };
+    serde_json::from_str(&text).unwrap_or(default)
+}
+
+fn read_events(path: &Path) -> Vec<serde_json::Value> {
+    let Ok(text) = fs::read_to_string(path) else {
+        return vec![];
+    };
+    let mut events: Vec<serde_json::Value> = text
+        .lines()
+        .filter_map(|line| serde_json::from_str(line).ok())
+        .collect();
+    if events.len() > 80 {
+        events = events.split_off(events.len() - 80);
+    }
+    events
+}
+
+fn read_reports(tasks_dir: &Path) -> Vec<serde_json::Value> {
+    let mut reports = vec![];
+    let Ok(tasks) = fs::read_dir(tasks_dir) else {
+        return reports;
+    };
+    for task in tasks.flatten() {
+        let reports_dir = task.path().join("reports");
+        let Ok(entries) = fs::read_dir(reports_dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            if entry.path().extension().and_then(|ext| ext.to_str()) != Some("json") {
+                continue;
+            }
+            reports.push(read_json_file(&entry.path(), serde_json::json!({})));
+        }
+    }
+    reports
 }
 
 fn session_info(session: &Arc<Session>) -> SessionInfo {

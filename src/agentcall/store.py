@@ -254,6 +254,7 @@ class Store:
             "file_claims.json": {},
             "active_sessions.json": {},
             "context_index.json": {"calls": []},
+            "transcripts.json": {},
         }
         for name, value in defaults.items():
             path = self.state_dir / name
@@ -276,6 +277,12 @@ class Store:
 
     def project_state(self) -> dict[str, Any]:
         return dict(self.read_state_json("project.json", {"version": 1, "decisions": [], "risks": [], "memory": []}))
+
+    def file_claims(self) -> dict[str, Any]:
+        return dict(self.read_state_json("file_claims.json", {}))
+
+    def write_file_claims(self, claims: dict[str, Any]) -> None:
+        self.write_state_json("file_claims.json", claims)
 
     def append_context_index(self, item: dict[str, Any]) -> None:
         index = self.read_state_json("context_index.json", {"calls": []})
@@ -303,6 +310,8 @@ class Store:
             "recent_events": self.events_tail(20),
             "reports": self.reports(),
             "project_state": self.project_state(),
+            "file_claims": list_file_claims(self.file_claims()),
+            "transcripts": list(self.read_state_json("transcripts.json", {}).values()),
         }
 
     def worker_json_path(self, worker_id: str) -> Path:
@@ -378,3 +387,10 @@ def task_status_from_report(report_exists: bool, exit_code: int | None) -> str:
     if exit_code == 0:
         return TaskStatus.FAILED.value
     return TaskStatus.FAILED.value
+
+
+def list_file_claims(claims: dict[str, Any]) -> list[dict[str, Any]]:
+    return [
+        {"file": file_path, **dict(claim)}
+        for file_path, claim in sorted(claims.items(), key=lambda item: item[0])
+    ]

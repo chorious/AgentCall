@@ -13,6 +13,11 @@ agents-as-tools，可观测 Claude Code 会话负责长生命周期 handoffs，M
 - `docs/v0.4-orchestration-roadmap.md`
 - `docs/v0.4-implementation.md`
 
+## v0.5 Handoff 可观测性
+
+v0.5 补上真实 Claude Code hook 安装脚本、file claim 冲突策略、transcript 索引、
+更强 router，以及状态 board 前端。见 `docs/v0.5-implementation.md`。
+
 ## v2.0 Direction
 
 - Parent owns context, orchestration, validation, and task state.

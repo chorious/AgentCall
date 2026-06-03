@@ -6,7 +6,7 @@ use std::process::Command;
 
 const PROTOCOL_VERSION: &str = "2024-11-05";
 const SERVER_NAME: &str = "agentcall-mcp";
-const SERVER_VERSION: &str = "0.4.0";
+const SERVER_VERSION: &str = "0.5.0";
 
 fn main() {
     let config = match Config::from_args(env::args().skip(1).collect()) {
@@ -151,7 +151,11 @@ fn tools() -> Vec<Value> {
                     "objective": {"type": "string"},
                     "task_type": {"type": "string"},
                     "estimated_files": {"type": "integer", "minimum": 0},
-                    "needs_continuity": {"type": "boolean", "default": false}
+                    "needs_continuity": {"type": "boolean", "default": false},
+                    "risk": {"type": "string"},
+                    "phase": {"type": "string"},
+                    "expected_minutes": {"type": "integer", "minimum": 0},
+                    "parallel_children": {"type": "integer", "minimum": 0}
                 },
                 "required": ["objective"],
                 "additionalProperties": false
@@ -218,6 +222,38 @@ fn tools() -> Vec<Value> {
         json!({
             "name": "agentcall_board",
             "description": "Return the unified v0.4 task/session/report board state.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {"root": {"type": "string"}},
+                "additionalProperties": false
+            }
+        }),
+        json!({
+            "name": "agentcall_file_claims",
+            "description": "Return current AgentCall file claims and conflict ownership.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {"root": {"type": "string"}},
+                "additionalProperties": false
+            }
+        }),
+        json!({
+            "name": "agentcall_transcript_index",
+            "description": "Index one Claude Code transcript JSONL file into AgentCall state.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "root": {"type": "string"},
+                    "path": {"type": "string"},
+                    "session_id": {"type": "string"}
+                },
+                "required": ["path"],
+                "additionalProperties": false
+            }
+        }),
+        json!({
+            "name": "agentcall_transcripts_list",
+            "description": "Return transcript summaries indexed by AgentCall.",
             "inputSchema": {
                 "type": "object",
                 "properties": {"root": {"type": "string"}},
@@ -336,6 +372,9 @@ fn handle_tool_call(config: &Config, id: Value, params: Value) -> Value {
         "agentcall_events_tail" => events_tail(config, args),
         "agentcall_reports_list" => reports_list(config, args),
         "agentcall_board" => board(config, args),
+        "agentcall_file_claims" => file_claims(config, args),
+        "agentcall_transcript_index" => transcript_index(config, args),
+        "agentcall_transcripts_list" => transcripts_list(config, args),
         "agentcall_hook_ingest" => hook_ingest(config, args),
         "agentcall_session_spawn" => session_spawn(config, args),
         "agentcall_session_list" => session_list(config, args),
@@ -368,7 +407,9 @@ fn capabilities(config: &Config) -> Value {
             "hook_ingest": true,
             "checkpoint_request": true,
             "board": true,
-            "session_control": true
+            "session_control": true,
+            "file_claims": true,
+            "transcripts": true
         },
         "drivers": [
             {"kind": "acp", "available": true, "live_model": true, "costs_tokens": true, "default": true, "transport": "stdio-json-rpc"},
@@ -385,6 +426,9 @@ fn capabilities(config: &Config) -> Value {
             "agentcall_events_tail",
             "agentcall_reports_list",
             "agentcall_board",
+            "agentcall_file_claims",
+            "agentcall_transcript_index",
+            "agentcall_transcripts_list",
             "agentcall_hook_ingest",
             "agentcall_session_spawn",
             "agentcall_session_list",
@@ -441,6 +485,22 @@ fn route_task_tool(config: &Config, args: Value) -> Result<Value, String> {
     }
     if args.get("needs_continuity").and_then(Value::as_bool).unwrap_or(false) {
         command.push("--needs-continuity".to_string());
+    }
+    for (json_key, cli_key) in [
+        ("risk", "--risk"),
+        ("phase", "--phase"),
+        ("expected_minutes", "--expected-minutes"),
+        ("parallel_children", "--parallel-children"),
+    ] {
+        if let Some(value) = args.get(json_key) {
+            if let Some(text) = value.as_str() {
+                command.push(cli_key.to_string());
+                command.push(text.to_string());
+            } else if let Some(number) = value.as_i64() {
+                command.push(cli_key.to_string());
+                command.push(number.to_string());
+            }
+        }
     }
     let output = run_agentcall_owned(config, &config.workspace, command)?;
     serde_json::from_str(&output).map_err(|err| format!("invalid route JSON: {err}"))
@@ -516,6 +576,30 @@ fn board(config: &Config, args: Value) -> Result<Value, String> {
     let root = root_from_args(config, &args);
     let output = run_agentcall_owned(config, &root, vec!["board".to_string(), "--json".to_string()])?;
     serde_json::from_str(&output).map_err(|err| format!("invalid board JSON: {err}"))
+}
+
+fn file_claims(config: &Config, args: Value) -> Result<Value, String> {
+    let root = root_from_args(config, &args);
+    let output = run_agentcall_owned(config, &root, vec!["claims".to_string(), "--json".to_string()])?;
+    serde_json::from_str(&output).map_err(|err| format!("invalid claims JSON: {err}"))
+}
+
+fn transcript_index(config: &Config, args: Value) -> Result<Value, String> {
+    let root = root_from_args(config, &args);
+    let path = required_str(&args, "path")?;
+    let mut command = vec!["transcript".to_string(), "index".to_string(), path.to_string()];
+    if let Some(session_id) = args.get("session_id").and_then(Value::as_str) {
+        command.push("--session-id".to_string());
+        command.push(session_id.to_string());
+    }
+    let output = run_agentcall_owned(config, &root, command)?;
+    serde_json::from_str(&output).map_err(|err| format!("invalid transcript index JSON: {err}"))
+}
+
+fn transcripts_list(config: &Config, args: Value) -> Result<Value, String> {
+    let root = root_from_args(config, &args);
+    let output = run_agentcall_owned(config, &root, vec!["transcript".to_string(), "list".to_string()])?;
+    serde_json::from_str(&output).map_err(|err| format!("invalid transcripts JSON: {err}"))
 }
 
 fn hook_ingest(config: &Config, args: Value) -> Result<Value, String> {
@@ -773,6 +857,9 @@ mod tests {
         assert!(names.contains(&"agentcall_board".to_string()));
         assert!(names.contains(&"agentcall_session_spawn".to_string()));
         assert!(names.contains(&"agentcall_session_send".to_string()));
+        assert!(names.contains(&"agentcall_file_claims".to_string()));
+        assert!(names.contains(&"agentcall_transcript_index".to_string()));
+        assert!(names.contains(&"agentcall_transcripts_list".to_string()));
     }
 
     #[test]

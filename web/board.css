@@ -1,0 +1,175 @@
+:root {
+  color-scheme: dark;
+  font-family: "Segoe UI", "Microsoft YaHei", system-ui, sans-serif;
+  background: #111315;
+  color: #e7e2d6;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  background: #111315;
+}
+
+.board {
+  width: min(1440px, 100%);
+  margin: 0 auto;
+  padding: 18px;
+}
+
+.bar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  padding-bottom: 14px;
+  border-bottom: 1px solid #35383b;
+}
+
+h1,
+h2,
+p {
+  margin: 0;
+}
+
+h1 {
+  font-size: 22px;
+  font-weight: 650;
+}
+
+h2 {
+  font-size: 14px;
+  font-weight: 650;
+  color: #f0b15f;
+  margin: 18px 0 10px;
+}
+
+p {
+  color: #b8b2a6;
+  line-height: 1.45;
+}
+
+button {
+  border: 1px solid #5b6268;
+  color: #f3efe7;
+  background: #22262a;
+  padding: 8px 14px;
+  border-radius: 6px;
+  cursor: pointer;
+}
+
+.metrics {
+  display: grid;
+  grid-template-columns: repeat(5, minmax(120px, 1fr));
+  gap: 10px;
+  margin: 16px 0 4px;
+}
+
+.metric {
+  border: 1px solid #35383b;
+  background: #1a1d20;
+  border-radius: 6px;
+  padding: 10px 12px;
+}
+
+.metric span {
+  display: block;
+  color: #9fa6aa;
+  font-size: 12px;
+}
+
+.metric strong {
+  display: block;
+  margin-top: 6px;
+  font-size: 24px;
+}
+
+.columns {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 14px;
+}
+
+.columns.lower {
+  grid-template-columns: minmax(0, 1fr) minmax(0, 2fr);
+}
+
+.wide {
+  min-width: 0;
+}
+
+.list {
+  display: grid;
+  gap: 8px;
+}
+
+article,
+.empty {
+  border: 1px solid #35383b;
+  background: #191c1f;
+  border-radius: 6px;
+  padding: 10px;
+  min-height: 42px;
+}
+
+.row {
+  display: grid;
+  grid-template-columns: 86px minmax(0, 1fr);
+  gap: 8px;
+  margin-bottom: 5px;
+  font-size: 12px;
+}
+
+.row span {
+  color: #949ba0;
+}
+
+.row b {
+  min-width: 0;
+  overflow-wrap: anywhere;
+  font-weight: 500;
+}
+
+.badge {
+  display: inline-block;
+  border: 1px solid #5b6268;
+  border-radius: 999px;
+  padding: 1px 7px;
+  font-style: normal;
+  color: #dce7ec;
+}
+
+.badge.running,
+.badge.active,
+.badge.done {
+  border-color: #4a8f70;
+  color: #8fe0b4;
+}
+
+.badge.needs_permission,
+.badge.checkpoint_requested,
+.badge.checkpoint_due {
+  border-color: #b08c47;
+  color: #ffd27a;
+}
+
+.badge.ended,
+.badge.released,
+.badge.stopped {
+  color: #9fa6aa;
+}
+
+.mono {
+  font-family: "Cascadia Mono", Consolas, monospace;
+}
+
+@media (max-width: 900px) {
+  .metrics,
+  .columns,
+  .columns.lower {
+    grid-template-columns: 1fr;
+  }
+}

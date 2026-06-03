@@ -14,6 +14,7 @@ from .v2.context import ContextPacket
 from .v2.hooks import ClaudeCodeHookReceiver
 from .v2.inspection import inspect_workflow
 from .v2.router import route_task
+from .v2.transcripts import index_transcript
 from .v2.workflows import run_small_project_workflow_with_driver
 
 
@@ -57,6 +58,10 @@ def build_parser() -> argparse.ArgumentParser:
     route.add_argument("--task-type", default=None)
     route.add_argument("--estimated-files", type=int, default=None)
     route.add_argument("--needs-continuity", action="store_true")
+    route.add_argument("--risk", default=None)
+    route.add_argument("--phase", default=None)
+    route.add_argument("--expected-minutes", type=int, default=None)
+    route.add_argument("--parallel-children", type=int, default=None)
 
     context = sub.add_parser("context", help="Create and inspect v0.4 context packets.")
     context_sub = context.add_subparsers(dest="context_command", required=True)
@@ -74,6 +79,9 @@ def build_parser() -> argparse.ArgumentParser:
     reports = sub.add_parser("reports", help="List structured child reports.")
     reports.add_argument("task_id", nargs="?")
 
+    claims = sub.add_parser("claims", help="List file claims.")
+    claims.add_argument("--json", action="store_true")
+
     board = sub.add_parser("board", help="Show unified v0.4 task/session/report state.")
     board.add_argument("--json", action="store_true")
 
@@ -87,6 +95,13 @@ def build_parser() -> argparse.ArgumentParser:
     checkpoint_sub = checkpoint.add_subparsers(dest="checkpoint_command", required=True)
     checkpoint_request = checkpoint_sub.add_parser("request", help="Mark a session as needing a checkpoint.")
     checkpoint_request.add_argument("session_id")
+
+    transcript = sub.add_parser("transcript", help="Index and inspect Claude Code transcripts.")
+    transcript_sub = transcript.add_subparsers(dest="transcript_command", required=True)
+    transcript_index = transcript_sub.add_parser("index", help="Index one transcript JSONL file.")
+    transcript_index.add_argument("path")
+    transcript_index.add_argument("--session-id", default=None)
+    transcript_sub.add_parser("list", help="List transcript summaries.")
 
     workflow = sub.add_parser("workflow", help="Run v2 bounded parent/child workflows.")
     workflow_sub = workflow.add_subparsers(dest="workflow_command", required=True)
@@ -177,6 +192,9 @@ def main(argv: list[str] | None = None) -> int:
         if args.command == "reports":
             return handle_reports(args, store)
 
+        if args.command == "claims":
+            return handle_claims(args, store)
+
         if args.command == "board":
             return handle_board(args, store)
 
@@ -185,6 +203,9 @@ def main(argv: list[str] | None = None) -> int:
 
         if args.command == "checkpoint":
             return handle_checkpoint(args, store)
+
+        if args.command == "transcript":
+            return handle_transcript(args, store)
 
         if args.command == "workflow":
             return handle_workflow(args, store)
@@ -301,6 +322,10 @@ def handle_route(args: argparse.Namespace) -> int:
         task_type=args.task_type,
         estimated_files=args.estimated_files,
         needs_continuity=args.needs_continuity,
+        risk=args.risk,
+        phase=args.phase,
+        expected_minutes=args.expected_minutes,
+        parallel_children=args.parallel_children,
     )
     print(json.dumps(recommendation.to_dict(), ensure_ascii=False, indent=2))
     return 0
@@ -348,6 +373,17 @@ def handle_reports(args: argparse.Namespace, store: Store) -> int:
     return 0
 
 
+def handle_claims(args: argparse.Namespace, store: Store) -> int:
+    store.require_initialized()
+    claims = list(store.file_claims().values())
+    if args.json:
+        print(json.dumps(claims, ensure_ascii=False, indent=2))
+    else:
+        for claim in claims:
+            print(f"{claim.get('file')}\t{claim.get('status')}\t{claim.get('session_id')}")
+    return 0
+
+
 def handle_board(args: argparse.Namespace, store: Store) -> int:
     state = store.board_state()
     if args.json:
@@ -389,6 +425,19 @@ def handle_checkpoint(args: argparse.Namespace, store: Store) -> int:
     )
     print(json.dumps(session, ensure_ascii=False, indent=2))
     return 0
+
+
+def handle_transcript(args: argparse.Namespace, store: Store) -> int:
+    if args.transcript_command == "index":
+        store.init()
+        summary = index_transcript(store, args.path, session_id=args.session_id)
+        print(json.dumps(summary.to_dict(), ensure_ascii=False, indent=2))
+        return 0
+    if args.transcript_command == "list":
+        store.require_initialized()
+        print(json.dumps(list(store.read_state_json("transcripts.json", {}).values()), ensure_ascii=False, indent=2))
+        return 0
+    raise AgentCallError(f"Unknown transcript command: {args.transcript_command}")
 
 
 def handle_workflow(args: argparse.Namespace, store: Store) -> int:
