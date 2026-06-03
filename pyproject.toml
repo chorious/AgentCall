@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "agentcall"
-version = "0.2.0"
+version = "0.7.1"
 description = "SOP orchestration for supervised CLI coding agents"
 readme = "README.md"
 requires-python = ">=3.11"

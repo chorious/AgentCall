@@ -4,7 +4,7 @@ version = 4
 
 [[package]]
 name = "agentcall-daemon"
-version = "0.1.0"
+version = "0.7.1"
 dependencies = [
  "chrono",
  "portable-pty",
@@ -14,14 +14,14 @@ dependencies = [
 
 [[package]]
 name = "agentcall-hook"
-version = "0.5.1"
+version = "0.7.1"
 dependencies = [
  "serde_json",
 ]
 
 [[package]]
 name = "agentcall-mcp"
-version = "0.5.0"
+version = "0.7.1"
 dependencies = [
  "serde",
  "serde_json",

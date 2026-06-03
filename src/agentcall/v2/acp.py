@@ -73,7 +73,7 @@ class AcpStdioClient:
                     "fs": {"readTextFile": False, "writeTextFile": False},
                     "terminal": False,
                 },
-                "clientInfo": {"name": "agentcall", "title": "AgentCall", "version": "0.2.0"},
+                "clientInfo": {"name": "agentcall", "title": "AgentCall", "version": "0.7.1"},
             },
         )
 
@@ -169,4 +169,3 @@ class AcpStdioClient:
         if not isinstance(message, dict):
             raise AcpError(f"ACP emitted non-object JSON message: {message!r}")
         return message
-

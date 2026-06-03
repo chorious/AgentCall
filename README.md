@@ -1,141 +1,100 @@
 # AgentCall
 
-AgentCall is an orchestration layer for supervising coding agents through bounded child lifecycles, structured reports, feedback gates, hooks, and process-aware delegation.
+AgentCall 是一个面向复杂工程的多 Agent 协作底座。它把 Claude Code / Codex / 未来 ACP 或 SDK 子 Agent 的工作统一收敛到同一个 daemon、同一套事件与状态 API，并让主程通过结构化 summary、report 和 file claim 来组织协作，而不是反复读取原始终端画面。
 
-第一版证明了 SOP：多个 agent 能在同一个 workspace 下通过标准任务、报告、审查文件协作。现在的主线是 v2：主程拥有项目上下文、阶段组织和验收；子 Agent 通过 ACP/SDK 或 PTY handoff 执行一段有边界的生命周期；完成后必须交付结构化 report；没有问题就直接接受，不机械写 review。
+当前主线版本：`v0.7.1 Hook-Aware Summary Binding`
 
-## v0.6 多 Agent 并发验收方向
+版本演进请看 [CHANGELOG.md](CHANGELOG.md)；完整文档索引请看 [docs/README.md](docs/README.md)。README 只记录当前可用入口和环境刷新方式。
 
-v0.6 的目标从继续打磨 PTY/summary 体验，调整为先证明多 Agent 并发下系统仍然可信：同文件 claim 必须稳定冲突，不同文件并发必须稳定通过，事件日志不能撞 id 或坏行，stale claim 能回收，Codex 能通过结构化 `session_summary` 验收多个 child，而不是默认读 PTY 画面。
+## 当前原则
 
-- `docs/arch/plan/v0.6-direction.md`
-- `docs/arch/plan/v0.6-plan.md`
+- Rust daemon 是 live 状态的唯一写者：`events`、`file_claims`、`active_sessions`、`session_summary`、`runtime_binding`。
+- Python 只保留 CLI 胶水、测试辅助和 legacy/manual 路径，不作为 live state writer。
+- Codex 默认读取 `agentcall_board` / `agentcall_session` 的结构化 summary，不默认读 raw terminal。
+- Claude Code hooks daemon-first：hook 脚本 POST `/api/hooks/ingest`，daemon 不可达时 fail-open。
+- PTY wrapper 负责人类可视化和 handoff；hook/report/validator 才是状态权威。
+- `D:\guKimi` 只通过 `AGENTCALL_CLAUDE_WORKSPACE` 注入，不作为发布硬编码默认。
 
-## v0.5.1 Codex Hooks 与架构收敛
+## 快速启动
 
-v0.5.1 把 Codex 自己也接入 AgentCall 的 hook/preflight 体系：Codex hooks 负责在回合开始、用户输入、停止和 compact 前后记录状态并注入提醒；Rust MCP 提供 `agentcall_codex_preflight`，返回主程下一步应该检查的 board、route、claims、reports。
-
-架构收敛为：
-
-- `web/`：CSS/JS/HTML 前端与状态看板。
-- `src/agentcall/`：Python 胶水层，保留 CLI、ACP adapter、workflow 测试入口。
-- `crates/`：Rust 后端层，包含 MCP server、hook receiver、PTY daemon。
-
-ACP 与 PTY 共享同一生命周期，只有 route/runtime adapter 不同。详见 `docs/v0.5.1-architecture.md`。
-
-## v0.5 Handoff 可观察性
-
-v0.5 增加 Claude Code hooks、file claim 冲突保护、transcript 索引、增强 route，以及可视化 board。
-
-- `docs/v0.5-implementation.md`
-
-## v0.4 编排控制面
-
-v0.4 建立了 AgentCall 的控制面：MCP 暴露能力、route 区分 ACP agents-as-tools 与 Claude Code handoff、context packet 约束子任务输入。
-
-- `docs/v0.4-orchestration-roadmap.md`
-- `docs/v0.4-implementation.md`
-
-## v2 Direction
-
-- Parent owns context, orchestration, validation, and task state.
-- Child agents are bounded lifecycle calls, not long-running project owners.
-- Every child call must return a structured report.
-- Reviews are delegated only when parent validation finds risk, drift, blockers, or low confidence.
-- SOP behavior moves into code: report validation, scope checks, lifecycle limits, route policy, hooks, and file claims.
-- ACP/SDK is the flagship child-call path.
-- PTY/tmux is retained as a visible handoff/debug route and archived v1.0 prototype.
-
-## Quick Start
+构建 Rust 后端：
 
 ```powershell
-$env:PYTHONPATH='src'
-python -m agentcall init
-python -m agentcall task create "Build a minimal game loop"
-python -m agentcall task status task-0001
+cargo build -p agentcall-daemon -p agentcall-mcp
 ```
 
-Run the current bounded workflow simulation:
+启动 daemon：
 
 ```powershell
-$env:PYTHONPATH='src'
-python -m agentcall --root .agentcall-demo workflow simulate --driver scripted
-python -m agentcall --root .agentcall-demo workflow inspect task-0001
+$env:AGENTCALL_CLAUDE_WORKSPACE='D:\guKimi'
+target\debug\agentcall-daemon.exe --workspace E:\Project\AgentCall
 ```
 
-The default live child route is Claude ACP over stdio JSON-RPC. A deterministic `scripted` driver remains available for free smoke tests.
-
-## Rust Backends
-
-Build all Rust backends:
-
-```powershell
-cargo build
-```
-
-MCP server:
-
-```powershell
-target\debug\agentcall-mcp.exe --workspace E:\Project\AgentCall
-```
-
-Hook receiver:
-
-```powershell
-target\debug\agentcall-hook.exe --root E:\Project\AgentCall --event UserPromptSubmit --runtime codex
-```
-
-PTY daemon and board:
-
-```powershell
-target\debug\agentcall-daemon.exe --port 3293 --workspace .
-```
-
-Then open:
+打开 board：
 
 ```text
-http://localhost:3293/board
+http://127.0.0.1:3293/board
 ```
 
-## Hooks
-
-Install Codex hooks:
-
-```powershell
-python scripts\install_codex_hooks.py --root E:\Project\AgentCall
-```
-
-Install Claude Code hooks:
+刷新 hook 配置：
 
 ```powershell
 python scripts\install_claude_hooks.py --root E:\Project\AgentCall
+python scripts\install_codex_hooks.py  --root E:\Project\AgentCall
 ```
 
-Claude Code and Codex hooks are daemon-first in v0.6.1: live hook writes POST `/api/hooks/ingest` through `AGENTCALL_DAEMON_URL` or `http://127.0.0.1:3293`. If the daemon is unavailable, hook scripts fail open without writing shared state.
+Claude Code hooks 默认写入项目本地 `.claude/settings.local.json`；Codex hooks 写入项目本地 `.codex/hooks.json`。更新 daemon、MCP 或 hook 脚本后，需要重启 daemon、viewer 和旧 Claude PTY 会话；旧 PID 不保证吃到新配置。
 
-## MCP Surface
+## MCP 默认工具流
 
-AgentCall exposes a Rust MCP server so Codex or other parent processes can discover and call orchestration tools:
+AgentCall 暴露 Rust MCP server，供 Codex 或其他主进程低负担调用：
 
 ```text
-agentcall_capabilities
-agentcall_report_schema
-agentcall_codex_preflight
-agentcall_route_task
-agentcall_context_packet_create
-agentcall_workflow_simulate
-agentcall_workflow_inspect
-agentcall_board
-agentcall_file_claims
-agentcall_reports_list
-agentcall_events_tail
-agentcall_hook_ingest
-agentcall_session_*
+agentcall_board(view=compact, filter=attention)
+agentcall_delegate
+agentcall_session
+agentcall_session_send
+agentcall_report
+agentcall_runtime_health
 ```
 
-See `docs/v3.0-mcp.md`.
+默认用法是先看 board，再进入具体 session：
 
-## Directory Layout
+```powershell
+target\debug\agentcall-mcp.exe --workspace E:\Project\AgentCall --daemon-url http://127.0.0.1:3293
+```
+
+## Daemon API
+
+常用接口：
+
+```text
+GET  /api/runtime/health
+GET  /api/board?view=compact&filter=attention
+GET  /api/sessions
+GET  /api/sessions/{name}/summary
+GET  /api/sessions/{name}/output/clean
+POST /api/sessions
+POST /api/sessions/{name}/input
+POST /api/hooks/ingest
+```
+
+`session_summary` 当前包含：
+
+```text
+liveness_status
+attention_status
+report_ready
+report_source
+status_source
+binding_source
+hook_session_id
+last_hook_status
+decode_health
+confidence
+```
+
+## 目录结构
 
 ```text
 .agentcall/
@@ -143,23 +102,35 @@ See `docs/v3.0-mcp.md`.
   state/
     active_sessions.json
     file_claims.json
+    runtime_binding.json
     transcripts.json
+  sessions/                 # legacy detached Python PTY，仅 debug/manual
   tasks/
     task-0001/
       task.json
       task.md
       reports/
       calls/
-      review.md        # only when feedback is needed
+      review.md             # 只有需要反馈时才写 review
+
+crates/
+  agentcall-daemon/          # PTY daemon、HTTP API、hook ingest、summary
+  agentcall-mcp/             # Rust MCP server
+  agentcall-hook/            # legacy standalone hook receiver
+
+scripts/
+  agentcall-claude-hook.py
+  agentcall-codex-hook.py
+  install_claude_hooks.py
+  install_codex_hooks.py
 ```
 
-## Tests
+## 测试
 
 ```powershell
+cargo test --workspace
 python -m pytest -q
-cargo test -p agentcall-mcp
-cargo test -p agentcall-hook
-cargo test -p agentcall-daemon
+python -m compileall scripts src
 ```
 
-pytest temp output is configured under `.agentcall_pytest/` so root does not get flooded by `.pytest_tmp*` directories.
+`pytest` 临时输出固定在 `.agentcall_pytest/`，避免污染项目根目录。
