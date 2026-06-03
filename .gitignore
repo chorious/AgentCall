@@ -2,6 +2,7 @@
 .agentcall_build/
 .agentcall_hook_smoke/
 .agentcall_pytest/
+.codex/
 .pytest_cache/
 .pytest_tmp/
 .pytest_tmp*/
