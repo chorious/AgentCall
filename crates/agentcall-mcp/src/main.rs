@@ -1,13 +1,13 @@
 use serde_json::{json, Value};
 use std::env;
-use std::io::{self, BufRead, Write};
+use std::io::{self, BufRead, Read, Write};
+use std::net::TcpStream;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
 const PROTOCOL_VERSION: &str = "2024-11-05";
 const SERVER_NAME: &str = "agentcall-mcp";
 const SERVER_VERSION: &str = "0.5.0";
-
 fn main() {
     let config = match Config::from_args(env::args().skip(1).collect()) {
         Ok(config) => config,
@@ -26,12 +26,14 @@ fn main() {
 struct Config {
     workspace: PathBuf,
     python: String,
+    daemon_url: String,
 }
 
 impl Config {
     fn from_args(args: Vec<String>) -> Result<Self, String> {
         let mut workspace = env::current_dir().map_err(|err| err.to_string())?;
         let mut python = "python".to_string();
+        let mut daemon_url = "http://127.0.0.1:3293".to_string();
         let mut index = 0;
         while index < args.len() {
             match args[index].as_str() {
@@ -50,16 +52,23 @@ impl Config {
                         .ok_or("missing --python value")?
                         .to_string();
                 }
+                "--daemon-url" => {
+                    index += 1;
+                    daemon_url = args
+                        .get(index)
+                        .ok_or("missing --daemon-url value")?
+                        .to_string();
+                }
                 "--help" | "-h" => {
                     return Err(
-                        "usage: agentcall-mcp [--workspace PATH] [--python PYTHON]".to_string(),
+                        "usage: agentcall-mcp [--workspace PATH] [--python PYTHON] [--daemon-url URL]".to_string(),
                     );
                 }
                 other => return Err(format!("unknown argument: {other}")),
             }
             index += 1;
         }
-        Ok(Self { workspace, python })
+        Ok(Self { workspace, python, daemon_url })
     }
 }
 
@@ -107,6 +116,31 @@ fn handle_message(config: &Config, request: Value) -> Option<Value> {
 fn tools() -> Vec<Value> {
     vec![
         json!({
+            "name": "agentcall_runtime_health",
+            "description": "Return AgentCall daemon health and state-writer status.",
+            "inputSchema": {"type": "object", "properties": {}, "additionalProperties": false}
+        }),
+        json!({
+            "name": "agentcall_project_sessions",
+            "description": "Return projects and sessions known by the AgentCall daemon.",
+            "inputSchema": {"type": "object", "properties": {}, "additionalProperties": false}
+        }),
+        json!({
+            "name": "agentcall_session_summary",
+            "description": "Return event-first summary for one PTY session from the AgentCall daemon.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {"name": {"type": "string"}},
+                "required": ["name"],
+                "additionalProperties": false
+            }
+        }),
+        json!({
+            "name": "agentcall_concurrency_probe",
+            "description": "Return daemon-side concurrency diagnostics. This is diagnostic only, not an acceptance test.",
+            "inputSchema": {"type": "object", "properties": {}, "additionalProperties": false}
+        }),
+        json!({
             "name": "agentcall_capabilities",
             "description": "Discover AgentCall v3 MCP capabilities, drivers, endpoints, and workspace.",
             "inputSchema": {"type": "object", "properties": {}, "additionalProperties": false}
@@ -124,6 +158,7 @@ fn tools() -> Vec<Value> {
                 "properties": {
                     "root": {"type": "string", "description": "Workspace root. Defaults to the server workspace."},
                     "driver": {"type": "string", "enum": ["acp", "scripted"], "default": "acp"},
+                    "claude_workspace": {"type": "string", "description": "Claude ACP/headless working directory. Defaults to AGENTCALL_CLAUDE_WORKSPACE or current directory."},
                     "max_turns": {"type": "integer", "minimum": 1, "default": 1}
                 },
                 "additionalProperties": false
@@ -202,6 +237,7 @@ fn tools() -> Vec<Value> {
                 "type": "object",
                 "properties": {
                     "root": {"type": "string"},
+                    "claude_workspace": {"type": "string", "description": "Claude ACP working directory. Defaults to AGENTCALL_CLAUDE_WORKSPACE or current directory."},
                     "max_turns": {"type": "integer", "minimum": 1, "default": 1}
                 },
                 "additionalProperties": false
@@ -295,6 +331,7 @@ fn tools() -> Vec<Value> {
                 "properties": {
                     "root": {"type": "string"},
                     "name": {"type": "string"},
+                    "cwd": {"type": "string", "default": "D:\\guKimi", "description": "PTY child working directory. Defaults to the Claude Code workspace."},
                     "command": {"type": "array", "items": {"type": "string"}},
                     "cols": {"type": "integer", "default": 100},
                     "rows": {"type": "integer", "default": 40}
@@ -374,7 +411,12 @@ fn tools() -> Vec<Value> {
 fn handle_tool_call(config: &Config, id: Value, params: Value) -> Value {
     let name = params.get("name").and_then(Value::as_str).unwrap_or("");
     let args = params.get("arguments").cloned().unwrap_or(json!({}));
+    let event_args = args.clone();
     let result = match name {
+        "agentcall_runtime_health" => daemon_get(config, "/api/runtime/health"),
+        "agentcall_project_sessions" => daemon_get(config, "/api/projects"),
+        "agentcall_session_summary" => session_summary(config, args),
+        "agentcall_concurrency_probe" => concurrency_probe(config),
         "agentcall_capabilities" => Ok(capabilities(config)),
         "agentcall_report_schema" => python_json(config, &config.workspace, &["-c", REPORT_SCHEMA_SNIPPET]),
         "agentcall_workflow_simulate" => workflow_simulate(config, args),
@@ -398,6 +440,9 @@ fn handle_tool_call(config: &Config, id: Value, params: Value) -> Value {
         "agentcall_checkpoint_request" => checkpoint_request(config, args),
         _ => Err(format!("unknown tool: {name}")),
     };
+    let status = if result.is_ok() { "ok" } else { "error" };
+    let message = result.as_ref().err().map(String::as_str).unwrap_or("");
+    emit_mcp_event(config, name, &event_args, status, message);
     match result {
         Ok(value) => success_response(id, tool_text(value)),
         Err(err) => success_response(id, tool_error(&err)),
@@ -411,6 +456,8 @@ fn capabilities(config: &Config) -> Value {
         "version": SERVER_VERSION,
         "protocol_version": "v3-mcp",
         "workspace": config.workspace.to_string_lossy(),
+        "daemon_url": config.daemon_url,
+        "claude_workspace": claude_workspace_from_args(&json!({})),
         "features": {
             "workflow_simulate": true,
             "workflow_inspect": true,
@@ -425,12 +472,19 @@ fn capabilities(config: &Config) -> Value {
             "session_control": true,
             "file_claims": true,
             "transcripts": true
+            ,
+            "runtime_health": true,
+            "session_summary": true
         },
         "drivers": [
             {"kind": "acp", "available": true, "live_model": true, "costs_tokens": true, "default": true, "transport": "stdio-json-rpc"},
             {"kind": "scripted", "available": true, "live_model": false, "costs_tokens": false, "test_only": true}
         ],
         "tools": [
+            "agentcall_runtime_health",
+            "agentcall_project_sessions",
+            "agentcall_session_summary",
+            "agentcall_concurrency_probe",
             "agentcall_capabilities",
             "agentcall_report_schema",
             "agentcall_workflow_simulate",
@@ -456,23 +510,112 @@ fn capabilities(config: &Config) -> Value {
     })
 }
 
+fn session_summary(config: &Config, args: Value) -> Result<Value, String> {
+    let name = args
+        .get("name")
+        .and_then(Value::as_str)
+        .ok_or("missing name")?;
+    daemon_get(config, &format!("/api/sessions/{}/summary", url_encode(name)))
+}
+
+fn concurrency_probe(config: &Config) -> Result<Value, String> {
+    let health = daemon_get(config, "/api/runtime/health")?;
+    Ok(json!({
+        "diagnostic_only": true,
+        "acceptance_source": "L0/L1/L2/L3 tests, not this probe",
+        "daemon": health
+    }))
+}
+
+fn daemon_get(config: &Config, path: &str) -> Result<Value, String> {
+    daemon_request(config, "GET", path, None)
+}
+
+fn daemon_post_json(config: &Config, path: &str, body: Value) -> Result<Value, String> {
+    daemon_request(config, "POST", path, Some(body))
+}
+
+fn daemon_request(config: &Config, method: &str, path: &str, body: Option<Value>) -> Result<Value, String> {
+    let (host, port) = parse_daemon_url(&config.daemon_url)?;
+    let mut stream = TcpStream::connect((host.as_str(), port))
+        .map_err(|err| format!("failed to connect daemon {}: {err}", config.daemon_url))?;
+    let body_text = body
+        .map(|value| serde_json::to_string(&value).unwrap_or_else(|_| "{}".to_string()))
+        .unwrap_or_default();
+    let request = if method == "POST" {
+        format!(
+            "POST {path} HTTP/1.1\r\nHost: {host}:{port}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            body_text.as_bytes().len(),
+            body_text
+        )
+    } else {
+        format!("GET {path} HTTP/1.1\r\nHost: {host}:{port}\r\nConnection: close\r\n\r\n")
+    };
+    stream
+        .write_all(request.as_bytes())
+        .map_err(|err| format!("failed to write daemon request: {err}"))?;
+    let mut response = String::new();
+    stream
+        .read_to_string(&mut response)
+        .map_err(|err| format!("failed to read daemon response: {err}"))?;
+    let Some((head, body)) = response.split_once("\r\n\r\n") else {
+        return Err("invalid daemon response".to_string());
+    };
+    if !head.starts_with("HTTP/1.1 200") {
+        return Err(format!("daemon returned non-200 response: {}", head.lines().next().unwrap_or(head)));
+    }
+    serde_json::from_str(body).map_err(|err| format!("invalid daemon JSON: {err}"))
+}
+
+fn parse_daemon_url(url: &str) -> Result<(String, u16), String> {
+    let rest = url
+        .strip_prefix("http://")
+        .ok_or("daemon-url must start with http://")?;
+    let host_port = rest.trim_end_matches('/');
+    let (host, port) = host_port
+        .rsplit_once(':')
+        .ok_or("daemon-url must include a port")?;
+    let port = port
+        .parse::<u16>()
+        .map_err(|err| format!("invalid daemon port: {err}"))?;
+    Ok((host.to_string(), port))
+}
+
+fn url_encode(value: &str) -> String {
+    value
+        .bytes()
+        .flat_map(|byte| match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                vec![byte as char]
+            }
+            _ => format!("%{byte:02X}").chars().collect(),
+        })
+        .collect()
+}
+
 fn workflow_simulate(config: &Config, args: Value) -> Result<Value, String> {
     let root = root_from_args(config, &args);
     let driver = args.get("driver").and_then(Value::as_str).unwrap_or("acp");
     let max_turns = args.get("max_turns").and_then(Value::as_i64).unwrap_or(1).to_string();
-    let output = run_agentcall(
-        config,
-        &root,
-        &[
-            "workflow",
-            "simulate",
-            "--driver",
-            driver,
-            "--max-turns",
-            &max_turns,
-        ],
-    )?;
-    Ok(json!({"root": root.to_string_lossy(), "output": output, "summary": parse_key_value_output(&output)}))
+    let mut command = vec![
+        "workflow".to_string(),
+        "simulate".to_string(),
+        "--driver".to_string(),
+        driver.to_string(),
+        "--max-turns".to_string(),
+        max_turns,
+    ];
+    if driver != "scripted" {
+        command.push("--claude-workspace".to_string());
+        command.push(claude_workspace_from_args(&args));
+    }
+    let output = run_agentcall_owned(config, &root, command)?;
+    Ok(json!({
+        "root": root.to_string_lossy(),
+        "claude_workspace": claude_workspace_from_args(&args),
+        "output": output,
+        "summary": parse_key_value_output(&output)
+    }))
 }
 
 fn workflow_inspect(config: &Config, args: Value) -> Result<Value, String> {
@@ -589,6 +732,7 @@ fn codex_preflight(config: &Config, args: Value) -> Result<Value, String> {
             "reports": reports.len(),
         },
         "route_model": {
+            "claude_workspace": claude_workspace_from_args(&args),
             "shared_lifecycle": [
                 "context_packet",
                 "bounded_execution_or_handoff",
@@ -706,15 +850,13 @@ fn reports_list(config: &Config, args: Value) -> Result<Value, String> {
 }
 
 fn board(config: &Config, args: Value) -> Result<Value, String> {
-    let root = root_from_args(config, &args);
-    let output = run_agentcall_owned(config, &root, vec!["board".to_string(), "--json".to_string()])?;
-    serde_json::from_str(&output).map_err(|err| format!("invalid board JSON: {err}"))
+    let _ = args;
+    daemon_get(config, "/api/board")
 }
 
 fn file_claims(config: &Config, args: Value) -> Result<Value, String> {
-    let root = root_from_args(config, &args);
-    let output = run_agentcall_owned(config, &root, vec!["claims".to_string(), "--json".to_string()])?;
-    serde_json::from_str(&output).map_err(|err| format!("invalid claims JSON: {err}"))
+    let _ = args;
+    daemon_get(config, "/api/file-claims")
 }
 
 fn transcript_index(config: &Config, args: Value) -> Result<Value, String> {
@@ -736,25 +878,12 @@ fn transcripts_list(config: &Config, args: Value) -> Result<Value, String> {
 }
 
 fn hook_ingest(config: &Config, args: Value) -> Result<Value, String> {
-    let root = root_from_args(config, &args);
     let event = required_str(&args, "event")?;
     let payload = args.get("payload").cloned().unwrap_or(json!({}));
-    let output = run_agentcall_owned(
-        config,
-        &root,
-        vec![
-            "hook".to_string(),
-            "ingest".to_string(),
-            event.to_string(),
-            "--payload-json".to_string(),
-            serde_json::to_string(&payload).unwrap(),
-        ],
-    )?;
-    serde_json::from_str(&output).map_err(|err| format!("invalid hook JSON: {err}"))
+    daemon_post_json(config, "/api/hooks/ingest", json!({"event": event, "payload": payload}))
 }
 
 fn session_spawn(config: &Config, args: Value) -> Result<Value, String> {
-    let root = root_from_args(config, &args);
     let name = required_str(&args, "name")?;
     let command_args = string_array(&args, "command");
     if command_args.is_empty() {
@@ -762,71 +891,60 @@ fn session_spawn(config: &Config, args: Value) -> Result<Value, String> {
     }
     let cols = args.get("cols").and_then(Value::as_i64).unwrap_or(100);
     let rows = args.get("rows").and_then(Value::as_i64).unwrap_or(40);
-    let mut command = vec![
-        "session".to_string(),
-        "start".to_string(),
-        "--cols".to_string(),
-        cols.to_string(),
-        "--rows".to_string(),
-        rows.to_string(),
-        name.to_string(),
-        "--".to_string(),
-    ];
-    command.extend(command_args);
-    let output = run_agentcall_owned(config, &root, command)?;
-    Ok(json!({"root": root.to_string_lossy(), "output": output, "summary": parse_tabbed_status(&output)}))
+    let cwd = args
+        .get("cwd")
+        .and_then(Value::as_str)
+        .map(str::to_string)
+        .unwrap_or_else(|| claude_workspace_from_args(&args));
+    let effective_cwd = if is_claude_command(&command_args) {
+        claude_workspace_from_args(&args)
+    } else {
+        cwd.clone()
+    };
+    let response = daemon_post_json(
+        config,
+        "/api/sessions",
+        json!({
+            "name": name,
+            "command": command_args,
+            "cwd": effective_cwd,
+            "cols": cols,
+            "rows": rows
+        }),
+    )?;
+    Ok(json!({
+        "cwd": effective_cwd,
+        "requested_cwd": cwd,
+        "cwd_policy": if is_claude_command(&string_array(&args, "command")) { "force_claude_workspace" } else { "requested_or_default" },
+        "session": response
+    }))
 }
 
 fn session_list(config: &Config, args: Value) -> Result<Value, String> {
-    let root = root_from_args(config, &args);
-    let output = run_agentcall_owned(config, &root, vec!["session".to_string(), "list".to_string()])?;
-    Ok(json!({"root": root.to_string_lossy(), "output": output}))
+    let _ = args;
+    daemon_get(config, "/api/sessions")
 }
 
 fn session_status(config: &Config, args: Value) -> Result<Value, String> {
-    let root = root_from_args(config, &args);
     let name = required_str(&args, "name")?;
-    let output = run_agentcall_owned(
-        config,
-        &root,
-        vec!["session".to_string(), "status".to_string(), name.to_string()],
-    )?;
-    Ok(json!({"root": root.to_string_lossy(), "name": name, "output": output, "summary": parse_key_value_output(&output)}))
+    daemon_get(config, &format!("/api/sessions/{}/summary", url_encode(name)))
 }
 
 fn session_tail(config: &Config, args: Value) -> Result<Value, String> {
-    let root = root_from_args(config, &args);
-    let name = required_str(&args, "name")?;
-    let lines = args.get("lines").and_then(Value::as_i64).unwrap_or(80);
-    let mut command = vec![
-        "session".to_string(),
-        "tail".to_string(),
-        name.to_string(),
-        "--lines".to_string(),
-        lines.to_string(),
-    ];
-    if args.get("plain").and_then(Value::as_bool).unwrap_or(true) {
-        command.push("--plain".to_string());
-    }
-    let output = run_agentcall_owned(config, &root, command)?;
-    Ok(json!({"root": root.to_string_lossy(), "name": name, "output": output}))
+    let _ = config;
+    let _ = args;
+    Err("agentcall_session_tail is disabled in v0.6 daemon-single-writer mode; use session_summary or the viewer stream".to_string())
 }
 
 fn session_send(config: &Config, args: Value) -> Result<Value, String> {
-    let root = root_from_args(config, &args);
     let name = required_str(&args, "name")?;
     let text = required_str(&args, "text")?;
-    let mut command = vec![
-        "session".to_string(),
-        "send".to_string(),
-        name.to_string(),
-        text.to_string(),
-    ];
-    if !args.get("enter").and_then(Value::as_bool).unwrap_or(true) {
-        command.push("--no-enter".to_string());
-    }
-    let output = run_agentcall_owned(config, &root, command)?;
-    Ok(json!({"root": root.to_string_lossy(), "name": name, "output": output, "summary": parse_tabbed_status(&output)}))
+    let enter = args.get("enter").and_then(Value::as_bool).unwrap_or(true);
+    daemon_post_json(
+        config,
+        &format!("/api/sessions/{}/input", url_encode(name)),
+        json!({"text": text, "enter": enter}),
+    )
 }
 
 fn checkpoint_request(config: &Config, args: Value) -> Result<Value, String> {
@@ -845,6 +963,57 @@ fn root_from_args(config: &Config, args: &Value) -> PathBuf {
         .and_then(Value::as_str)
         .map(PathBuf::from)
         .unwrap_or_else(|| config.workspace.clone())
+}
+
+fn claude_workspace_from_args(args: &Value) -> String {
+    args.get("claude_workspace")
+        .or_else(|| args.get("cwd"))
+        .and_then(Value::as_str)
+        .map(str::to_string)
+        .or_else(|| env::var("AGENTCALL_CLAUDE_WORKSPACE").ok())
+        .or_else(|| env::current_dir().ok().map(|path| path.to_string_lossy().to_string()))
+        .unwrap_or_else(|| ".".to_string())
+}
+
+fn is_claude_command(command: &[String]) -> bool {
+    command
+        .first()
+        .map(|program| {
+            let name = Path::new(program)
+                .file_name()
+                .and_then(|value| value.to_str())
+                .unwrap_or(program)
+                .to_ascii_lowercase();
+            name == "claude" || name == "claude.exe"
+        })
+        .unwrap_or(false)
+}
+
+fn emit_mcp_event(config: &Config, tool_name: &str, args: &Value, status: &str, message: &str) {
+    let data = json!({
+        "tool": tool_name,
+        "status": status,
+        "arguments": args,
+        "claude_workspace": claude_workspace_from_args(args),
+        "runtime": "mcp",
+        "error": message,
+    });
+    let event_message = if message.is_empty() {
+        format!("MCP tool {tool_name} completed.")
+    } else {
+        format!("MCP tool {tool_name} failed.")
+    };
+    if let Err(err) = daemon_post_json(
+        config,
+        "/api/events",
+        json!({
+            "event_type": "mcp.tool_called",
+            "message": event_message,
+            "data": data
+        }),
+    ) {
+        eprintln!("agentcall-mcp: failed to emit event: {err}");
+    }
 }
 
 fn run_agentcall(config: &Config, root: &Path, args: &[&str]) -> Result<String, String> {
@@ -914,16 +1083,6 @@ fn parse_key_value_output(output: &str) -> Value {
     let mut object = serde_json::Map::new();
     for line in output.lines() {
         if let Some((key, value)) = line.split_once(':') {
-            object.insert(key.trim().to_string(), json!(value.trim()));
-        }
-    }
-    Value::Object(object)
-}
-
-fn parse_tabbed_status(output: &str) -> Value {
-    let mut object = serde_json::Map::new();
-    for segment in output.split('\t') {
-        if let Some((key, value)) = segment.split_once('=') {
             object.insert(key.trim().to_string(), json!(value.trim()));
         }
     }

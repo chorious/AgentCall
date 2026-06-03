@@ -3,6 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 import shlex
 
+from ..runtime import claude_workspace
 from ..store import Store
 from .drivers import AcpClaudeDriver, AgentDriver, FunctionAgentDriver, HeadlessJsonClaudeDriver
 from .orchestrator import ParentOrchestrator, WorkflowOutcome
@@ -55,6 +56,7 @@ def run_small_project_workflow(
     *,
     driver: AgentDriver | None = None,
     reviewer: AgentDriver | None = None,
+    child_workspace: Path | str | None = None,
     max_turns: int = 1,
 ) -> WorkflowOutcome:
     store = Store(root)
@@ -62,7 +64,7 @@ def run_small_project_workflow(
     calculator = prepare_small_project(store)
     driver = driver or build_scripted_small_project_driver(calculator)
 
-    return ParentOrchestrator(store, driver, reviewer=reviewer).run_bounded_task(
+    return ParentOrchestrator(store, driver, reviewer=reviewer, child_workspace=child_workspace).run_bounded_task(
         objective=(
             "Fix the small_project calculator add bug. The file is "
             "`.agentcall/simulations/small_project/calculator.py`; change add(a, b) "
@@ -97,6 +99,7 @@ def run_small_project_workflow_with_driver(
     driver_kind: str = "scripted",
     acp_command: str | None = None,
     claude_bin: str = "claude",
+    claude_workspace_path: str | Path | None = None,
     max_turns: int = 1,
 ) -> WorkflowOutcome:
     store = Store(root)
@@ -108,7 +111,10 @@ def run_small_project_workflow_with_driver(
         acp_command=acp_command,
         claude_bin=claude_bin,
     )
-    return run_small_project_workflow(root, driver=driver, max_turns=max_turns)
+    child_workspace = None
+    if driver_kind in {"acp", "headless-json"}:
+        child_workspace = claude_workspace(claude_workspace_path)
+    return run_small_project_workflow(root, driver=driver, child_workspace=child_workspace, max_turns=max_turns)
 
 
 def split_command(command: str) -> list[str]:

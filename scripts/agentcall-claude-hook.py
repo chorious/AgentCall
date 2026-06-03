@@ -5,6 +5,8 @@ import json
 import os
 import subprocess
 import sys
+import urllib.error
+import urllib.request
 from pathlib import Path
 
 
@@ -68,6 +70,45 @@ def read_payload() -> dict:
 
 
 def ingest(root: Path, event: str, payload: dict, python_bin: str) -> dict:
+    daemon_result = ingest_via_daemon(event, payload, runtime=None)
+    if daemon_result is not None:
+        return daemon_result
+
+    print("AgentCall daemon ingest unavailable; falling back to legacy Python hook ingest.", file=sys.stderr)
+    return ingest_via_legacy_python(root, event, payload, python_bin)
+
+
+def ingest_via_daemon(event: str, payload: dict, runtime: str | None) -> dict | None:
+    daemon_url = os.environ.get("AGENTCALL_DAEMON_URL", "http://127.0.0.1:3293").rstrip("/")
+    body = {"event": event, "payload": payload}
+    if runtime:
+        body["runtime"] = runtime
+
+    request = urllib.request.Request(
+        f"{daemon_url}/api/hooks/ingest",
+        data=json.dumps(body, ensure_ascii=False).encode("utf-8"),
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=5) as response:
+            text = response.read().decode("utf-8")
+    except (OSError, urllib.error.URLError, urllib.error.HTTPError) as exc:
+        print(f"AgentCall daemon ingest failed: {exc}", file=sys.stderr)
+        return None
+
+    try:
+        result = json.loads(text)
+    except json.JSONDecodeError as exc:
+        print(f"Invalid AgentCall daemon hook ingest JSON: {exc}", file=sys.stderr)
+        return None
+    if not isinstance(result, dict):
+        print("Invalid AgentCall daemon hook ingest response: expected JSON object", file=sys.stderr)
+        return None
+    return result
+
+
+def ingest_via_legacy_python(root: Path, event: str, payload: dict, python_bin: str) -> dict:
     env = os.environ.copy()
     src = root / "src"
     env["PYTHONPATH"] = str(src) + os.pathsep + env.get("PYTHONPATH", "")

@@ -9,11 +9,13 @@ from pathlib import Path
 import winpty
 
 from .models import utc_now
+from .store import Store
 
 
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--root", required=True)
+    parser.add_argument("--cwd", default=None)
     parser.add_argument("--name", required=True)
     parser.add_argument("--command-json", required=True)
     parser.add_argument("--cols", type=int, default=100)
@@ -21,25 +23,33 @@ def main() -> int:
     args = parser.parse_args()
 
     root = Path(args.root).resolve()
+    cwd = Path(args.cwd).resolve() if args.cwd else root
+    store = Store(root)
     session_dir = root / ".agentcall" / "sessions" / args.name
     state_path = session_dir / "state.json"
     input_path = session_dir / "input.ndjson"
     output_path = session_dir / "output.log"
     command = [str(part) for part in json.loads(args.command_json)]
 
-    write_state(state_path, args.name, command, "starting", child_pid=None)
+    write_state(state_path, args.name, command, "starting", child_pid=None, cwd=str(cwd))
     child = winpty.PtyProcess.spawn(
         command,
-        cwd=str(root),
+        cwd=str(cwd),
         dimensions=(args.rows, args.cols),
     )
-    write_state(state_path, args.name, command, "running", child_pid=getattr(child, "pid", None))
+    child_pid = getattr(child, "pid", None)
+    write_state(state_path, args.name, command, "running", child_pid=child_pid, cwd=str(cwd))
+    store.append_event(
+        "pty.worker_started",
+        message=f"PTY worker spawned child for session {args.name}.",
+        data={"name": args.name, "child_pid": child_pid, "command": command, "cwd": str(cwd)},
+    )
 
     stop = threading.Event()
 
     def reader() -> None:
         with output_path.open("a", encoding="utf-8", errors="replace") as output:
-            output.write(f"\n\n--- session {args.name} started {utc_now()} command={command!r} ---\n")
+            output.write(f"\n\n--- session {args.name} started {utc_now()} cwd={str(cwd)!r} command={command!r} ---\n")
             output.flush()
             while not stop.is_set():
                 try:
@@ -47,6 +57,11 @@ def main() -> int:
                 except Exception as exc:
                     output.write(f"\n--- read error: {exc} ---\n")
                     output.flush()
+                    store.append_event(
+                        "pty.read_error",
+                        message=f"PTY read error in session {args.name}.",
+                        data={"name": args.name, "error": str(exc)},
+                    )
                     break
                 if not chunk:
                     time.sleep(0.05)
@@ -72,9 +87,17 @@ def main() -> int:
                             continue
                         event = json.loads(line)
                         if event.get("type") == "stop":
+                            store.append_event(
+                                "pty.stop_received",
+                                message=f"PTY stop received for session {args.name}.",
+                                data={"name": args.name},
+                            )
                             stop.set()
                             break
                         if event.get("type") == "input":
+                            delay_ms = int(event.get("delay_ms") or 0)
+                            if delay_ms > 0:
+                                time.sleep(delay_ms / 1000)
                             child.write(str(event.get("text", "")))
             time.sleep(0.1)
     finally:
@@ -84,11 +107,16 @@ def main() -> int:
                 child.terminate(force=True)
         except Exception:
             pass
-        write_state(state_path, args.name, command, "stopped", child_pid=getattr(child, "pid", None))
+        write_state(state_path, args.name, command, "stopped", child_pid=getattr(child, "pid", None), cwd=str(cwd))
+        store.append_event(
+            "pty.worker_stopped",
+            message=f"PTY worker stopped session {args.name}.",
+            data={"name": args.name, "child_pid": getattr(child, "pid", None), "cwd": str(cwd)},
+        )
     return 0
 
 
-def write_state(path: Path, name: str, command: list[str], status: str, child_pid: int | None) -> None:
+def write_state(path: Path, name: str, command: list[str], status: str, child_pid: int | None, cwd: str | None) -> None:
     current = {}
     if path.exists():
         try:
@@ -98,6 +126,7 @@ def write_state(path: Path, name: str, command: list[str], status: str, child_pi
     data = {
         "name": name,
         "command": command,
+        "cwd": cwd,
         "worker_pid": current.get("worker_pid"),
         "child_pid": child_pid,
         "status": status,

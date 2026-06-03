@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any
 
 from .models import utc_now
+from .runtime import claude_workspace, is_claude_command
 from .store import AgentCallError, Store
 
 
@@ -16,6 +17,7 @@ from .store import AgentCallError, Store
 class SessionRecord:
     name: str
     command: list[str]
+    cwd: str | None
     worker_pid: int | None
     child_pid: int | None
     status: str
@@ -27,6 +29,7 @@ class SessionRecord:
         return cls(
             name=str(data["name"]),
             command=[str(part) for part in data.get("command", [])],
+            cwd=data.get("cwd"),
             worker_pid=data.get("worker_pid"),
             child_pid=data.get("child_pid"),
             status=str(data.get("status", "unknown")),
@@ -38,6 +41,7 @@ class SessionRecord:
         return {
             "name": self.name,
             "command": self.command,
+            "cwd": self.cwd,
             "worker_pid": self.worker_pid,
             "child_pid": self.child_pid,
             "status": self.status,
@@ -63,10 +67,22 @@ class SessionManager:
     def output_path(self, name: str) -> Path:
         return self.session_dir(name) / "output.log"
 
-    def start(self, name: str, command: list[str], *, cols: int = 100, rows: int = 40) -> SessionRecord:
+    def start(
+        self,
+        name: str,
+        command: list[str],
+        *,
+        cols: int = 100,
+        rows: int = 40,
+        cwd: str | Path | None = None,
+    ) -> SessionRecord:
         self.store.require_initialized()
         if not command:
             raise AgentCallError("Missing session command after --")
+        requested_cwd = Path(cwd).resolve() if cwd is not None else self.store.root
+        working_dir = claude_workspace() if is_claude_command(command) else requested_cwd
+        if not working_dir.exists():
+            raise AgentCallError(f"Session cwd does not exist: {working_dir}")
         session_dir = self.session_dir(name)
         if self.state_path(name).exists():
             existing = self.load(name)
@@ -82,6 +98,7 @@ class SessionManager:
         record = SessionRecord(
             name=name,
             command=command,
+            cwd=str(working_dir),
             worker_pid=None,
             child_pid=None,
             status="starting",
@@ -99,6 +116,8 @@ class SessionManager:
             "agentcall.session_worker",
             "--root",
             str(self.store.root),
+            "--cwd",
+            str(working_dir),
             "--name",
             name,
             "--cols",
@@ -127,7 +146,15 @@ class SessionManager:
         self.store.append_event(
             "session.started",
             message=f"Session {name} started.",
-            data={"name": name, "worker_pid": proc.pid, "command": command},
+            data={
+                "name": name,
+                "worker_pid": proc.pid,
+                "command": command,
+                "cwd": str(working_dir),
+                "requested_cwd": str(requested_cwd),
+                "cwd_policy": "force_claude_workspace" if is_claude_command(command) else "requested_or_root",
+                "runtime": "pty",
+            },
         )
         return record
 
@@ -157,14 +184,17 @@ class SessionManager:
 
     def send(self, name: str, text: str, *, enter: bool = True) -> None:
         self.load(name)
-        payload = text + ("\r" if enter else "")
-        event = {"ts": utc_now(), "type": "input", "text": payload}
         with self.input_path(name).open("a", encoding="utf-8") as handle:
-            handle.write(json.dumps(event, ensure_ascii=False) + "\n")
+            if text:
+                event = {"ts": utc_now(), "type": "input", "text": text, "kind": "text"}
+                handle.write(json.dumps(event, ensure_ascii=False) + "\n")
+            if enter:
+                event = {"ts": utc_now(), "type": "input", "text": "\r", "kind": "submit", "delay_ms": 80}
+                handle.write(json.dumps(event, ensure_ascii=False) + "\n")
         self.store.append_event(
             "session.input",
             message=f"Input queued for session {name}.",
-            data={"name": name, "chars": len(payload), "enter": enter},
+            data={"name": name, "chars": len(text) + (1 if enter else 0), "enter": enter, "submit_split": enter},
         )
 
     def stop(self, name: str) -> None:

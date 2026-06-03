@@ -4,6 +4,13 @@ AgentCall is an orchestration layer for supervising coding agents through bounde
 
 第一版证明了 SOP：多个 agent 能在同一个 workspace 下通过标准任务、报告、审查文件协作。现在的主线是 v2：主程拥有项目上下文、阶段组织和验收；子 Agent 通过 ACP/SDK 或 PTY handoff 执行一段有边界的生命周期；完成后必须交付结构化 report；没有问题就直接接受，不机械写 review。
 
+## v0.6 多 Agent 并发验收方向
+
+v0.6 的目标从继续打磨 PTY/summary 体验，调整为先证明多 Agent 并发下系统仍然可信：同文件 claim 必须稳定冲突，不同文件并发必须稳定通过，事件日志不能撞 id 或坏行，stale claim 能回收，Codex 能通过结构化 `session_summary` 验收多个 child，而不是默认读 PTY 画面。
+
+- `docs/arch/plan/v0.6-direction.md`
+- `docs/arch/plan/v0.6-plan.md`
+
 ## v0.5.1 Codex Hooks 与架构收敛
 
 v0.5.1 把 Codex 自己也接入 AgentCall 的 hook/preflight 体系：Codex hooks 负责在回合开始、用户输入、停止和 compact 前后记录状态并注入提醒；Rust MCP 提供 `agentcall_codex_preflight`，返回主程下一步应该检查的 board、route、claims、reports。
@@ -104,7 +111,7 @@ Install Claude Code hooks:
 python scripts\install_claude_hooks.py --root E:\Project\AgentCall
 ```
 
-Claude Code hooks include `PreToolUse/PostToolUse` file claim protection. Codex hooks use a Python command path and currently focus on state recording and context/preflight reminders.
+Claude Code and Codex hooks are daemon-first in v0.6.1: live hook writes POST `/api/hooks/ingest` through `AGENTCALL_DAEMON_URL` or `http://127.0.0.1:3293`. Python `agentcall hook ingest` is retained only as fail-open legacy fallback.
 
 ## MCP Surface
 

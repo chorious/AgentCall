@@ -22,10 +22,17 @@ class WorkflowOutcome:
 
 
 class ParentOrchestrator:
-    def __init__(self, store: Store, driver: AgentDriver, reviewer: AgentDriver | None = None) -> None:
+    def __init__(
+        self,
+        store: Store,
+        driver: AgentDriver,
+        reviewer: AgentDriver | None = None,
+        child_workspace: Path | str | None = None,
+    ) -> None:
         self.store = store
         self.driver = driver
         self.reviewer = reviewer
+        self.child_workspace = Path(child_workspace).resolve() if child_workspace else None
 
     def run_bounded_task(
         self,
@@ -119,7 +126,7 @@ class ParentOrchestrator:
             role=role,
             mode=mode,
             objective=objective,
-            workspace=self.store.root,
+            workspace=self.child_workspace or self.store.root,
             allowed_paths=allowed_paths,
             acceptance_criteria=acceptance_criteria,
             max_turns=max_turns,
@@ -133,10 +140,12 @@ class ParentOrchestrator:
             data={
                 "call_id": call_id,
                 "driver": self.driver.name,
+                "workspace": str(spec.workspace),
                 "max_turns": max_turns,
                 "context_packet": str(self.store.call_path(task_id, call_id).relative_to(self.store.root)),
             },
         )
+        self._append_runtime_event(self.driver.name, "call_started", task_id, call_id, spec.workspace, mode.value)
         self.store.append_event(
             "agent.state_changed",
             task_id=task_id,
@@ -145,6 +154,15 @@ class ParentOrchestrator:
         )
         report = self.driver.invoke(spec)
         self._persist_report(report)
+        self._append_runtime_event(
+            self.driver.name,
+            "call_completed",
+            task_id,
+            report.call_id,
+            spec.workspace,
+            mode.value,
+            data={"status": report.status, "agent": report.agent},
+        )
         self.store.append_event(
             "child.report_received",
             task_id=task_id,
@@ -179,7 +197,7 @@ class ParentOrchestrator:
                 "Review the executor report and parent findings. Do not modify files. "
                 "Return done with empty risks/open_questions only if the work is acceptable."
             ),
-            workspace=self.store.root,
+            workspace=self.child_workspace or self.store.root,
             allowed_paths=allowed_paths,
             acceptance_criteria=acceptance_criteria,
             max_turns=max_turns,
@@ -193,9 +211,11 @@ class ParentOrchestrator:
             data={
                 "call_id": call_id,
                 "driver": self.reviewer.name,
+                "workspace": str(spec.workspace),
                 "context_packet": str(self.store.call_path(task_id, call_id).relative_to(self.store.root)),
             },
         )
+        self._append_runtime_event(self.reviewer.name, "call_started", task_id, call_id, spec.workspace, ChildMode.REVIEW.value)
         self.store.append_event(
             "agent.state_changed",
             task_id=task_id,
@@ -204,6 +224,15 @@ class ParentOrchestrator:
         )
         report = self.reviewer.invoke(spec)
         self._persist_report(report)
+        self._append_runtime_event(
+            self.reviewer.name,
+            "call_completed",
+            task_id,
+            report.call_id,
+            spec.workspace,
+            ChildMode.REVIEW.value,
+            data={"status": report.status, "agent": report.agent},
+        )
         self.store.append_event(
             "reviewer.report_received",
             task_id=task_id,
@@ -295,6 +324,29 @@ class ParentOrchestrator:
         if report.call_id.endswith("executor-02"):
             report.write_markdown(self.store.report_path(report.task_id))
 
+    def _append_runtime_event(
+        self,
+        driver_name: str,
+        action: str,
+        task_id: str,
+        call_id: str,
+        workspace: Path,
+        mode: str,
+        *,
+        data: dict | None = None,
+    ) -> None:
+        prefix = runtime_event_prefix(driver_name)
+        if prefix is None:
+            return
+        payload = {"call_id": call_id, "driver": driver_name, "workspace": str(workspace), "mode": mode}
+        payload.update(data or {})
+        self.store.append_event(
+            f"{prefix}.{action}",
+            task_id=task_id,
+            message=f"{driver_name} {action.replace('_', ' ')}.",
+            data=payload,
+        )
+
     def _fail(
         self,
         task_id: str,
@@ -343,3 +395,13 @@ def spec_to_dict(spec: ChildCallSpec) -> dict:
         "budget_usd": spec.budget_usd,
         "context": spec.context,
     }
+
+
+def runtime_event_prefix(driver_name: str) -> str | None:
+    if driver_name == "claude-acp":
+        return "acp"
+    if driver_name == "claude-headless-json":
+        return "fallback.claude_p"
+    if driver_name.startswith("simulated-"):
+        return "simulation"
+    return None

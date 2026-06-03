@@ -53,6 +53,15 @@ def build_parser() -> argparse.ArgumentParser:
     events.add_argument("--json", action="store_true", help="Print events as JSON.")
     events.add_argument("--limit", type=int, default=None)
 
+    event = sub.add_parser("event", help="Emit one backend event.")
+    event_sub = event.add_subparsers(dest="event_command", required=True)
+    event_emit = event_sub.add_parser("emit", help="Append one event to the AgentCall board.")
+    event_emit.add_argument("event_type")
+    event_emit.add_argument("--message", default="")
+    event_emit.add_argument("--task-id", default=None)
+    event_emit.add_argument("--run-id", default=None)
+    event_emit.add_argument("--data-json", default="{}")
+
     route = sub.add_parser("route", help="Recommend ACP vs Claude Code session runtime.")
     route.add_argument("objective")
     route.add_argument("--task-type", default=None)
@@ -87,7 +96,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     hook = sub.add_parser("hook", help="Ingest Claude Code hook payloads.")
     hook_sub = hook.add_subparsers(dest="hook_command", required=True)
-    hook_ingest = hook_sub.add_parser("ingest", help="Ingest one hook event as JSON.")
+    hook_ingest = hook_sub.add_parser("ingest", help="Legacy fallback: ingest one hook event as JSON.")
     hook_ingest.add_argument("event")
     hook_ingest.add_argument("--payload-json", default="{}")
     hook_ingest.add_argument("--runtime", default="claude-code-session")
@@ -119,6 +128,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="ACP stdio command string. Used only with --driver acp.",
     )
     workflow_simulate.add_argument("--claude-bin", default="claude", help="Claude CLI path for headless-json.")
+    workflow_simulate.add_argument(
+        "--claude-workspace",
+        default=None,
+        help="Working directory for Claude ACP/headless children. Defaults to AGENTCALL_CLAUDE_WORKSPACE or current directory.",
+    )
     workflow_simulate.add_argument("--max-turns", type=int, default=1, help="Lifecycle turn limit per child call.")
     workflow_inspect = workflow_sub.add_parser("inspect", help="Inspect a v2 workflow task.")
     workflow_inspect.add_argument("task_id")
@@ -139,13 +153,14 @@ def build_parser() -> argparse.ArgumentParser:
     session_start.add_argument("name")
     session_start.add_argument("--cols", type=int, default=100)
     session_start.add_argument("--rows", type=int, default=40)
+    session_start.add_argument("--cwd", default=None, help="Child process working directory.")
     session_start.add_argument("session_command_args", nargs=argparse.REMAINDER)
     session_sub.add_parser("list", help="List sessions.")
     session_status = session_sub.add_parser("status", help="Show session status.")
     session_status.add_argument("name")
     session_send = session_sub.add_parser("send", help="Send text to a session.")
     session_send.add_argument("name")
-    session_send.add_argument("text")
+    session_send.add_argument("text", nargs="?", default="")
     session_send.add_argument("--no-enter", action="store_true")
     session_tail = session_sub.add_parser("tail", help="Print recent session output.")
     session_tail.add_argument("name")
@@ -183,6 +198,9 @@ def main(argv: list[str] | None = None) -> int:
 
         if args.command == "events":
             return handle_events(args, store)
+
+        if args.command == "event":
+            return handle_event(args, store)
 
         if args.command == "route":
             return handle_route(args)
@@ -317,6 +335,26 @@ def handle_events(args: argparse.Namespace, store: Store) -> int:
     return 0
 
 
+def handle_event(args: argparse.Namespace, store: Store) -> int:
+    if args.event_command != "emit":
+        raise AgentCallError(f"Unknown event command: {args.event_command}")
+    try:
+        data = json.loads(args.data_json)
+    except json.JSONDecodeError as exc:
+        raise AgentCallError(f"Invalid --data-json: {exc}") from exc
+    if not isinstance(data, dict):
+        raise AgentCallError("--data-json must decode to an object")
+    event = store.append_event(
+        args.event_type,
+        task_id=args.task_id,
+        run_id=args.run_id,
+        message=args.message,
+        data=data,
+    )
+    print(json.dumps(event, ensure_ascii=False, indent=2))
+    return 0
+
+
 def handle_route(args: argparse.Namespace) -> int:
     recommendation = route_task(
         args.objective,
@@ -401,6 +439,10 @@ def handle_board(args: argparse.Namespace, store: Store) -> int:
 def handle_hook(args: argparse.Namespace, store: Store) -> int:
     if args.hook_command != "ingest":
         raise AgentCallError(f"Unknown hook command: {args.hook_command}")
+    print(
+        "AgentCall hook ingest CLI is legacy fallback; live v0.6.1 hook writes must POST daemon /api/hooks/ingest.",
+        file=sys.stderr,
+    )
     try:
         payload = json.loads(args.payload_json)
     except json.JSONDecodeError as exc:
@@ -449,6 +491,7 @@ def handle_workflow(args: argparse.Namespace, store: Store) -> int:
                 driver_kind=args.driver,
                 acp_command=args.acp_command,
                 claude_bin=args.claude_bin,
+                claude_workspace_path=args.claude_workspace,
                 max_turns=args.max_turns,
             )
         except ValueError as exc:
@@ -498,10 +541,14 @@ def handle_session(args: argparse.Namespace, store: Store) -> int:
 
     if args.session_command == "start":
         command = normalize_remainder(args.session_command_args)
-        record = manager.start(args.name, command, cols=args.cols, rows=args.rows)
+        cwd = args.cwd
+        if cwd is None and command[:1] == ["--cwd"] and len(command) >= 2:
+            cwd = command[1]
+            command = normalize_remainder(command[2:])
+        record = manager.start(args.name, command, cols=args.cols, rows=args.rows, cwd=cwd)
         print(
             f"{record.name}\tstatus={record.status}\tworker_pid={record.worker_pid}"
-            f"\tchild_pid={record.child_pid}\tcommand={' '.join(record.command)}"
+            f"\tchild_pid={record.child_pid}\tcwd={record.cwd or '-'}\tcommand={' '.join(record.command)}"
         )
         return 0
 
@@ -509,7 +556,7 @@ def handle_session(args: argparse.Namespace, store: Store) -> int:
         for record in manager.list():
             print(
                 f"{record.name}\t{record.status}\tworker_pid={record.worker_pid}"
-                f"\tchild_pid={record.child_pid}\tcommand={' '.join(record.command)}"
+                f"\tchild_pid={record.child_pid}\tcwd={record.cwd or '-'}\tcommand={' '.join(record.command)}"
             )
         return 0
 
@@ -519,6 +566,7 @@ def handle_session(args: argparse.Namespace, store: Store) -> int:
         print(f"status: {record.status}")
         print(f"worker_pid: {record.worker_pid}")
         print(f"child_pid: {record.child_pid}")
+        print(f"cwd: {record.cwd or '-'}")
         print(f"command: {' '.join(record.command)}")
         return 0
 

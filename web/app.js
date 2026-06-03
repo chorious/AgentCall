@@ -128,7 +128,8 @@ function createPane(session) {
     const text = input.value;
     if (!text.trim()) return;
     input.value = "";
-    socket.send({ type: "input", data: `${text}\r` });
+    socket.send({ type: "input", data: text });
+    setTimeout(() => socket.send({ type: "input", data: "\r" }), 80);
     term.focus();
   });
 
