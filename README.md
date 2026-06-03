@@ -1,6 +1,6 @@
 # AgentCall
 
-AgentCall 是一个面向复杂工程协作的本地 Agent 编排底座。当前主线是 Rust daemon 单写模型：daemon 负责 PTY 会话、hook ingest、file claim、runtime binding、summary 和 HTTP API；Python 只保留 CLI 胶水、测试辅助和 legacy/manual 路径。
+AgentCall 是一个面向复杂工程协作的本地 Agent 编排底座[特别适配Codex调用Claude Code]。当前主线是 Rust daemon 单写模型：daemon 负责 PTY 会话、hook ingest、file claim、runtime binding、summary 和 HTTP API；Python 只保留 CLI 胶水、测试辅助和 legacy/manual 路径。
 
 当前版本：`v0.7.1`
 
