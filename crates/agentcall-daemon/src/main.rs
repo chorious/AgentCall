@@ -3,6 +3,7 @@ mod http;
 mod session;
 mod state;
 mod summary;
+mod terminal;
 mod util;
 
 use crate::http::handle_connection;

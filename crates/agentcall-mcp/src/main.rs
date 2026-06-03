@@ -1,4 +1,4 @@
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::env;
 use std::io::{self, BufRead, Read, Write};
 use std::net::TcpStream;
@@ -47,10 +47,7 @@ impl Config {
                 }
                 "--python" => {
                     index += 1;
-                    python = args
-                        .get(index)
-                        .ok_or("missing --python value")?
-                        .to_string();
+                    python = args.get(index).ok_or("missing --python value")?.to_string();
                 }
                 "--daemon-url" => {
                     index += 1;
@@ -68,7 +65,11 @@ impl Config {
             }
             index += 1;
         }
-        Ok(Self { workspace, python, daemon_url })
+        Ok(Self {
+            workspace,
+            python,
+            daemon_url,
+        })
     }
 }
 
@@ -83,7 +84,11 @@ fn serve(config: Config) -> io::Result<()> {
         let line = line.trim_start_matches('\u{feff}');
         let response = match serde_json::from_str::<Value>(line) {
             Ok(request) => handle_message(&config, request),
-            Err(err) => Some(error_response(json!(null), -32700, &format!("Parse error: {err}"))),
+            Err(err) => Some(error_response(
+                json!(null),
+                -32700,
+                &format!("Parse error: {err}"),
+            )),
         };
         if let Some(response) = response {
             writeln!(stdout, "{}", serde_json::to_string(&response).unwrap())?;
@@ -108,8 +113,16 @@ fn handle_message(config: &Config, request: Value) -> Option<Value> {
         "notifications/initialized" => None,
         "ping" => Some(success_response(id, json!({}))),
         "tools/list" => Some(success_response(id, json!({ "tools": tools() }))),
-        "tools/call" => Some(handle_tool_call(config, id, request.get("params").cloned().unwrap_or(json!({})))),
-        _ => Some(error_response(id, -32601, &format!("Method not found: {method}"))),
+        "tools/call" => Some(handle_tool_call(
+            config,
+            id,
+            request.get("params").cloned().unwrap_or(json!({})),
+        )),
+        _ => Some(error_response(
+            id,
+            -32601,
+            &format!("Method not found: {method}"),
+        )),
     }
 }
 
@@ -118,26 +131,6 @@ fn tools() -> Vec<Value> {
         json!({
             "name": "agentcall_runtime_health",
             "description": "Return AgentCall daemon health and state-writer status.",
-            "inputSchema": {"type": "object", "properties": {}, "additionalProperties": false}
-        }),
-        json!({
-            "name": "agentcall_project_sessions",
-            "description": "Return projects and sessions known by the AgentCall daemon.",
-            "inputSchema": {"type": "object", "properties": {}, "additionalProperties": false}
-        }),
-        json!({
-            "name": "agentcall_session_summary",
-            "description": "Return event-first summary for one PTY session from the AgentCall daemon.",
-            "inputSchema": {
-                "type": "object",
-                "properties": {"name": {"type": "string"}},
-                "required": ["name"],
-                "additionalProperties": false
-            }
-        }),
-        json!({
-            "name": "agentcall_concurrency_probe",
-            "description": "Return daemon-side concurrency diagnostics. This is diagnostic only, not an acceptance test.",
             "inputSchema": {"type": "object", "properties": {}, "additionalProperties": false}
         }),
         json!({
@@ -151,8 +144,8 @@ fn tools() -> Vec<Value> {
             "inputSchema": {"type": "object", "properties": {}, "additionalProperties": false}
         }),
         json!({
-            "name": "agentcall_workflow_simulate",
-            "description": "Run the small-project bounded parent/child workflow through Claude ACP by default.",
+            "name": "agentcall_delegate",
+            "description": "Delegate a bounded workflow through ACP or scripted runtime.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -161,19 +154,6 @@ fn tools() -> Vec<Value> {
                     "claude_workspace": {"type": "string", "description": "Claude ACP/headless working directory. Defaults to AGENTCALL_CLAUDE_WORKSPACE or current directory."},
                     "max_turns": {"type": "integer", "minimum": 1, "default": 1}
                 },
-                "additionalProperties": false
-            }
-        }),
-        json!({
-            "name": "agentcall_workflow_inspect",
-            "description": "Inspect a v2 workflow task and return report/state evidence.",
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "root": {"type": "string", "description": "Workspace root. Defaults to the server workspace."},
-                    "task_id": {"type": "string"}
-                },
-                "required": ["task_id"],
                 "additionalProperties": false
             }
         }),
@@ -231,58 +211,16 @@ fn tools() -> Vec<Value> {
             }
         }),
         json!({
-            "name": "agentcall_delegate_acp",
-            "description": "Run the bounded small-project workflow through the ACP runtime.",
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "root": {"type": "string"},
-                    "claude_workspace": {"type": "string", "description": "Claude ACP working directory. Defaults to AGENTCALL_CLAUDE_WORKSPACE or current directory."},
-                    "max_turns": {"type": "integer", "minimum": 1, "default": 1}
-                },
-                "additionalProperties": false
-            }
-        }),
-        json!({
-            "name": "agentcall_events_tail",
-            "description": "Return recent AgentCall events as JSON.",
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "root": {"type": "string"},
-                    "task_id": {"type": "string"},
-                    "limit": {"type": "integer", "minimum": 1, "default": 50}
-                },
-                "additionalProperties": false
-            }
-        }),
-        json!({
-            "name": "agentcall_reports_list",
-            "description": "Return structured child reports as JSON.",
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "root": {"type": "string"},
-                    "task_id": {"type": "string"}
-                },
-                "additionalProperties": false
-            }
-        }),
-        json!({
             "name": "agentcall_board",
-            "description": "Return the unified v0.4 task/session/report board state.",
+            "description": "Return unified board state. Use compact/attention views for low-friction Codex control.",
             "inputSchema": {
                 "type": "object",
-                "properties": {"root": {"type": "string"}},
-                "additionalProperties": false
-            }
-        }),
-        json!({
-            "name": "agentcall_file_claims",
-            "description": "Return current AgentCall file claims and conflict ownership.",
-            "inputSchema": {
-                "type": "object",
-                "properties": {"root": {"type": "string"}},
+                "properties": {
+                    "root": {"type": "string"},
+                    "view": {"type": "string", "enum": ["full", "compact"], "default": "full"},
+                    "filter": {"type": "string", "enum": ["all", "attention"], "default": "all"},
+                    "section": {"type": "string", "enum": ["all", "sessions", "events", "reports", "claims", "transcripts"], "default": "all"}
+                },
                 "additionalProperties": false
             }
         }),
@@ -297,15 +235,6 @@ fn tools() -> Vec<Value> {
                     "session_id": {"type": "string"}
                 },
                 "required": ["path"],
-                "additionalProperties": false
-            }
-        }),
-        json!({
-            "name": "agentcall_transcripts_list",
-            "description": "Return transcript summaries indexed by AgentCall.",
-            "inputSchema": {
-                "type": "object",
-                "properties": {"root": {"type": "string"}},
                 "additionalProperties": false
             }
         }),
@@ -341,67 +270,46 @@ fn tools() -> Vec<Value> {
             }
         }),
         json!({
-            "name": "agentcall_session_list",
-            "description": "List PTY sessions known to AgentCall.",
-            "inputSchema": {
-                "type": "object",
-                "properties": {"root": {"type": "string"}},
-                "additionalProperties": false
-            }
-        }),
-        json!({
-            "name": "agentcall_session_status",
-            "description": "Show one PTY session status.",
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "root": {"type": "string"},
-                    "name": {"type": "string"}
-                },
-                "required": ["name"],
-                "additionalProperties": false
-            }
-        }),
-        json!({
-            "name": "agentcall_session_tail",
-            "description": "Return recent output from a PTY session.",
+            "name": "agentcall_session",
+            "description": "Return one daemon PTY session llm_summary, with optional clean output tail.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "root": {"type": "string"},
                     "name": {"type": "string"},
-                    "lines": {"type": "integer", "default": 80},
-                    "plain": {"type": "boolean", "default": true}
+                    "include": {"type": "array", "items": {"type": "string", "enum": ["summary", "clean_tail"]}, "default": ["summary"]}
                 },
                 "required": ["name"],
+                "additionalProperties": false
+            }
+        }),
+        json!({
+            "name": "agentcall_report",
+            "description": "Request or accept a report for a supervised session/task.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "root": {"type": "string"},
+                    "action": {"type": "string", "enum": ["request", "accept"], "default": "accept"},
+                    "session_id": {"type": "string"},
+                    "task_id": {"type": "string"}
+                },
                 "additionalProperties": false
             }
         }),
         json!({
             "name": "agentcall_session_send",
-            "description": "Send text to a PTY session.",
+            "description": "Send text or a high-level nudge action to a daemon PTY session.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "root": {"type": "string"},
                     "name": {"type": "string"},
+                    "action": {"type": "string", "enum": ["send", "continue", "stop", "request_report"], "default": "send"},
                     "text": {"type": "string"},
                     "enter": {"type": "boolean", "default": true}
                 },
-                "required": ["name", "text"],
-                "additionalProperties": false
-            }
-        }),
-        json!({
-            "name": "agentcall_checkpoint_request",
-            "description": "Mark a Claude Code handoff session as needing a checkpoint report.",
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "root": {"type": "string"},
-                    "session_id": {"type": "string"}
-                },
-                "required": ["session_id"],
+                "required": ["name"],
                 "additionalProperties": false
             }
         }),
@@ -418,12 +326,15 @@ fn handle_tool_call(config: &Config, id: Value, params: Value) -> Value {
         "agentcall_session_summary" => session_summary(config, args),
         "agentcall_concurrency_probe" => concurrency_probe(config),
         "agentcall_capabilities" => Ok(capabilities(config)),
-        "agentcall_report_schema" => python_json(config, &config.workspace, &["-c", REPORT_SCHEMA_SNIPPET]),
+        "agentcall_report_schema" => {
+            python_json(config, &config.workspace, &["-c", REPORT_SCHEMA_SNIPPET])
+        }
         "agentcall_workflow_simulate" => workflow_simulate(config, args),
         "agentcall_workflow_inspect" => workflow_inspect(config, args),
         "agentcall_codex_preflight" => codex_preflight(config, args),
         "agentcall_route_task" => route_task_tool(config, args),
         "agentcall_context_packet_create" => context_packet_create(config, args),
+        "agentcall_delegate" => delegate(config, args),
         "agentcall_delegate_acp" => delegate_acp(config, args),
         "agentcall_events_tail" => events_tail(config, args),
         "agentcall_reports_list" => reports_list(config, args),
@@ -436,7 +347,9 @@ fn handle_tool_call(config: &Config, id: Value, params: Value) -> Value {
         "agentcall_session_list" => session_list(config, args),
         "agentcall_session_status" => session_status(config, args),
         "agentcall_session_tail" => session_tail(config, args),
+        "agentcall_session" => session(config, args),
         "agentcall_session_send" => session_send(config, args),
+        "agentcall_report" => report(config, args),
         "agentcall_checkpoint_request" => checkpoint_request(config, args),
         _ => Err(format!("unknown tool: {name}")),
     };
@@ -469,12 +382,15 @@ fn capabilities(config: &Config) -> Value {
             "codex_preflight": true,
             "checkpoint_request": true,
             "board": true,
+            "board_compact": true,
             "session_control": true,
+            "llm_summary": true,
             "file_claims": true,
             "transcripts": true
             ,
             "runtime_health": true,
-            "session_summary": true
+            "session_summary": true,
+            "legacy_tools_supported_as_aliases": true
         },
         "drivers": [
             {"kind": "acp", "available": true, "live_model": true, "costs_tokens": true, "default": true, "transport": "stdio-json-rpc"},
@@ -482,30 +398,19 @@ fn capabilities(config: &Config) -> Value {
         ],
         "tools": [
             "agentcall_runtime_health",
-            "agentcall_project_sessions",
-            "agentcall_session_summary",
-            "agentcall_concurrency_probe",
             "agentcall_capabilities",
             "agentcall_report_schema",
-            "agentcall_workflow_simulate",
-            "agentcall_workflow_inspect",
             "agentcall_codex_preflight",
             "agentcall_route_task",
             "agentcall_context_packet_create",
-            "agentcall_delegate_acp",
-            "agentcall_events_tail",
-            "agentcall_reports_list",
+            "agentcall_delegate",
             "agentcall_board",
-            "agentcall_file_claims",
             "agentcall_transcript_index",
-            "agentcall_transcripts_list",
             "agentcall_hook_ingest",
             "agentcall_session_spawn",
-            "agentcall_session_list",
-            "agentcall_session_status",
-            "agentcall_session_tail",
+            "agentcall_session",
             "agentcall_session_send",
-            "agentcall_checkpoint_request"
+            "agentcall_report"
         ]
     })
 }
@@ -515,7 +420,10 @@ fn session_summary(config: &Config, args: Value) -> Result<Value, String> {
         .get("name")
         .and_then(Value::as_str)
         .ok_or("missing name")?;
-    daemon_get(config, &format!("/api/sessions/{}/summary", url_encode(name)))
+    daemon_get(
+        config,
+        &format!("/api/sessions/{}/summary", url_encode(name)),
+    )
 }
 
 fn concurrency_probe(config: &Config) -> Result<Value, String> {
@@ -535,7 +443,12 @@ fn daemon_post_json(config: &Config, path: &str, body: Value) -> Result<Value, S
     daemon_request(config, "POST", path, Some(body))
 }
 
-fn daemon_request(config: &Config, method: &str, path: &str, body: Option<Value>) -> Result<Value, String> {
+fn daemon_request(
+    config: &Config,
+    method: &str,
+    path: &str,
+    body: Option<Value>,
+) -> Result<Value, String> {
     let (host, port) = parse_daemon_url(&config.daemon_url)?;
     let mut stream = TcpStream::connect((host.as_str(), port))
         .map_err(|err| format!("failed to connect daemon {}: {err}", config.daemon_url))?;
@@ -562,7 +475,10 @@ fn daemon_request(config: &Config, method: &str, path: &str, body: Option<Value>
         return Err("invalid daemon response".to_string());
     };
     if !head.starts_with("HTTP/1.1 200") {
-        return Err(format!("daemon returned non-200 response: {}", head.lines().next().unwrap_or(head)));
+        return Err(format!(
+            "daemon returned non-200 response: {}",
+            head.lines().next().unwrap_or(head)
+        ));
     }
     serde_json::from_str(body).map_err(|err| format!("invalid daemon JSON: {err}"))
 }
@@ -596,7 +512,11 @@ fn url_encode(value: &str) -> String {
 fn workflow_simulate(config: &Config, args: Value) -> Result<Value, String> {
     let root = root_from_args(config, &args);
     let driver = args.get("driver").and_then(Value::as_str).unwrap_or("acp");
-    let max_turns = args.get("max_turns").and_then(Value::as_i64).unwrap_or(1).to_string();
+    let max_turns = args
+        .get("max_turns")
+        .and_then(Value::as_i64)
+        .unwrap_or(1)
+        .to_string();
     let mut command = vec![
         "workflow".to_string(),
         "simulate".to_string(),
@@ -625,7 +545,9 @@ fn workflow_inspect(config: &Config, args: Value) -> Result<Value, String> {
         .and_then(Value::as_str)
         .ok_or("missing required argument: task_id")?;
     let output = run_agentcall(config, &root, &["workflow", "inspect", task_id])?;
-    Ok(json!({"root": root.to_string_lossy(), "task_id": task_id, "output": output, "summary": parse_key_value_output(&output)}))
+    Ok(
+        json!({"root": root.to_string_lossy(), "task_id": task_id, "output": output, "summary": parse_key_value_output(&output)}),
+    )
 }
 
 fn codex_preflight(config: &Config, args: Value) -> Result<Value, String> {
@@ -634,10 +556,7 @@ fn codex_preflight(config: &Config, args: Value) -> Result<Value, String> {
         .get("phase")
         .and_then(Value::as_str)
         .unwrap_or("turn_start");
-    let objective = args
-        .get("objective")
-        .and_then(Value::as_str)
-        .unwrap_or("");
+    let objective = args.get("objective").and_then(Value::as_str).unwrap_or("");
     let board = board(config, json!({"root": root.to_string_lossy()}))?;
     let active_sessions = board
         .get("active_sessions")
@@ -760,7 +679,11 @@ fn route_task_tool(config: &Config, args: Value) -> Result<Value, String> {
         command.push("--estimated-files".to_string());
         command.push(estimated_files.to_string());
     }
-    if args.get("needs_continuity").and_then(Value::as_bool).unwrap_or(false) {
+    if args
+        .get("needs_continuity")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+    {
         command.push("--needs-continuity".to_string());
     }
     for (json_key, cli_key) in [
@@ -796,11 +719,20 @@ fn context_packet_create(config: &Config, args: Value) -> Result<Value, String> 
         "--call-id".to_string(),
         call_id.to_string(),
         "--phase".to_string(),
-        args.get("phase").and_then(Value::as_str).unwrap_or("execute").to_string(),
+        args.get("phase")
+            .and_then(Value::as_str)
+            .unwrap_or("execute")
+            .to_string(),
         "--role".to_string(),
-        args.get("role").and_then(Value::as_str).unwrap_or("executor").to_string(),
+        args.get("role")
+            .and_then(Value::as_str)
+            .unwrap_or("executor")
+            .to_string(),
         "--runtime".to_string(),
-        args.get("runtime").and_then(Value::as_str).unwrap_or("acp").to_string(),
+        args.get("runtime")
+            .and_then(Value::as_str)
+            .unwrap_or("acp")
+            .to_string(),
         "--objective".to_string(),
         objective.to_string(),
     ];
@@ -823,6 +755,10 @@ fn delegate_acp(config: &Config, args: Value) -> Result<Value, String> {
     let mut object = args.as_object().cloned().unwrap_or_default();
     object.insert("driver".to_string(), json!("acp"));
     workflow_simulate(config, Value::Object(object))
+}
+
+fn delegate(config: &Config, args: Value) -> Result<Value, String> {
+    workflow_simulate(config, args)
 }
 
 fn events_tail(config: &Config, args: Value) -> Result<Value, String> {
@@ -850,8 +786,17 @@ fn reports_list(config: &Config, args: Value) -> Result<Value, String> {
 }
 
 fn board(config: &Config, args: Value) -> Result<Value, String> {
-    let _ = args;
-    daemon_get(config, "/api/board")
+    let mut query = vec![];
+    for key in ["view", "filter", "section"] {
+        if let Some(value) = args.get(key).and_then(Value::as_str) {
+            query.push(format!("{}={}", url_encode(key), url_encode(value)));
+        }
+    }
+    if query.is_empty() {
+        daemon_get(config, "/api/board")
+    } else {
+        daemon_get(config, &format!("/api/board?{}", query.join("&")))
+    }
 }
 
 fn file_claims(config: &Config, args: Value) -> Result<Value, String> {
@@ -862,7 +807,11 @@ fn file_claims(config: &Config, args: Value) -> Result<Value, String> {
 fn transcript_index(config: &Config, args: Value) -> Result<Value, String> {
     let root = root_from_args(config, &args);
     let path = required_str(&args, "path")?;
-    let mut command = vec!["transcript".to_string(), "index".to_string(), path.to_string()];
+    let mut command = vec![
+        "transcript".to_string(),
+        "index".to_string(),
+        path.to_string(),
+    ];
     if let Some(session_id) = args.get("session_id").and_then(Value::as_str) {
         command.push("--session-id".to_string());
         command.push(session_id.to_string());
@@ -873,14 +822,22 @@ fn transcript_index(config: &Config, args: Value) -> Result<Value, String> {
 
 fn transcripts_list(config: &Config, args: Value) -> Result<Value, String> {
     let root = root_from_args(config, &args);
-    let output = run_agentcall_owned(config, &root, vec!["transcript".to_string(), "list".to_string()])?;
+    let output = run_agentcall_owned(
+        config,
+        &root,
+        vec!["transcript".to_string(), "list".to_string()],
+    )?;
     serde_json::from_str(&output).map_err(|err| format!("invalid transcripts JSON: {err}"))
 }
 
 fn hook_ingest(config: &Config, args: Value) -> Result<Value, String> {
     let event = required_str(&args, "event")?;
     let payload = args.get("payload").cloned().unwrap_or(json!({}));
-    daemon_post_json(config, "/api/hooks/ingest", json!({"event": event, "payload": payload}))
+    daemon_post_json(
+        config,
+        "/api/hooks/ingest",
+        json!({"event": event, "payload": payload}),
+    )
 }
 
 fn session_spawn(config: &Config, args: Value) -> Result<Value, String> {
@@ -926,8 +883,7 @@ fn session_list(config: &Config, args: Value) -> Result<Value, String> {
 }
 
 fn session_status(config: &Config, args: Value) -> Result<Value, String> {
-    let name = required_str(&args, "name")?;
-    daemon_get(config, &format!("/api/sessions/{}/summary", url_encode(name)))
+    session(config, args)
 }
 
 fn session_tail(config: &Config, args: Value) -> Result<Value, String> {
@@ -938,13 +894,70 @@ fn session_tail(config: &Config, args: Value) -> Result<Value, String> {
 
 fn session_send(config: &Config, args: Value) -> Result<Value, String> {
     let name = required_str(&args, "name")?;
-    let text = required_str(&args, "text")?;
+    let action = args.get("action").and_then(Value::as_str).unwrap_or("send");
     let enter = args.get("enter").and_then(Value::as_bool).unwrap_or(true);
+    if action == "stop" {
+        return daemon_post_json(
+            config,
+            &format!("/api/sessions/{}/stop", url_encode(name)),
+            json!({}),
+        );
+    }
+    let text = args
+        .get("text")
+        .and_then(Value::as_str)
+        .map(str::to_string)
+        .unwrap_or_else(|| match action {
+            "continue" => "Continue from the current state. If the task is complete, write the requested report now.".to_string(),
+            "request_report" => "Stop new implementation work and write the requested report with exact changes, tests, failures, and remaining risks.".to_string(),
+            _ => "".to_string(),
+        });
+    if text.is_empty() {
+        return Err("missing text for send action".to_string());
+    }
     daemon_post_json(
         config,
         &format!("/api/sessions/{}/input", url_encode(name)),
         json!({"text": text, "enter": enter}),
     )
+}
+
+fn session(config: &Config, args: Value) -> Result<Value, String> {
+    let name = required_str(&args, "name")?;
+    let summary = daemon_get(
+        config,
+        &format!("/api/sessions/{}/summary", url_encode(name)),
+    )?;
+    let include = string_array(&args, "include");
+    if include.iter().any(|item| item == "clean_tail") {
+        let clean = daemon_get(
+            config,
+            &format!("/api/sessions/{}/output/clean", url_encode(name)),
+        )?;
+        Ok(json!({"summary": summary, "clean_tail": clean}))
+    } else {
+        Ok(summary)
+    }
+}
+
+fn report(config: &Config, args: Value) -> Result<Value, String> {
+    match args
+        .get("action")
+        .and_then(Value::as_str)
+        .unwrap_or("accept")
+    {
+        "request" => checkpoint_request(config, args),
+        "accept" => {
+            if args.get("task_id").is_some() {
+                reports_list(config, args)
+            } else if args.get("session_id").is_some() {
+                checkpoint_request(config, args)
+            } else {
+                reports_list(config, args)
+            }
+        }
+        other => Err(format!("unknown report action: {other}")),
+    }
 }
 
 fn checkpoint_request(config: &Config, args: Value) -> Result<Value, String> {
@@ -953,7 +966,11 @@ fn checkpoint_request(config: &Config, args: Value) -> Result<Value, String> {
     let output = run_agentcall_owned(
         config,
         &root,
-        vec!["checkpoint".to_string(), "request".to_string(), session_id.to_string()],
+        vec![
+            "checkpoint".to_string(),
+            "request".to_string(),
+            session_id.to_string(),
+        ],
     )?;
     serde_json::from_str(&output).map_err(|err| format!("invalid checkpoint JSON: {err}"))
 }
@@ -971,7 +988,11 @@ fn claude_workspace_from_args(args: &Value) -> String {
         .and_then(Value::as_str)
         .map(str::to_string)
         .or_else(|| env::var("AGENTCALL_CLAUDE_WORKSPACE").ok())
-        .or_else(|| env::current_dir().ok().map(|path| path.to_string_lossy().to_string()))
+        .or_else(|| {
+            env::current_dir()
+                .ok()
+                .map(|path| path.to_string_lossy().to_string())
+        })
         .unwrap_or_else(|| ".".to_string())
 }
 
@@ -1076,8 +1097,7 @@ fn python_json(config: &Config, root: &Path, args: &[&str]) -> Result<Value, Str
     serde_json::from_slice(&output.stdout).map_err(|err| format!("invalid JSON from python: {err}"))
 }
 
-const REPORT_SCHEMA_SNIPPET: &str =
-    "import json; from agentcall.v2 import REPORT_JSON_SCHEMA; print(json.dumps(REPORT_JSON_SCHEMA))";
+const REPORT_SCHEMA_SNIPPET: &str = "import json; from agentcall.v2 import REPORT_JSON_SCHEMA; print(json.dumps(REPORT_JSON_SCHEMA))";
 
 fn parse_key_value_output(output: &str) -> Value {
     let mut object = serde_json::Map::new();
@@ -1141,18 +1161,19 @@ mod tests {
             .map(|tool| tool["name"].as_str().unwrap().to_string())
             .collect();
         assert!(names.contains(&"agentcall_capabilities".to_string()));
-        assert!(names.contains(&"agentcall_workflow_simulate".to_string()));
-        assert!(names.contains(&"agentcall_workflow_inspect".to_string()));
+        assert!(names.contains(&"agentcall_delegate".to_string()));
         assert!(names.contains(&"agentcall_codex_preflight".to_string()));
         assert!(names.contains(&"agentcall_route_task".to_string()));
         assert!(names.contains(&"agentcall_context_packet_create".to_string()));
         assert!(names.contains(&"agentcall_hook_ingest".to_string()));
         assert!(names.contains(&"agentcall_board".to_string()));
+        assert!(names.contains(&"agentcall_session".to_string()));
         assert!(names.contains(&"agentcall_session_spawn".to_string()));
         assert!(names.contains(&"agentcall_session_send".to_string()));
-        assert!(names.contains(&"agentcall_file_claims".to_string()));
+        assert!(names.contains(&"agentcall_report".to_string()));
         assert!(names.contains(&"agentcall_transcript_index".to_string()));
-        assert!(names.contains(&"agentcall_transcripts_list".to_string()));
+        assert!(!names.contains(&"agentcall_session_list".to_string()));
+        assert!(!names.contains(&"agentcall_events_tail".to_string()));
     }
 
     #[test]

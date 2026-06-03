@@ -1,4 +1,5 @@
 use crate::state::{AppState, append_agent_event};
+use crate::terminal::{DecodeHealth, append_limited_text, decode_utf8_stream};
 use crate::util::{now_ms, safe_name};
 use portable_pty::{Child, CommandBuilder, MasterPty, PtySize, native_pty_system};
 use serde::{Deserialize, Serialize};
@@ -24,18 +25,21 @@ pub(crate) struct Session {
     pub(crate) created_at: u64,
     pub(crate) updated_at: AtomicU64,
     pub(crate) replay: Mutex<Vec<u8>>,
+    pub(crate) clean_replay: Mutex<String>,
+    pub(crate) decode_health: Mutex<DecodeHealth>,
     pub(crate) clients: Mutex<Vec<Sender<StreamEvent>>>,
 }
 
 #[derive(Clone, Serialize)]
 pub(crate) struct SessionInfo {
-    name: String,
+    pub(crate) name: String,
     command: Vec<String>,
     cwd: String,
-    status: String,
+    pub(crate) status: String,
     created_at: u64,
     updated_at: u64,
     replay_bytes: usize,
+    decode_health: DecodeHealth,
 }
 
 #[derive(Clone, Serialize)]
@@ -109,6 +113,11 @@ pub(crate) fn start_session(
         command.arg(arg);
     }
     command.cwd(&cwd);
+    command.env("PYTHONUTF8", "1");
+    command.env("PYTHONIOENCODING", "utf-8");
+    command.env("LANG", "C.UTF-8");
+    command.env("LC_ALL", "C.UTF-8");
+    command.env("AGENTCALL_WRAPPER_SESSION", &req.name);
 
     let child = pair
         .slave
@@ -131,6 +140,8 @@ pub(crate) fn start_session(
         created_at: now_ms(),
         updated_at: AtomicU64::new(now_ms()),
         replay: Mutex::new(Vec::new()),
+        clean_replay: Mutex::new(String::new()),
+        decode_health: Mutex::new(DecodeHealth::default()),
         clients: Mutex::new(Vec::new()),
     });
 
@@ -164,6 +175,7 @@ pub(crate) fn spawn_reader(
 ) {
     thread::spawn(move || {
         let mut buf = [0u8; 8192];
+        let mut pending = Vec::<u8>::new();
         loop {
             match reader.read(&mut buf) {
                 Ok(0) => break,
@@ -178,7 +190,17 @@ pub(crate) fn spawn_reader(
                         }
                     }
                     session.updated_at.store(now_ms(), Ordering::Relaxed);
-                    let data = String::from_utf8_lossy(bytes).to_string();
+                    let data = {
+                        let mut health = session.decode_health.lock().unwrap();
+                        decode_utf8_stream(&mut pending, bytes, &mut health)
+                    };
+                    if data.is_empty() {
+                        continue;
+                    }
+                    {
+                        let mut clean = session.clean_replay.lock().unwrap();
+                        append_limited_text(&mut clean, &data);
+                    }
                     broadcast(
                         &session,
                         StreamEvent {
@@ -266,6 +288,7 @@ pub(crate) fn session_info(session: &Arc<Session>) -> SessionInfo {
         created_at: session.created_at,
         updated_at: session.updated_at.load(Ordering::Relaxed),
         replay_bytes: session.replay.lock().unwrap().len(),
+        decode_health: session.decode_health.lock().unwrap().clone(),
     }
 }
 

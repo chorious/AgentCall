@@ -1,11 +1,18 @@
+use crate::hooks::runtime_bindings_state;
 use crate::session::{Session, default_claude_workspace, list_sessions};
 use crate::state::{AppState, read_events, read_json_file};
+use crate::terminal::{clean_terminal_text, tail_lines};
 use std::fs;
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
-pub(crate) fn board_state(state: &AppState) -> serde_json::Value {
+pub(crate) fn board_state(
+    state: &AppState,
+    view: Option<&str>,
+    filter: Option<&str>,
+    section: Option<&str>,
+) -> serde_json::Value {
     let agent_dir = state.workspace.join(".agentcall");
     let events = read_events(&agent_dir.join("events.ndjson"));
     let project_state = read_json_file(
@@ -25,28 +32,90 @@ pub(crate) fn board_state(state: &AppState) -> serde_json::Value {
         serde_json::json!({}),
     );
     let reports = read_reports(&agent_dir.join("tasks"));
-    serde_json::json!({
+    let live_daemon_sessions = list_sessions(state);
+    let legacy_sessions = legacy_detached_sessions(&agent_dir.join("sessions"));
+    let attention = attention_items(state, &legacy_sessions);
+
+    let full = serde_json::json!({
         "workspace": state.workspace,
-        "pty_sessions": list_sessions(state),
+        "pty_sessions": live_daemon_sessions,
+        "live_daemon_sessions": list_sessions(state),
+        "legacy_detached_sessions": legacy_sessions,
+        "attention": attention,
         "active_sessions": active_sessions,
         "file_claims": file_claims,
         "transcripts": transcripts,
         "reports": reports,
         "recent_events": events,
         "project_state": project_state
-    })
+    });
+
+    let selected = match section.unwrap_or("all") {
+        "sessions" => serde_json::json!({
+            "workspace": state.workspace,
+            "live_daemon_sessions": full["live_daemon_sessions"],
+            "legacy_detached_sessions": full["legacy_detached_sessions"],
+        }),
+        "events" => {
+            serde_json::json!({"workspace": state.workspace, "recent_events": full["recent_events"]})
+        }
+        "reports" => serde_json::json!({"workspace": state.workspace, "reports": full["reports"]}),
+        "claims" => {
+            serde_json::json!({"workspace": state.workspace, "file_claims": full["file_claims"]})
+        }
+        "transcripts" => {
+            serde_json::json!({"workspace": state.workspace, "transcripts": full["transcripts"]})
+        }
+        _ => full,
+    };
+
+    if filter == Some("attention") {
+        return serde_json::json!({
+            "workspace": state.workspace,
+            "view": view.unwrap_or("full"),
+            "filter": "attention",
+            "attention": selected.get("attention").cloned().unwrap_or_else(|| attention_items(state, &legacy_detached_sessions(&agent_dir.join("sessions")))),
+        });
+    }
+    if view == Some("compact") {
+        return serde_json::json!({
+            "workspace": state.workspace,
+            "view": "compact",
+            "live_daemon_sessions": selected.get("live_daemon_sessions").cloned().unwrap_or(serde_json::json!([])),
+            "legacy_detached_sessions": selected.get("legacy_detached_sessions").cloned().unwrap_or(serde_json::json!([])),
+            "attention": selected.get("attention").cloned().unwrap_or(serde_json::json!([])),
+        });
+    }
+    selected
 }
 
 pub(crate) fn runtime_health(state: &AppState) -> serde_json::Value {
     let sessions = list_sessions(state);
+    let running_sessions = sessions
+        .iter()
+        .filter(|session| session.status == "running")
+        .count();
     let agent_dir = state.workspace.join(".agentcall");
     let stale_claims = stale_claim_count(&agent_dir.join("state").join("file_claims.json"));
+    let runtime_bindings = runtime_bindings_state(state);
+    let runtime_binding_count = runtime_bindings
+        .as_object()
+        .map(|items| items.len())
+        .unwrap_or(0);
+    let unbound_live_sessions = unbound_live_session_names(&sessions, &runtime_bindings);
     serde_json::json!({
         "runtime": "agentcall-daemon",
         "workspace": state.workspace,
         "state_writer": "daemon",
+        "utf8_decoder": "streaming",
+        "hook_aware_summary": true,
         "event_next": state.event_seq.load(Ordering::SeqCst),
-        "active_pty_sessions": sessions.len(),
+        "active_pty_sessions": running_sessions,
+        "live_daemon_sessions": running_sessions,
+        "legacy_detached_sessions": legacy_detached_sessions(&agent_dir.join("sessions")).as_array().map(|items| items.len()).unwrap_or(0),
+        "runtime_bindings": runtime_binding_count,
+        "unbound_live_sessions": unbound_live_sessions,
+        "restart_required_after_update": true,
         "stale_claims": stale_claims,
         "status": "ok"
     })
@@ -64,21 +133,82 @@ pub(crate) fn projects_state(state: &AppState) -> serde_json::Value {
 
 pub(crate) fn session_summary(state: &AppState, session: &Arc<Session>) -> serde_json::Value {
     let status = session.status.lock().unwrap().clone();
-    let replay_text = {
-        let bytes = session.replay.lock().unwrap().clone();
-        String::from_utf8_lossy(&bytes).to_string()
-    };
-    let waiting_input = looks_like_waiting_for_input(&replay_text);
-    let summary_status = if waiting_input {
-        "waiting_input".to_string()
-    } else if status.starts_with("exited") {
-        "completed".to_string()
-    } else if status.starts_with("error") {
-        "failed".to_string()
-    } else {
-        "working".to_string()
-    };
+    let clean_output = clean_session_output(session);
+    let waiting_input = looks_like_waiting_for_input(&clean_output);
+    let interrupted = clean_output.to_ascii_lowercase().contains("interrupted")
+        || clean_output.contains("What should Claude do instead?");
+    let reports = extract_reports(&clean_output);
+    let report_source = if reports.is_empty() { "none" } else { "tui" };
+    let report_ready = !reports.is_empty()
+        || clean_output
+            .to_ascii_lowercase()
+            .contains("reports generated")
+        || clean_output
+            .to_ascii_lowercase()
+            .contains("tasks completed");
     let agent_dir = state.workspace.join(".agentcall");
+    let bindings = runtime_bindings_state(state);
+    let binding = binding_for_wrapper(&bindings, &session.name);
+    let binding_source = binding
+        .as_ref()
+        .and_then(|value| value.get("binding_source"))
+        .and_then(|value| value.as_str())
+        .unwrap_or("unbound");
+    let hook_session_id = binding
+        .as_ref()
+        .and_then(|value| value.get("claude_session_id"))
+        .and_then(|value| value.as_str())
+        .map(|value| value.to_string());
+    let last_hook_event = binding
+        .as_ref()
+        .and_then(|value| value.get("last_hook_event"))
+        .and_then(|value| value.as_str())
+        .map(|value| value.to_string());
+    let last_hook_status = binding
+        .as_ref()
+        .and_then(|value| value.get("last_hook_status"))
+        .and_then(|value| value.as_str())
+        .map(|value| value.to_string());
+    let last_hook_at = binding
+        .as_ref()
+        .and_then(|value| value.get("last_seen"))
+        .and_then(|value| value.as_str())
+        .map(|value| value.to_string());
+    let hook_dimensions = last_hook_status.as_deref().map(hook_status_dimensions);
+    let (mut liveness_status, mut attention_status, mut status_source) =
+        lifecycle_dimensions(&status).unwrap_or_else(|| {
+            if let Some((liveness, attention)) = hook_dimensions {
+                (liveness, attention, "hook".to_string())
+            } else if waiting_input || interrupted {
+                (
+                    "waiting_input".to_string(),
+                    "waiting_input".to_string(),
+                    "tui".to_string(),
+                )
+            } else if status == "running" {
+                (
+                    "working".to_string(),
+                    "none".to_string(),
+                    "daemon".to_string(),
+                )
+            } else {
+                (
+                    "unknown".to_string(),
+                    "low_confidence".to_string(),
+                    "unknown".to_string(),
+                )
+            }
+        });
+    if binding.is_none() && status == "running" {
+        attention_status = "unbound".to_string();
+        status_source = "unknown".to_string();
+        if liveness_status == "unknown" {
+            liveness_status = "working".to_string();
+        }
+    }
+    if liveness_status == "failed" {
+        attention_status = "failed".to_string();
+    }
     let claims = read_json_file(
         &agent_dir.join("state").join("file_claims.json"),
         serde_json::json!({}),
@@ -92,30 +222,91 @@ pub(crate) fn session_summary(state: &AppState, session: &Arc<Session>) -> serde
                     claim.get("status").and_then(|value| value.as_str()) == Some("active")
                 })
                 .filter(|(_, claim)| {
-                    claim.get("session_id").and_then(|value| value.as_str())
-                        == Some(session.name.as_str())
+                    let claim_session = claim.get("session_id").and_then(|value| value.as_str());
+                    claim_session == Some(session.name.as_str())
+                        || hook_session_id
+                            .as_deref()
+                            .is_some_and(|hook_id| claim_session == Some(hook_id))
                 })
                 .map(|(file, _)| file.clone())
                 .collect()
         })
         .unwrap_or_default();
+    let confidence = if attention_status == "unbound" {
+        0.3
+    } else if status_source == "hook" || status_source == "lifecycle" {
+        0.9
+    } else if waiting_input || interrupted || report_ready {
+        0.55
+    } else if clean_output.trim().is_empty() {
+        0.2
+    } else {
+        0.55
+    };
+    if confidence < 0.5 && attention_status == "none" {
+        attention_status = "low_confidence".to_string();
+    }
+    let needs_attention = attention_status != "none";
+    let status_compat = if attention_status != "none" {
+        attention_status.clone()
+    } else {
+        liveness_status.clone()
+    };
+    let needs_user_input =
+        attention_status == "waiting_input" || attention_status == "needs_permission";
+    let hint_source = if waiting_input || interrupted || report_ready {
+        Some("tui")
+    } else {
+        None
+    };
+    let last_tool = binding
+        .as_ref()
+        .and_then(|value| value.get("last_tool"))
+        .cloned()
+        .unwrap_or(serde_json::Value::Null);
     serde_json::json!({
         "session": session.name,
         "project": state.workspace.file_name().and_then(|name| name.to_str()).unwrap_or("workspace"),
         "transport": "pty",
-        "status": summary_status,
+        "status": status_compat,
+        "liveness_status": liveness_status,
+        "attention_status": attention_status,
+        "report_ready": report_ready,
+        "report_source": if report_ready { report_source } else { "none" },
+        "status_source": status_source,
+        "hint_source": hint_source,
+        "binding": binding,
+        "binding_source": binding_source,
+        "hook_session_id": hook_session_id,
+        "last_hook_event": last_hook_event,
+        "last_hook_status": last_hook_status,
+        "last_hook_at": last_hook_at,
+        "headline": headline(&clean_output),
+        "current_task": current_task(&clean_output),
+        "reports": reports,
+        "tokens": extract_after_marker(&clean_output, "tokens"),
+        "context_used": extract_context_used(&clean_output),
+        "mode": extract_mode(&clean_output),
+        "last_error": last_error(&clean_output),
+        "needs_attention": needs_attention,
+        "confidence": confidence,
+        "decode_health": session.decode_health.lock().unwrap().clone(),
         "workspace": state.workspace,
         "cwd": session.cwd,
         "claude_workspace": default_claude_workspace(),
-        "last_hook_at": null,
-        "last_tool": null,
+        "last_tool": last_tool,
         "claimed_files": claimed_files,
         "files_written": [],
         "report": null,
-        "needs_user_input": waiting_input,
+        "needs_user_input": needs_user_input,
         "warnings": [],
         "conflicts": []
     })
+}
+
+pub(crate) fn clean_session_output(session: &Arc<Session>) -> String {
+    let text = session.clean_replay.lock().unwrap().clone();
+    tail_lines(&clean_terminal_text(&text), 120)
 }
 
 pub(crate) fn looks_like_waiting_for_input(text: &str) -> bool {
@@ -132,6 +323,211 @@ pub(crate) fn looks_like_waiting_for_input(text: &str) -> bool {
     tail.contains("waiting for your input")
         || tail.trim_end().ends_with('>')
         || tail.contains("? for shortcuts")
+}
+
+pub(crate) fn legacy_detached_sessions(sessions_dir: &Path) -> serde_json::Value {
+    let Ok(entries) = fs::read_dir(sessions_dir) else {
+        return serde_json::json!([]);
+    };
+    let mut sessions = vec![];
+    for entry in entries.flatten() {
+        let path = entry.path().join("state.json");
+        if !path.exists() {
+            continue;
+        }
+        let mut value = read_json_file(&path, serde_json::json!({}));
+        if let Some(object) = value.as_object_mut() {
+            object.insert(
+                "runtime".to_string(),
+                serde_json::json!("legacy_python_pty"),
+            );
+            object.insert(
+                "status_class".to_string(),
+                serde_json::json!("legacy_detached"),
+            );
+            object.insert("live".to_string(), serde_json::json!(false));
+        }
+        sessions.push(value);
+    }
+    sessions.sort_by(|a, b| {
+        a.get("name")
+            .and_then(|value| value.as_str())
+            .cmp(&b.get("name").and_then(|value| value.as_str()))
+    });
+    serde_json::json!(sessions)
+}
+
+fn attention_items(
+    state: &AppState,
+    legacy_detached_sessions: &serde_json::Value,
+) -> serde_json::Value {
+    let mut items = vec![];
+    let live_sessions: Vec<Arc<Session>> =
+        state.sessions.lock().unwrap().values().cloned().collect();
+    for session in live_sessions {
+        let summary = session_summary(state, &session);
+        let attention_status = summary
+            .get("attention_status")
+            .and_then(|value| value.as_str())
+            .unwrap_or("none");
+        if matches!(
+            attention_status,
+            "needs_permission" | "checkpoint_due" | "waiting_input" | "unbound" | "failed"
+        ) {
+            items.push(serde_json::json!({
+                "kind": "daemon_session_attention",
+                "session": summary.get("session").cloned().unwrap_or(serde_json::Value::Null),
+                "liveness_status": summary.get("liveness_status").cloned().unwrap_or(serde_json::Value::Null),
+                "attention_status": attention_status,
+                "status_source": summary.get("status_source").cloned().unwrap_or(serde_json::Value::Null),
+                "binding_source": summary.get("binding_source").cloned().unwrap_or(serde_json::Value::Null),
+                "needs_attention": true,
+            }));
+        }
+    }
+    if let Some(legacy) = legacy_detached_sessions.as_array() {
+        for session in legacy {
+            items.push(serde_json::json!({
+                "kind": "legacy_detached_session",
+                "session": session.get("name").cloned().unwrap_or(serde_json::Value::Null),
+                "status": session.get("status").cloned().unwrap_or(serde_json::Value::Null),
+                "needs_attention": true,
+                "reason": "legacy Python PTY is not a live daemon session"
+            }));
+        }
+    }
+    serde_json::json!(items)
+}
+
+fn binding_for_wrapper(
+    bindings: &serde_json::Value,
+    wrapper_session: &str,
+) -> Option<serde_json::Value> {
+    bindings.get(wrapper_session).cloned()
+}
+
+fn lifecycle_dimensions(status: &str) -> Option<(String, String, String)> {
+    if status.starts_with("error") {
+        Some((
+            "failed".to_string(),
+            "failed".to_string(),
+            "lifecycle".to_string(),
+        ))
+    } else if status.starts_with("exited") {
+        Some((
+            "completed".to_string(),
+            "none".to_string(),
+            "lifecycle".to_string(),
+        ))
+    } else {
+        None
+    }
+}
+
+fn hook_status_dimensions(status: &str) -> (String, String) {
+    match status {
+        "needs_permission" => (
+            "needs_permission".to_string(),
+            "needs_permission".to_string(),
+        ),
+        "waiting_input" => ("waiting_input".to_string(), "waiting_input".to_string()),
+        "checkpoint_due" => ("checkpoint_due".to_string(), "checkpoint_due".to_string()),
+        "idle" => ("idle".to_string(), "none".to_string()),
+        "completed" | "ended" => ("completed".to_string(), "none".to_string()),
+        "failed" => ("failed".to_string(), "failed".to_string()),
+        "working" | "running" | "observed" | "notified" => {
+            ("working".to_string(), "none".to_string())
+        }
+        _ => ("unknown".to_string(), "low_confidence".to_string()),
+    }
+}
+
+fn unbound_live_session_names(
+    sessions: &[crate::session::SessionInfo],
+    bindings: &serde_json::Value,
+) -> Vec<String> {
+    sessions
+        .iter()
+        .filter(|session| session.status == "running")
+        .filter(|session| binding_for_wrapper(bindings, &session.name).is_none())
+        .map(|session| session.name.clone())
+        .collect()
+}
+
+fn headline(text: &str) -> Option<String> {
+    text.lines()
+        .rev()
+        .map(str::trim)
+        .find(|line| {
+            !line.is_empty()
+                && !line.contains("Auto-update failed")
+                && !line.contains("for shortcuts")
+                && !line.starts_with('>')
+        })
+        .map(|line| line.chars().take(240).collect())
+}
+
+fn current_task(text: &str) -> Option<String> {
+    text.lines()
+        .rev()
+        .map(str::trim)
+        .find(|line| line.contains("task") || line.contains("Task") || line.contains("v2."))
+        .map(|line| line.chars().take(240).collect())
+}
+
+fn extract_reports(text: &str) -> Vec<String> {
+    let mut reports = vec![];
+    for token in text.split(|ch: char| {
+        ch.is_whitespace() || ch == '"' || ch == '\'' || ch == ',' || ch == ':' || ch == ';'
+    }) {
+        let trimmed = token.trim_matches(|ch: char| {
+            !ch.is_ascii_alphanumeric() && ch != '_' && ch != '-' && ch != '.'
+        });
+        if trimmed.starts_with("report_")
+            && trimmed.ends_with(".md")
+            && !reports.iter().any(|item| item == trimmed)
+        {
+            reports.push(trimmed.to_string());
+        }
+    }
+    reports
+}
+
+fn extract_after_marker(text: &str, marker: &str) -> Option<String> {
+    text.lines()
+        .rev()
+        .find(|line| line.contains(marker))
+        .map(|line| line.trim().chars().take(120).collect())
+}
+
+fn extract_context_used(text: &str) -> Option<String> {
+    text.lines().rev().find_map(|line| {
+        line.split_once("context used")
+            .map(|_| line.trim().chars().take(80).collect())
+    })
+}
+
+fn extract_mode(text: &str) -> String {
+    let lower = text.to_ascii_lowercase();
+    if lower.contains("auto mode on") {
+        "auto".to_string()
+    } else if lower.contains("plan mode") {
+        "plan".to_string()
+    } else {
+        "unknown".to_string()
+    }
+}
+
+fn last_error(text: &str) -> Option<String> {
+    text.lines()
+        .rev()
+        .map(str::trim)
+        .find(|line| {
+            let lower = line.to_ascii_lowercase();
+            (lower.contains("error") || lower.contains("failed"))
+                && !line.contains("Auto-update failed")
+        })
+        .map(|line| line.chars().take(240).collect())
 }
 
 pub(crate) fn stale_claim_count(path: &Path) -> usize {
@@ -167,4 +563,40 @@ pub(crate) fn read_reports(tasks_dir: &Path) -> Vec<serde_json::Value> {
         }
     }
     reports
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::state::AppState;
+
+    #[test]
+    fn extracts_reports_and_ignores_auto_update_as_error() {
+        let text = "All tasks completed\nReports created:\n- report_v2.0.md\n- report_v2.1.md\nAuto-update failed · Run /doctor";
+        assert_eq!(
+            extract_reports(text),
+            vec!["report_v2.0.md", "report_v2.1.md"]
+        );
+        assert_eq!(last_error(text), None);
+    }
+
+    #[test]
+    fn board_marks_python_sessions_as_legacy_detached() {
+        let root =
+            std::env::temp_dir().join(format!("agentcall-board-test-{}", std::process::id()));
+        let session_dir = root.join(".agentcall").join("sessions").join("legacy-one");
+        fs::create_dir_all(&session_dir).unwrap();
+        fs::write(
+            session_dir.join("state.json"),
+            r#"{"name":"legacy-one","status":"running","worker_pid":123,"child_pid":456}"#,
+        )
+        .unwrap();
+        let state = AppState::new(root.clone());
+        let board = board_state(&state, Some("compact"), None, None);
+        let legacy = board["legacy_detached_sessions"].as_array().unwrap();
+        assert_eq!(legacy[0]["name"], "legacy-one");
+        assert_eq!(legacy[0]["status_class"], "legacy_detached");
+        assert_eq!(legacy[0]["live"], false);
+        let _ = fs::remove_dir_all(root);
+    }
 }

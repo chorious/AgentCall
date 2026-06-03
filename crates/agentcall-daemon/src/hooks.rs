@@ -41,6 +41,17 @@ pub(crate) fn unmatched_hooks_state(state: &AppState) -> serde_json::Value {
     )
 }
 
+pub(crate) fn runtime_bindings_state(state: &AppState) -> serde_json::Value {
+    read_json_file(
+        &state
+            .workspace
+            .join(".agentcall")
+            .join("state")
+            .join("runtime_binding.json"),
+        serde_json::json!({}),
+    )
+}
+
 pub(crate) fn ingest_hook(
     state: &AppState,
     req: HookIngestRequest,
@@ -58,7 +69,22 @@ pub(crate) fn ingest_hook(
     let workspace = string_field(&payload, &["workspace", "cwd"]);
     let transcript_path = string_field(&payload, &["transcript_path"]);
     let status = infer_hook_status(&req.event, &payload);
+    let env_wrapper_session = string_field(&payload, &["wrapper_session", "wrapperSession"]);
+    let (wrapper_session, binding_source) = upsert_runtime_binding_locked(
+        &state_dir,
+        env_wrapper_session.as_deref(),
+        &session_id,
+        transcript_path.as_deref(),
+        workspace.as_deref(),
+        &req.event,
+        &status,
+        tool_name.as_deref(),
+    )?;
     payload["session_id"] = serde_json::json!(session_id.clone());
+    payload["binding_source"] = serde_json::json!(binding_source.clone());
+    if let Some(wrapper_session) = &wrapper_session {
+        payload["wrapper_session"] = serde_json::json!(wrapper_session);
+    }
 
     if unmatched {
         append_unmatched_hook_locked(&state_dir, &req.event, &session_id, &payload)?;
@@ -84,6 +110,8 @@ pub(crate) fn ingest_hook(
             "pid": payload.get("pid").cloned().unwrap_or(serde_json::Value::Null),
             "transcript_path": transcript_path,
             "workspace": workspace,
+            "wrapper_session": wrapper_session,
+            "binding_source": binding_source,
             "updated_at": chrono::Utc::now().to_rfc3339(),
             "last_hook_event": req.event,
             "last_tool": tool_name,
@@ -102,6 +130,8 @@ pub(crate) fn ingest_hook(
             "tool_name": tool_name,
             "workspace": workspace,
             "transcript_path": transcript_path,
+            "wrapper_session": wrapper_session,
+            "binding_source": binding_source,
             "raw": payload,
             "decision": decision,
         }),
@@ -111,6 +141,8 @@ pub(crate) fn ingest_hook(
         "event_type": format!("hook.{}", req.event),
         "session_id": session_id,
         "status": status,
+        "wrapper_session": wrapper_session,
+        "binding_source": binding_source,
         "decision": decision,
         "unmatched": unmatched
     }))
@@ -158,6 +190,72 @@ pub(crate) fn upsert_active_session_locked(
     }
     sessions[session_id] = session;
     write_json_file(&path, &sessions)
+}
+
+pub(crate) fn upsert_runtime_binding_locked(
+    state_dir: &Path,
+    env_wrapper_session: Option<&str>,
+    claude_session_id: &str,
+    transcript_path: Option<&str>,
+    cwd: Option<&str>,
+    event: &str,
+    status: &str,
+    tool_name: Option<&str>,
+) -> Result<(Option<String>, String), String> {
+    let path = state_dir.join("runtime_binding.json");
+    let mut bindings = read_json_file(&path, serde_json::json!({}));
+    if !bindings.is_object() {
+        bindings = serde_json::json!({});
+    }
+    let env_wrapper_session = env_wrapper_session.filter(|value| !value.trim().is_empty());
+    let wrapper_session = env_wrapper_session
+        .map(|value| value.to_string())
+        .or_else(|| find_known_wrapper_binding(&bindings, claude_session_id, transcript_path));
+    let Some(wrapper_session) = wrapper_session else {
+        return Ok((None, "unbound".to_string()));
+    };
+    let binding_source = if env_wrapper_session.is_some() {
+        "env"
+    } else {
+        "known_session"
+    };
+    bindings[&wrapper_session] = serde_json::json!({
+        "wrapper_session": wrapper_session.clone(),
+        "claude_session_id": claude_session_id,
+        "transcript_path": transcript_path,
+        "cwd": cwd,
+        "last_hook_event": event,
+        "last_hook_status": status,
+        "last_tool": tool_name,
+        "last_seen": chrono::Utc::now().to_rfc3339(),
+        "binding_source": binding_source,
+    });
+    write_json_file(&path, &bindings)?;
+    Ok((Some(wrapper_session), binding_source.to_string()))
+}
+
+pub(crate) fn find_known_wrapper_binding(
+    bindings: &serde_json::Value,
+    claude_session_id: &str,
+    transcript_path: Option<&str>,
+) -> Option<String> {
+    let object = bindings.as_object()?;
+    object.iter().find_map(|(wrapper, binding)| {
+        let session_match = binding
+            .get("claude_session_id")
+            .and_then(|value| value.as_str())
+            == Some(claude_session_id);
+        let transcript_match = transcript_path.is_some()
+            && binding
+                .get("transcript_path")
+                .and_then(|value| value.as_str())
+                == transcript_path;
+        if session_match || transcript_match {
+            Some(wrapper.clone())
+        } else {
+            None
+        }
+    })
 }
 
 pub(crate) fn apply_hook_policy_locked(
@@ -406,7 +504,7 @@ pub(crate) fn infer_hook_status(event: &str, payload: &serde_json::Value) -> Str
         return status.to_string();
     }
     match event {
-        "SessionStart" | "UserPromptSubmit" | "PreToolUse" => "running".to_string(),
+        "SessionStart" | "UserPromptSubmit" | "PreToolUse" | "PostToolUse" => "working".to_string(),
         "Notification" => {
             let message = payload
                 .get("message")
@@ -421,8 +519,9 @@ pub(crate) fn infer_hook_status(event: &str, payload: &serde_json::Value) -> Str
                 "notified".to_string()
             }
         }
-        "Stop" | "SubagentStop" => "checkpoint_due".to_string(),
-        "SessionEnd" => "ended".to_string(),
+        "Stop" => "idle".to_string(),
+        "SubagentStop" => "checkpoint_due".to_string(),
+        "SessionEnd" => "completed".to_string(),
         _ => "observed".to_string(),
     }
 }
@@ -521,5 +620,111 @@ mod tests {
         assert_ne!(result["session_id"], "unknown-session");
         let unmatched = unmatched_hooks_state(&state);
         assert_eq!(unmatched.as_array().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn hook_status_semantics_keep_stop_benign_and_permission_distinct() {
+        assert_eq!(infer_hook_status("Stop", &serde_json::json!({})), "idle");
+        assert_eq!(
+            infer_hook_status("SubagentStop", &serde_json::json!({})),
+            "checkpoint_due"
+        );
+        assert_eq!(
+            infer_hook_status(
+                "Notification",
+                &serde_json::json!({"message": "Permission required for Bash"})
+            ),
+            "needs_permission"
+        );
+        assert_eq!(
+            infer_hook_status(
+                "Notification",
+                &serde_json::json!({"message": "Claude is waiting for input"})
+            ),
+            "waiting_input"
+        );
+    }
+
+    #[test]
+    fn hook_env_binding_creates_runtime_binding() {
+        let state = test_state("env-binding");
+        let result = ingest_hook(
+            &state,
+            HookIngestRequest {
+                event: "PreToolUse".to_string(),
+                payload: serde_json::json!({
+                    "session_id": "claude-a",
+                    "wrapper_session": "wrapper-a",
+                    "transcript_path": "E:/tmp/a.jsonl",
+                    "cwd": "E:/Project/AgentCall",
+                    "tool_name": "Read"
+                }),
+                runtime: None,
+            },
+        )
+        .unwrap();
+        assert_eq!(result["wrapper_session"], "wrapper-a");
+        assert_eq!(result["binding_source"], "env");
+        let bindings = runtime_bindings_state(&state);
+        assert_eq!(bindings["wrapper-a"]["claude_session_id"], "claude-a");
+        assert_eq!(bindings["wrapper-a"]["binding_source"], "env");
+    }
+
+    #[test]
+    fn hook_known_session_fallback_only_after_existing_binding() {
+        let state = test_state("known-binding");
+        ingest_hook(
+            &state,
+            HookIngestRequest {
+                event: "PreToolUse".to_string(),
+                payload: serde_json::json!({
+                    "session_id": "claude-a",
+                    "wrapper_session": "wrapper-a",
+                    "transcript_path": "E:/tmp/a.jsonl",
+                    "tool_name": "Read"
+                }),
+                runtime: None,
+            },
+        )
+        .unwrap();
+        let result = ingest_hook(
+            &state,
+            HookIngestRequest {
+                event: "Stop".to_string(),
+                payload: serde_json::json!({
+                    "session_id": "claude-a",
+                    "transcript_path": "E:/tmp/a.jsonl"
+                }),
+                runtime: None,
+            },
+        )
+        .unwrap();
+        assert_eq!(result["wrapper_session"], "wrapper-a");
+        assert_eq!(result["binding_source"], "known_session");
+        let bindings = runtime_bindings_state(&state);
+        assert_eq!(bindings["wrapper-a"]["last_hook_status"], "idle");
+        assert_eq!(bindings["wrapper-a"]["binding_source"], "known_session");
+    }
+
+    #[test]
+    fn hook_without_env_or_known_session_stays_unbound() {
+        let state = test_state("unbound-binding");
+        let result = ingest_hook(
+            &state,
+            HookIngestRequest {
+                event: "PreToolUse".to_string(),
+                payload: serde_json::json!({
+                    "session_id": "claude-a",
+                    "transcript_path": "E:/tmp/a.jsonl",
+                    "tool_name": "Read"
+                }),
+                runtime: None,
+            },
+        )
+        .unwrap();
+        assert_eq!(result["binding_source"], "unbound");
+        assert!(result.get("wrapper_session").unwrap().is_null());
+        let bindings = runtime_bindings_state(&state);
+        assert!(bindings.as_object().unwrap().is_empty());
     }
 }

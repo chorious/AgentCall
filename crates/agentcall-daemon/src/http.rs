@@ -7,7 +7,9 @@ use crate::session::{
     resize_session, start_session, stop_session, write_input,
 };
 use crate::state::{AppState, append_agent_event};
-use crate::summary::{board_state, projects_state, runtime_health, session_summary};
+use crate::summary::{
+    board_state, clean_session_output, projects_state, runtime_health, session_summary,
+};
 use portable_pty::PtySize;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -129,7 +131,15 @@ pub(crate) fn route(request: Request, state: Arc<AppState>) -> Response {
         ("GET", "/vendor/xterm.css") => static_file("web/vendor/xterm.css"),
         ("GET", "/vendor/fit-addon.js") => static_file("web/vendor/fit-addon.js"),
         ("GET", "/api/sessions") => json_response(&list_sessions(&state)),
-        ("GET", "/api/board") => json_response(&board_state(&state)),
+        ("GET", "/api/board") => {
+            let query = query_params(&request.path);
+            json_response(&board_state(
+                &state,
+                query.get("view").map(String::as_str),
+                query.get("filter").map(String::as_str),
+                query.get("section").map(String::as_str),
+            ))
+        }
         ("GET", "/api/runtime/health") => json_response(&runtime_health(&state)),
         ("GET", "/api/projects") => json_response(&projects_state(&state)),
         ("GET", "/api/file-claims") => json_response(&file_claims_state(&state)),
@@ -161,11 +171,10 @@ pub(crate) fn dynamic_route(request: Request, state: Arc<AppState>) -> Response 
     let Some(rest) = path.strip_prefix("/api/sessions/") else {
         return error_response(404, "not found");
     };
-    let mut parts = rest.rsplitn(2, '/');
-    let action = parts.next().unwrap_or("");
-    let name = parts.next().unwrap_or("");
-    let name = url_decode(name);
-    match (request.method.as_str(), action) {
+    let mut parts = rest.split('/');
+    let name = url_decode(parts.next().unwrap_or(""));
+    let action = parts.collect::<Vec<_>>().join("/");
+    match (request.method.as_str(), action.as_str()) {
         ("GET", "ws") => {
             let key = request.headers.get("sec-websocket-key").cloned();
             match (get_session(&state, &name), key) {
@@ -184,6 +193,14 @@ pub(crate) fn dynamic_route(request: Request, state: Arc<AppState>) -> Response 
         },
         ("GET", "summary") => match get_session(&state, &name) {
             Some(session) => json_response(&session_summary(&state, &session)),
+            None => error_response(404, "session not found"),
+        },
+        ("GET", "output/clean") => match get_session(&state, &name) {
+            Some(session) => json_response(&serde_json::json!({
+                "session": name,
+                "clean_output": clean_session_output(&session),
+                "decode_health": session.decode_health.lock().unwrap().clone()
+            })),
             None => error_response(404, "session not found"),
         },
         ("POST", "input") => match parse_json::<InputRequest>(&request.body)
@@ -210,10 +227,7 @@ pub(crate) fn write_sse(mut stream: TcpStream, session: Arc<Session>) -> std::io
     stream.write_all(
         b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream; charset=utf-8\r\nCache-Control: no-cache\r\nConnection: keep-alive\r\n\r\n",
     )?;
-    let replay = {
-        let bytes = session.replay.lock().unwrap().clone();
-        String::from_utf8_lossy(&bytes).to_string()
-    };
+    let replay = { session.clean_replay.lock().unwrap().clone() };
     if !replay.is_empty() {
         write_event(
             &mut stream,
@@ -256,10 +270,7 @@ pub(crate) fn write_ws(
         .as_bytes(),
     )?;
 
-    let replay = {
-        let bytes = session.replay.lock().unwrap().clone();
-        String::from_utf8_lossy(&bytes).to_string()
-    };
+    let replay = { session.clean_replay.lock().unwrap().clone() };
     if !replay.is_empty() {
         let event = StreamEvent {
             seq: 0,
@@ -572,4 +583,21 @@ pub(crate) fn url_decode(value: &str) -> String {
         .replace("%2F", "/")
         .replace("%5C", "\\")
         .replace("%3A", ":")
+}
+
+pub(crate) fn query_params(path: &str) -> HashMap<String, String> {
+    let Some((_, query)) = path.split_once('?') else {
+        return HashMap::new();
+    };
+    query
+        .split('&')
+        .filter_map(|part| {
+            let (key, value) = part.split_once('=').unwrap_or((part, ""));
+            if key.is_empty() {
+                None
+            } else {
+                Some((url_decode(key), url_decode(value)))
+            }
+        })
+        .collect()
 }

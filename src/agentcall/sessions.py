@@ -45,6 +45,9 @@ class SessionRecord:
             "worker_pid": self.worker_pid,
             "child_pid": self.child_pid,
             "status": self.status,
+            "runtime": "legacy_python_pty",
+            "status_class": "legacy_detached",
+            "live": False,
             "created_at": self.created_at,
             "updated_at": self.updated_at,
         }
@@ -153,7 +156,9 @@ class SessionManager:
                 "cwd": str(working_dir),
                 "requested_cwd": str(requested_cwd),
                 "cwd_policy": "force_claude_workspace" if is_claude_command(command) else "requested_or_root",
-                "runtime": "pty",
+                "runtime": "legacy_python_pty",
+                "status_class": "legacy_detached",
+                "live": False,
             },
         )
         return record
