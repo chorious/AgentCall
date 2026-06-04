@@ -398,8 +398,6 @@ def spec_to_dict(spec: ChildCallSpec) -> dict:
 
 
 def runtime_event_prefix(driver_name: str) -> str | None:
-    if driver_name == "claude-acp":
-        return "acp"
     if driver_name == "claude-headless-json":
         return "fallback.claude_p"
     if driver_name.startswith("simulated-"):

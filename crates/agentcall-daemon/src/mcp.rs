@@ -25,21 +25,21 @@ pub(crate) fn mcp_tools() -> Vec<Value> {
                     "root": {"type": "string"},
                     "view": {"type": "string", "enum": ["full", "compact"], "default": "full"},
                     "filter": {"type": "string", "enum": ["all", "attention"], "default": "all"},
-                    "section": {"type": "string", "enum": ["all", "sessions", "events", "reports", "claims", "transcripts", "routes", "acp"], "default": "all"}
+                    "section": {"type": "string", "enum": ["all", "sessions", "events", "reports", "claims", "transcripts", "routes"], "default": "all"}
                 },
                 "additionalProperties": false
             }
         }),
         json!({
             "name": "agentcall_route",
-            "description": "Recommend or start the route-first runtime. Use runtime=acp to force ACP and runtime=pty to force visible handoff.",
+            "description": "Recommend or start a Claude Code PTY utility worker. Use pty_workflow=plan_then_auto only when the supervisor explicitly wants a plan gate.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "objective": {"type": "string"},
                     "workspace": {"type": "string"},
                     "mode": {"type": "string", "enum": ["recommend", "start"], "default": "recommend"},
-                    "runtime": {"type": "string", "enum": ["auto", "pty", "acp"], "default": "auto"},
+                    "runtime": {"type": "string", "enum": ["auto", "pty"], "default": "auto"},
                     "estimated_minutes": {"type": "integer", "minimum": 0},
                     "estimated_files": {"type": "integer", "minimum": 0},
                     "estimated_loc": {"type": "integer", "minimum": 0},
@@ -47,20 +47,14 @@ pub(crate) fn mcp_tools() -> Vec<Value> {
                     "risk": {"type": "string", "enum": ["low", "medium", "high"], "default": "medium"},
                     "session_name": {"type": "string"},
                     "command": {"type": "array", "items": {"type": "string"}},
-                    "adapter_command": {"type": "array", "items": {"type": "string"}},
-                    "timeout_seconds": {"type": "integer", "minimum": 1},
                     "task_id": {"type": "string"},
                     "call_id": {"type": "string"},
                     "phase": {"type": "string", "default": "execute"},
                     "role": {"type": "string", "default": "executor"},
                     "allowed_paths": {"type": "array", "items": {"type": "string"}},
                     "acceptance_criteria": {"type": "array", "items": {"type": "string"}},
-                    "template": {"type": "string", "enum": ["read-and-report", "evidence-check", "contract-check", "diff-review", "single-report-update"]},
-                    "target_files": {"type": "array", "items": {"type": "string"}},
                     "report_path": {"type": "string"},
-                    "max_reads": {"type": "integer", "minimum": 0},
-                    "max_writes": {"type": "integer", "minimum": 0},
-                    "pty_workflow": {"type": "string", "enum": ["plan_then_auto", "normal"], "default": "plan_then_auto"},
+                    "pty_workflow": {"type": "string", "enum": ["normal", "plan_then_auto"], "default": "normal"},
                     "initial_permission_mode": {"type": "string", "enum": ["plan", "auto", "default"]},
                     "persist_context": {"type": "boolean", "default": true}
                 },

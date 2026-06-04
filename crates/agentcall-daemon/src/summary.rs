@@ -1,6 +1,3 @@
-use crate::acp_supervisor::{
-    AcpSupervisorConfig, acp_invocations_state, active_invocation_count, orphaned_invocation_count,
-};
 use crate::hooks::runtime_bindings_state;
 use crate::routes::routes_state;
 use crate::session::{Session, list_sessions};
@@ -37,7 +34,6 @@ pub(crate) fn board_state(
     );
     let reports = read_reports(&agent_dir.join("tasks"));
     let routes = routes_state(state);
-    let acp_invocations = acp_invocations_state(state);
     let live_daemon_sessions = list_sessions(state);
     let legacy_sessions = legacy_detached_sessions(&agent_dir.join("sessions"));
     let attention = attention_items(state);
@@ -53,7 +49,6 @@ pub(crate) fn board_state(
         "transcripts": transcripts,
         "reports": reports,
         "routes": routes,
-        "acp_invocations": acp_invocations,
         "recent_events": events,
         "project_state": project_state
     });
@@ -69,16 +64,13 @@ pub(crate) fn board_state(
         }
         "reports" => serde_json::json!({"workspace": state.workspace, "reports": full["reports"]}),
         "routes" => serde_json::json!({"workspace": state.workspace, "routes": full["routes"]}),
-        "acp" => {
-            serde_json::json!({"workspace": state.workspace, "acp_invocations": full["acp_invocations"]})
-        }
         "claims" => {
             serde_json::json!({"workspace": state.workspace, "file_claims": full["file_claims"]})
         }
         "transcripts" => {
             serde_json::json!({"workspace": state.workspace, "transcripts": full["transcripts"]})
         }
-        _ => full,
+        _ => full.clone(),
     };
 
     if filter == Some("attention") {
@@ -96,6 +88,8 @@ pub(crate) fn board_state(
             "live_daemon_sessions": selected.get("live_daemon_sessions").cloned().unwrap_or(serde_json::json!([])),
             "legacy_detached_sessions": selected.get("legacy_detached_sessions").cloned().unwrap_or(serde_json::json!([])),
             "attention": selected.get("attention").cloned().unwrap_or(serde_json::json!([])),
+            "routes": recent_route_summaries(&full["routes"]),
+            "reports": recent_report_summaries(&full["reports"]),
         });
     }
     selected
@@ -115,22 +109,12 @@ pub(crate) fn runtime_health(state: &AppState) -> serde_json::Value {
         .map(|items| items.len())
         .unwrap_or(0);
     let unbound_live_sessions = unbound_live_session_names(&sessions, &runtime_bindings);
-    let acp_config = AcpSupervisorConfig::from_state(state);
     serde_json::json!({
         "runtime": "agentcall-daemon",
         "workspace": state.workspace,
         "config_path": crate::config::config_path(&state.workspace),
         "config_error": state.config_error,
         "claude_workspace": state.config.claude_workspace,
-        "acp_command_configured": state.config.acp_command.as_ref().is_some_and(|command| !command.is_empty()),
-        "acp_supervisor": true,
-        "acp_active_invocations": active_invocation_count(state),
-        "acp_max_active_invocations": acp_config.max_active_invocations,
-        "acp_default_timeout_seconds": acp_config.default_timeout_seconds,
-        "acp_max_timeout_seconds": acp_config.max_timeout_seconds,
-        "acp_checkpoint_due_seconds": acp_config.checkpoint_due_seconds,
-        "acp_heartbeat_interval_seconds": acp_config.heartbeat_interval_seconds,
-        "acp_orphaned_invocations": orphaned_invocation_count(state),
         "missing_required_config": state.config.claude_workspace.is_none(),
         "state_writer": "daemon",
         "utf8_decoder": "streaming",
@@ -340,6 +324,12 @@ pub(crate) fn session_summary(state: &AppState, session: &Arc<Session>) -> serde
             .and_then(|result| result.get("workflow_status"))
             .cloned()
             .unwrap_or(serde_json::Value::Null),
+        "containment": route_result
+            .as_ref()
+            .and_then(|result| result.get("containment"))
+            .and_then(|containment| containment.get("mode"))
+            .and_then(|value| value.as_str())
+            .unwrap_or("prompt_only"),
         "last_error": last_error(&clean_output),
         "needs_attention": needs_attention,
         "confidence": confidence,
@@ -435,60 +425,51 @@ fn attention_items(state: &AppState) -> serde_json::Value {
             }));
         }
     }
-    let acp_invocations = acp_invocations_state(state);
-    if let Some(invocations) = acp_invocations.as_object() {
-        for invocation in invocations.values() {
-            let status = invocation
-                .get("status")
-                .and_then(|value| value.as_str())
-                .unwrap_or("unknown");
-            if matches!(
-                status,
-                "checkpoint_due"
-                    | "failed"
-                    | "failed_timeout"
-                    | "failed_report_contract"
-                    | "orphaned_after_daemon_restart"
-                    | "acp_capacity_exceeded"
-            ) {
-                items.push(serde_json::json!({
-                    "kind": "acp_invocation_attention",
-                    "route_id": invocation.get("route_id").cloned().unwrap_or(serde_json::Value::Null),
-                    "invocation_id": invocation.get("invocation_id").cloned().unwrap_or(serde_json::Value::Null),
-                    "status": status,
-                    "sop_status": invocation.get("sop_status").cloned().unwrap_or(serde_json::Value::Null),
-                    "template": invocation.get("template").cloned().unwrap_or(serde_json::Value::Null),
-                    "report_path": invocation.get("report_path").cloned().unwrap_or(serde_json::Value::Null),
-                    "checkpoint_due": invocation.get("checkpoint_due").cloned().unwrap_or(serde_json::Value::Bool(false)),
-                    "needs_attention": true,
-                }));
-            }
-        }
-    }
-    let routes = routes_state(state);
-    let route_values: Vec<serde_json::Value> = routes.as_array().cloned().unwrap_or_else(|| {
-        routes
-            .as_object()
-            .map(|items| items.values().cloned().collect())
-            .unwrap_or_default()
+    serde_json::json!(items)
+}
+
+fn recent_route_summaries(routes: &serde_json::Value) -> serde_json::Value {
+    let mut items = routes.as_array().cloned().unwrap_or_default();
+    items.sort_by(|a, b| {
+        a.get("updated_at")
+            .and_then(|value| value.as_u64())
+            .cmp(&b.get("updated_at").and_then(|value| value.as_u64()))
     });
-    for route in route_values {
-        let status = route
-            .get("status")
-            .and_then(|value| value.as_str())
-            .unwrap_or("unknown");
-        if matches!(status, "acp_capacity_exceeded") {
-            items.push(serde_json::json!({
-                "kind": "route_attention",
+    let summaries: Vec<serde_json::Value> = items
+        .into_iter()
+        .rev()
+        .take(8)
+        .map(|route| {
+            serde_json::json!({
                 "route_id": route.get("route_id").cloned().unwrap_or(serde_json::Value::Null),
                 "runtime": route.get("recommended_runtime").cloned().unwrap_or(serde_json::Value::Null),
-                "status": status,
-                "required_next_step": route.get("required_next_step").cloned().unwrap_or(serde_json::Value::Null),
-                "needs_attention": true,
-            }));
-        }
-    }
-    serde_json::json!(items)
+                "status": route.get("status").cloned().unwrap_or(serde_json::Value::Null),
+                "session_name": route.get("session_name").cloned().unwrap_or(serde_json::Value::Null),
+                "worker_kind": route.get("result").and_then(|result| result.get("worker_kind")).cloned().unwrap_or(serde_json::Value::Null),
+                "workflow_status": route.get("result").and_then(|result| result.get("workflow_status")).cloned().unwrap_or(serde_json::Value::Null),
+                "updated_at": route.get("updated_at").cloned().unwrap_or(serde_json::Value::Null),
+            })
+        })
+        .collect();
+    serde_json::json!(summaries)
+}
+
+fn recent_report_summaries(reports: &serde_json::Value) -> serde_json::Value {
+    let items = reports.as_array().cloned().unwrap_or_default();
+    let summaries: Vec<serde_json::Value> = items
+        .into_iter()
+        .rev()
+        .take(8)
+        .map(|report| {
+            serde_json::json!({
+                "task_id": report.get("task_id").cloned().unwrap_or(serde_json::Value::Null),
+                "status": report.get("status").cloned().unwrap_or(serde_json::Value::Null),
+                "report_path": report.get("report_path").or_else(|| report.get("path")).cloned().unwrap_or(serde_json::Value::Null),
+                "summary": report.get("summary").cloned().unwrap_or(serde_json::Value::Null),
+            })
+        })
+        .collect();
+    serde_json::json!(summaries)
 }
 
 fn binding_for_wrapper(

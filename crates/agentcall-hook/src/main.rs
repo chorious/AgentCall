@@ -334,7 +334,7 @@ fn context_injection(store: &Store, runtime: &str) -> Result<String, String> {
         })
         .unwrap_or(0);
     Ok(format!(
-        "# AgentCall Context\n\n- runtime: {runtime}\n- workspace: {}\n- active_sessions: {active_sessions}\n- active_file_claims: {active_claims}\n- structured_reports: {reports}\n\nAgentCall discipline:\n- Before delegating, call `agentcall_codex_preflight` or inspect the board.\n- Use ACP for bounded child calls and PTY only for handoff/debug sessions.\n- Require a child report at lifecycle end. Write review only for drift, blockers, or revision.\n- Keep SOP in tools/code where possible; do not make the child infer hidden project state.\n",
+        "# AgentCall Context\n\n- runtime: {runtime}\n- workspace: {}\n- active_sessions: {active_sessions}\n- active_file_claims: {active_claims}\n- structured_reports: {reports}\n\nAgentCall discipline:\n- Inspect the board before delegation or handoff.\n- Use AgentCall PTY utility workers for child work.\n- Respect allowed_paths and file claims; do not write outside assigned ownership.\n- Require a concise report or exact change summary at lifecycle end.\n- Write review only for drift, blockers, failed validation, or revision.\n",
         store.root.display()
     ))
 }

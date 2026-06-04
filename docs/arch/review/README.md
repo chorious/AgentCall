@@ -1,22 +1,22 @@
 # Review / Report 归档
 
-AgentCall 的 review、plan-review、debt audit 与 worker report 归档。
-当前入口见 [docs/README.md](../../README.md);版本历史见 [CHANGELOG.md](../../../CHANGELOG.md)。
+这里归档 AgentCall 的 review、plan review、debt audit 和 worker report。当前入口请看 [docs/README.md](../../README.md)；版本变化请看 [CHANGELOG.md](../../../CHANGELOG.md)。
 
-## OPUS Review 链(ACP / 控制面演进)
+## OPUS Review
 
-按时间与依赖顺序:
+这些 review 主要用于记录方向调整和风险判断：
 
 | 文档 | 主题 |
 |---|---|
-| [plan_review_v0.8_OPUS.md](plan_review_v0.8_OPUS.md) | v0.8 route-first + Python 债清理,切分 v0.8a/v0.8b |
-| [python_debt_audit_OPUS.md](python_debt_audit_OPUS.md) | Python 只作胶水的判定标准 + 双写/无界审计 |
-| [acp_python_vs_rust_OPUS.md](acp_python_vs_rust_OPUS.md) | Python vs Rust ACP 实现对比:传输层对齐、驱动层缺失、Windows `npx` 缺口 |
-| [acp_sop_gate_review_OPUS.md](acp_sop_gate_review_OPUS.md) | ACP 重定位为 SOP 模板门:模板四元组 + 权限"牙齿" |
-| [plan_review_v2.3_OPUS.md](plan_review_v2.3_OPUS.md) | PTY 两阶段 plan→auto:自铸 session-id、两层禁写、ExitPlanMode 信号 |
-| [plan_review_v2.4_OPUS.md](plan_review_v2.4_OPUS.md) | ACP background supervisor:无人值守矛盾、孤儿 boot-id、可恢复降级 |
+| [plan_review_v3.0_OPUS.md](plan_review_v3.0_OPUS.md) | v3.0 PTY-only utility workers：砍掉 ACP 主线、保留 path-scoped PreToolUse deny、压缩控制面 |
+| [plan_review_v2.4_OPUS.md](plan_review_v2.4_OPUS.md) | ACP background supervisor：30 分钟上限、heartbeat、orphan 风险 |
+| [plan_review_v2.3_OPUS.md](plan_review_v2.3_OPUS.md) | PTY plan gate：plan/auto 双阶段、ExitPlanMode 信号 |
+| [acp_sop_gate_review_OPUS.md](acp_sop_gate_review_OPUS.md) | ACP SOP gate：模板化、边界和权限风险 |
+| [acp_python_vs_rust_OPUS.md](acp_python_vs_rust_OPUS.md) | Python vs Rust ACP：transport parity、cwd、binding/lifecycle 缺口 |
+| [plan_review_v0.8_OPUS.md](plan_review_v0.8_OPUS.md) | v0.8 route-first 与 Python 债务 |
+| [python_debt_audit_OPUS.md](python_debt_audit_OPUS.md) | Python 债务审计 |
 
-## v0.6.1 / v0.7 归档
+## v0.6.1 / v0.7 Reports
 
 | 文档 | 主题 |
 |---|---|

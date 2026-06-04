@@ -1,11 +1,10 @@
 from __future__ import annotations
 
 from pathlib import Path
-import shlex
 
 from ..runtime import claude_workspace
 from ..store import Store
-from .drivers import AcpClaudeDriver, AgentDriver, FunctionAgentDriver, HeadlessJsonClaudeDriver
+from .drivers import AgentDriver, FunctionAgentDriver, HeadlessJsonClaudeDriver
 from .orchestrator import ParentOrchestrator, WorkflowOutcome
 from .reports import ChildReport, ReportStatus
 from .types import ChildCallSpec, ChildMode
@@ -17,7 +16,7 @@ def build_scripted_small_project_driver(calculator_path: Path) -> FunctionAgentD
             return ChildReport(
                 task_id=spec.task_id,
                 call_id=spec.call_id,
-                agent="simulated-claude-acp",
+                agent="simulated-pty-worker",
                 status=ReportStatus.DONE.value,
                 summary="Plan: fix calculator.add and run a direct Python assertion.",
                 next_recommended_action="execute approved plan",
@@ -27,7 +26,7 @@ def build_scripted_small_project_driver(calculator_path: Path) -> FunctionAgentD
         return ChildReport(
             task_id=spec.task_id,
             call_id=spec.call_id,
-            agent="simulated-claude-acp",
+            agent="simulated-pty-worker",
             status=ReportStatus.DONE.value,
             summary="Fixed calculator.add and verified the result.",
             changed_files=[".agentcall/simulations/small_project/calculator.py"],
@@ -40,7 +39,7 @@ def build_scripted_small_project_driver(calculator_path: Path) -> FunctionAgentD
             next_recommended_action="accept",
         )
 
-    return FunctionAgentDriver("simulated-claude-acp", child_handler)
+    return FunctionAgentDriver("simulated-pty-worker", child_handler)
 
 
 def prepare_small_project(store: Store) -> Path:
@@ -80,16 +79,12 @@ def build_small_project_driver(
     *,
     kind: str,
     calculator_path: Path,
-    acp_command: str | None = None,
     claude_bin: str = "claude",
 ) -> AgentDriver:
     if kind == "scripted":
         return build_scripted_small_project_driver(calculator_path)
     if kind == "headless-json":
         return HeadlessJsonClaudeDriver(claude_bin=claude_bin)
-    if kind == "acp":
-        command = split_command(acp_command or "npx -y @agentclientprotocol/claude-agent-acp")
-        return AcpClaudeDriver(command=command)
     raise ValueError(f"Unknown v2 driver: {kind}")
 
 
@@ -97,7 +92,6 @@ def run_small_project_workflow_with_driver(
     root: Path | str = ".",
     *,
     driver_kind: str = "scripted",
-    acp_command: str | None = None,
     claude_bin: str = "claude",
     claude_workspace_path: str | Path | None = None,
     max_turns: int = 1,
@@ -108,14 +102,9 @@ def run_small_project_workflow_with_driver(
     driver = build_small_project_driver(
         kind=driver_kind,
         calculator_path=calculator,
-        acp_command=acp_command,
         claude_bin=claude_bin,
     )
     child_workspace = None
-    if driver_kind in {"acp", "headless-json"}:
+    if driver_kind == "headless-json":
         child_workspace = claude_workspace(claude_workspace_path)
     return run_small_project_workflow(root, driver=driver, child_workspace=child_workspace, max_turns=max_turns)
-
-
-def split_command(command: str) -> list[str]:
-    return shlex.split(command, posix=False)

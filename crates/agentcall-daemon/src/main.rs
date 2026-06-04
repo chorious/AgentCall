@@ -1,5 +1,3 @@
-mod acp;
-mod acp_supervisor;
 mod config;
 mod hooks;
 mod http;
@@ -43,7 +41,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         Err(err) => (LocalConfig::default(), Some(err)),
     };
     let state = Arc::new(AppState::new(workspace, config, config_error));
-    acp_supervisor::mark_orphaned_on_start(&state);
     let listener = TcpListener::bind(("127.0.0.1", port))?;
     println!("AgentCall daemon: http://localhost:{port}");
     append_agent_event(

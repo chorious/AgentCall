@@ -1,9 +1,3 @@
 {
-  "claude_workspace": "D:\\guKimi",
-  "acp_command": ["npx", "-y", "@agentclientprotocol/claude-agent-acp"],
-  "acp_default_timeout_seconds": 1800,
-  "acp_max_timeout_seconds": 1800,
-  "acp_checkpoint_due_seconds": 600,
-  "acp_heartbeat_interval_seconds": 60,
-  "acp_max_active_invocations": 2
+  "claude_workspace": "D:\\guKimi"
 }

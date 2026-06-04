@@ -2,12 +2,11 @@ from __future__ import annotations
 
 import json
 import sys
-import textwrap
 from pathlib import Path
 
 from agentcall.cli import main, strip_ansi
 from agentcall.store import Store
-from agentcall.v2 import AcpClaudeDriver, ChildMode, ChildReport, FunctionAgentDriver, ParentOrchestrator, ReportStatus
+from agentcall.v2 import ChildMode, ChildReport, FunctionAgentDriver, ParentOrchestrator, ReportStatus
 
 
 def test_sop_flow(tmp_path):
@@ -331,7 +330,7 @@ def test_v2_workflow_simulation_cli(tmp_path, capsys):
     assert planner_context.exists()
     assert executor_prompt.exists()
     context = json.loads(planner_context.read_text(encoding="utf-8"))
-    assert context["runtime"] == "simulated-claude-acp"
+    assert context["runtime"] == "simulated-pty-worker"
     assert context["sufficiency"]["status"] == "enough_to_act"
     assert "Context Packet" in executor_prompt.read_text(encoding="utf-8")
     report = json.loads(
@@ -348,8 +347,8 @@ def test_v04_route_context_hook_board_and_checkpoint_cli(tmp_path, capsys):
 
     assert main(["--root", str(tmp_path), "route", "Review a focused diff for risk"]) == 0
     route = json.loads(capsys.readouterr().out)
-    assert route["recommended_runtime"] == "acp"
-    assert route["expected_output"] == "ChildReport"
+    assert route["recommended_runtime"] == "claude-code-session"
+    assert route["expected_output"] == "CheckpointReport"
 
     assert (
         main(
@@ -445,114 +444,4 @@ def test_v05_router_uses_richer_signals(tmp_path, capsys):
     route = json.loads(capsys.readouterr().out)
     assert route["recommended_runtime"] == "claude-code-session"
     assert route["confidence"] >= 0.7
-    assert route["alternatives"]
-
-
-def test_v2_acp_driver_reads_structured_report_from_stdio_agent(tmp_path):
-    project = tmp_path / "mini_project"
-    project.mkdir()
-    (project / "calculator.py").write_text("def add(a, b):\n    return a + b\n", encoding="utf-8")
-    fake_agent = tmp_path / "fake_acp_agent.py"
-    fake_agent.write_text(
-        textwrap.dedent(
-            r'''
-            import json
-            import sys
-
-            def send(message):
-                print(json.dumps(message), flush=True)
-
-            current_mode = "execute"
-            for line in sys.stdin:
-                msg = json.loads(line)
-                method = msg.get("method")
-                req_id = msg.get("id")
-                if method == "initialize":
-                    send({
-                        "jsonrpc": "2.0",
-                        "id": req_id,
-                        "result": {
-                            "protocolVersion": 1,
-                            "agentCapabilities": {
-                                "sessionCapabilities": {"modes": {}}
-                            },
-                            "agentInfo": {"name": "fake-acp", "version": "0.0.1"},
-                            "authMethods": []
-                        }
-                    })
-                elif method == "session/new":
-                    send({"jsonrpc": "2.0", "id": req_id, "result": {"sessionId": "sess_fake"}})
-                elif method == "session/set_mode":
-                    send({
-                        "jsonrpc": "2.0",
-                        "method": "session/update",
-                        "params": {
-                            "sessionId": "sess_fake",
-                            "update": {"sessionUpdate": "current_mode_update", "modeId": msg["params"]["modeId"]}
-                        }
-                    })
-                    current_mode = msg["params"]["modeId"]
-                    send({"jsonrpc": "2.0", "id": req_id, "result": {}})
-                elif method == "session/prompt":
-                    send({
-                        "jsonrpc": "2.0",
-                        "id": 700,
-                        "method": "session/request_permission",
-                        "params": {
-                            "sessionId": "sess_fake",
-                            "toolCall": {"toolCallId": "call_1"},
-                            "options": [
-                                {"optionId": "allow-once", "name": "Allow once", "kind": "allow_once"},
-                                {"optionId": "reject-once", "name": "Reject", "kind": "reject_once"}
-                            ]
-                        }
-                    })
-                    permission = json.loads(sys.stdin.readline())
-                    assert permission["result"]["outcome"]["optionId"] == "allow-once"
-                    report = {
-                        "task_id": "placeholder",
-                        "call_id": "placeholder",
-                        "agent": "fake-acp",
-                        "status": "done",
-                        "summary": "ACP fake completed one bounded lifecycle.",
-                        "changed_files": [] if current_mode == "plan" else ["mini_project/calculator.py"],
-                        "commands_run": [] if current_mode == "plan" else ["pytest"],
-                        "tests": ["plan mode returned no file changes"] if current_mode == "plan" else ["pytest passed"],
-                        "risks": [],
-                        "open_questions": [],
-                        "next_recommended_action": "execute approved plan" if current_mode == "plan" else "accept",
-                        "turns_used": 1,
-                        "metadata": {}
-                    }
-                    send({
-                        "jsonrpc": "2.0",
-                        "method": "session/update",
-                        "params": {
-                            "sessionId": "sess_fake",
-                            "update": {
-                                "sessionUpdate": "agent_message_chunk",
-                                "content": {"type": "text", "text": json.dumps(report)}
-                            }
-                        }
-                    })
-                    send({"jsonrpc": "2.0", "id": req_id, "result": {"stopReason": "end_turn"}})
-            '''
-        ),
-        encoding="utf-8",
-    )
-
-    driver = AcpClaudeDriver(command=[sys.executable, str(fake_agent)])
-    store = Store(tmp_path)
-    store.init()
-
-    outcome = ParentOrchestrator(store, driver).run_bounded_task(
-        objective="Run fake ACP child",
-        allowed_paths=("mini_project",),
-        acceptance_criteria=("fake report returns done",),
-    )
-
-    assert outcome.accepted is True
-    assert len(outcome.reports) == 2
-    assert outcome.reports[0].changed_files == []
-    assert all(report.agent == "claude-acp" for report in outcome.reports)
-    assert all(report.metadata["stopReason"] == "end_turn" for report in outcome.reports)
+    assert route["alternatives"] == []

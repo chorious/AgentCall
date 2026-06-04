@@ -297,28 +297,25 @@ pub(crate) fn pre_tool_use_claim_locked(
     wrapper_session: Option<&str>,
 ) -> Result<serde_json::Value, String> {
     let tool_name = tool_name.unwrap_or("");
-    if let Some(policy) = wrapper_session.and_then(|wrapper| sop_policy_for_wrapper(state, wrapper))
-    {
-        if let Some(denial) = sop_policy_denial(tool_name, payload, &policy) {
-            return Ok(serde_json::json!({
-                "allowed": false,
-                "reason": denial,
-                "policy": {
-                    "template": policy.template,
-                    "report_path": policy.report_path,
-                    "target_files": policy.target_files,
-                    "allowed_paths": policy.allowed_paths
-                },
-                "files": extract_tool_files(payload),
-                "conflicts": []
-            }));
-        }
-    }
     if let Some(wrapper) = wrapper_session {
         if let Some(decision) =
             pty_plan_policy_decision(state, state_dir, wrapper, tool_name, payload)?
         {
             return Ok(decision);
+        }
+        if let Some(policy) = pty_path_policy_for_wrapper(state, wrapper) {
+            if let Some(denial) = pty_path_policy_denial(tool_name, payload, &policy) {
+                return Ok(serde_json::json!({
+                    "allowed": false,
+                    "reason": denial,
+                    "policy": {
+                        "runtime": "pty",
+                        "allowed_paths": policy.allowed_paths
+                    },
+                    "files": extract_tool_files(payload),
+                    "conflicts": []
+                }));
+            }
         }
     }
     if !is_write_tool(tool_name) {
@@ -473,113 +470,6 @@ pub(crate) fn mark_expired_claims_stale(claims: &mut serde_json::Value) {
     }
 }
 
-#[derive(Clone)]
-struct SopPolicy {
-    template: String,
-    target_files: Vec<String>,
-    allowed_paths: Vec<String>,
-    report_path: String,
-}
-
-fn sop_policy_for_wrapper(state: &AppState, wrapper_session: &str) -> Option<SopPolicy> {
-    let routes = read_json_file(
-        &state
-            .workspace
-            .join(".agentcall")
-            .join("state")
-            .join("routes.json"),
-        serde_json::json!({}),
-    );
-    let object = routes.as_object()?;
-    for route in object.values() {
-        let binding_match = route
-            .get("result")
-            .and_then(|result| result.get("binding_gate"))
-            .and_then(|gate| gate.get("wrapper_session"))
-            .and_then(serde_json::Value::as_str)
-            == Some(wrapper_session);
-        let invocation_match = route
-            .get("invocation_id")
-            .and_then(serde_json::Value::as_str)
-            == Some(wrapper_session);
-        let context = route
-            .get("result")
-            .and_then(|result| result.get("context_packet"));
-        let call_match = context
-            .and_then(|packet| packet.get("call_id"))
-            .and_then(serde_json::Value::as_str)
-            == Some(wrapper_session);
-        if !(binding_match || invocation_match || call_match) {
-            continue;
-        }
-        let packet = context?;
-        let template = packet
-            .get("template")
-            .and_then(serde_json::Value::as_str)?
-            .to_string();
-        let report_path = packet
-            .get("report_path")
-            .and_then(serde_json::Value::as_str)?
-            .to_string();
-        if template.is_empty() || report_path.is_empty() {
-            return None;
-        }
-        return Some(SopPolicy {
-            template,
-            target_files: string_array(packet.get("target_files")),
-            allowed_paths: string_array(packet.get("allowed_paths")),
-            report_path,
-        });
-    }
-    None
-}
-
-fn sop_policy_denial(
-    tool_name: &str,
-    payload: &serde_json::Value,
-    policy: &SopPolicy,
-) -> Option<String> {
-    if is_write_tool(tool_name) {
-        let files = extract_tool_files(payload);
-        if files.is_empty() {
-            return Some("sop policy denies write tool without explicit file path".to_string());
-        }
-        if files
-            .iter()
-            .all(|file| same_normalized_path(file, &policy.report_path))
-        {
-            return None;
-        }
-        return Some("sop policy denies write outside report_path".to_string());
-    }
-    if tool_name == "Bash" {
-        if bash_readonly_allowed(payload) {
-            return None;
-        }
-        return Some("sop policy denies bash command outside read-only whitelist".to_string());
-    }
-    if matches!(tool_name, "Read" | "Grep" | "Glob") {
-        let files = extract_tool_files(payload);
-        if files.is_empty() {
-            return None;
-        }
-        if files.iter().all(|file| {
-            policy
-                .target_files
-                .iter()
-                .any(|target| same_normalized_path(file, target))
-                || policy
-                    .allowed_paths
-                    .iter()
-                    .any(|allowed| path_within_or_equal(file, allowed))
-        }) {
-            return None;
-        }
-        return Some("sop policy denies read outside target_files/allowed_paths".to_string());
-    }
-    None
-}
-
 fn pty_plan_policy_decision(
     state: &AppState,
     state_dir: &Path,
@@ -668,6 +558,67 @@ fn pty_plan_policy_decision(
     Ok(None)
 }
 
+#[derive(Clone)]
+struct PtyPathPolicy {
+    allowed_paths: Vec<String>,
+}
+
+fn pty_path_policy_for_wrapper(state: &AppState, wrapper_session: &str) -> Option<PtyPathPolicy> {
+    let (_route_id, route) = route_for_wrapper_session(state, wrapper_session)?;
+    if route
+        .get("recommended_runtime")
+        .and_then(serde_json::Value::as_str)
+        != Some("pty")
+    {
+        return None;
+    }
+    let result = route.get("result")?;
+    let mut allowed_paths = string_array(
+        result
+            .get("containment")
+            .and_then(|containment| containment.get("allowed_paths")),
+    );
+    if allowed_paths.is_empty() {
+        allowed_paths = string_array(
+            result
+                .get("context_packet")
+                .and_then(|packet| packet.get("allowed_paths")),
+        );
+    }
+    if allowed_paths.is_empty() {
+        return None;
+    }
+    Some(PtyPathPolicy { allowed_paths })
+}
+
+fn pty_path_policy_denial(
+    tool_name: &str,
+    payload: &serde_json::Value,
+    policy: &PtyPathPolicy,
+) -> Option<String> {
+    if is_write_tool(tool_name) {
+        let files = extract_tool_files(payload);
+        if files.is_empty() {
+            return Some("PTY path policy denies write tool without explicit file path".to_string());
+        }
+        if files.iter().all(|file| {
+            policy
+                .allowed_paths
+                .iter()
+                .any(|allowed| path_within_or_equal(file, allowed))
+        }) {
+            return None;
+        }
+        return Some("PTY path policy denies write outside allowed_paths".to_string());
+    }
+    if tool_name == "Bash" && !bash_readonly_allowed(payload) {
+        return Some(
+            "PTY path policy denies non-read-only bash when allowed_paths are enforced".to_string(),
+        );
+    }
+    None
+}
+
 fn is_claude_plan_file(path: &str) -> bool {
     let normalized = normalize_workspace_path(path).to_ascii_lowercase();
     normalized.contains("/.claude/plans/") || normalized.starts_with(".claude/plans/")
@@ -734,10 +685,6 @@ fn string_array(value: Option<&serde_json::Value>) -> Vec<String> {
                 .collect()
         })
         .unwrap_or_default()
-}
-
-fn same_normalized_path(left: &str, right: &str) -> bool {
-    normalize_compare_path(left) == normalize_compare_path(right)
 }
 
 fn path_within_or_equal(path: &str, parent: &str) -> bool {
@@ -873,34 +820,6 @@ mod tests {
         })
     }
 
-    fn install_sop_route(state: &AppState, wrapper_session: &str, report_path: &str) {
-        let path = state
-            .workspace
-            .join(".agentcall")
-            .join("state")
-            .join("routes.json");
-        write_json_file(
-            &path,
-            &serde_json::json!({
-                "route-1": {
-                    "route_id": "route-1",
-                    "invocation_id": wrapper_session,
-                    "result": {
-                        "binding_gate": {"wrapper_session": wrapper_session},
-                        "context_packet": {
-                            "call_id": wrapper_session,
-                            "template": "read-and-report",
-                            "target_files": ["src/lib.rs"],
-                            "allowed_paths": ["src"],
-                            "report_path": report_path
-                        }
-                    }
-                }
-            }),
-        )
-        .unwrap();
-    }
-
     fn install_pty_plan_route(state: &AppState, wrapper_session: &str) {
         let path = state
             .workspace
@@ -927,46 +846,33 @@ mod tests {
         .unwrap();
     }
 
-    #[test]
-    fn sop_hook_policy_denies_write_outside_report_path() {
-        let state = test_state("sop-deny-write");
-        install_sop_route(&state, "acp-1", "docs/report.md");
-        let mut payload = write_payload("sess-a", "src/lib.rs");
-        payload["wrapper_session"] = serde_json::json!("acp-1");
-        let result = ingest_hook(
-            &state,
-            HookIngestRequest {
-                event: "PreToolUse".to_string(),
-                payload,
-                runtime: Some("acp".to_string()),
-            },
+    fn install_pty_auto_route(state: &AppState, wrapper_session: &str, allowed_paths: &[&str]) {
+        let path = state
+            .workspace
+            .join(".agentcall")
+            .join("state")
+            .join("routes.json");
+        write_json_file(
+            &path,
+            &serde_json::json!({
+                "route-pty": {
+                    "route_id": "route-pty",
+                    "recommended_runtime": "pty",
+                    "session_name": wrapper_session,
+                    "result": {
+                        "pty_workflow": "normal",
+                        "workflow_status": "running",
+                        "phase": "execute",
+                        "permission_mode": "auto",
+                        "containment": {
+                            "mode": "enforced",
+                            "allowed_paths": allowed_paths
+                        }
+                    }
+                }
+            }),
         )
         .unwrap();
-        assert_eq!(result["decision"]["allowed"], false);
-        assert!(
-            result["decision"]["reason"]
-                .as_str()
-                .unwrap()
-                .contains("outside report_path")
-        );
-    }
-
-    #[test]
-    fn sop_hook_policy_allows_write_to_report_path() {
-        let state = test_state("sop-allow-report-write");
-        install_sop_route(&state, "acp-1", "docs/report.md");
-        let mut payload = write_payload("sess-a", "docs/report.md");
-        payload["wrapper_session"] = serde_json::json!("acp-1");
-        let result = ingest_hook(
-            &state,
-            HookIngestRequest {
-                event: "PreToolUse".to_string(),
-                payload,
-                runtime: Some("acp".to_string()),
-            },
-        )
-        .unwrap();
-        assert_eq!(result["decision"]["allowed"], true);
     }
 
     #[test]
@@ -999,6 +905,48 @@ mod tests {
         install_pty_plan_route(&state, "pty-a");
         let mut payload =
             write_payload("claude-a", "C:/Users/MUSHI/.claude/plans/agentcall-plan.md");
+        payload["wrapper_session"] = serde_json::json!("pty-a");
+        let result = ingest_hook(
+            &state,
+            HookIngestRequest {
+                event: "PreToolUse".to_string(),
+                payload,
+                runtime: Some("claude-code-session".to_string()),
+            },
+        )
+        .unwrap();
+        assert_eq!(result["decision"]["allowed"], true);
+    }
+
+    #[test]
+    fn pty_auto_route_denies_write_outside_allowed_paths() {
+        let state = test_state("pty-auto-deny-outside");
+        install_pty_auto_route(&state, "pty-a", &["src"]);
+        let mut payload = write_payload("claude-a", "docs/report.md");
+        payload["wrapper_session"] = serde_json::json!("pty-a");
+        let result = ingest_hook(
+            &state,
+            HookIngestRequest {
+                event: "PreToolUse".to_string(),
+                payload,
+                runtime: Some("claude-code-session".to_string()),
+            },
+        )
+        .unwrap();
+        assert_eq!(result["decision"]["allowed"], false);
+        assert! (
+            result["decision"]["reason"]
+                .as_str()
+                .unwrap()
+                .contains("outside allowed_paths")
+        );
+    }
+
+    #[test]
+    fn pty_auto_route_allows_write_inside_allowed_paths() {
+        let state = test_state("pty-auto-allow-inside");
+        install_pty_auto_route(&state, "pty-a", &["src"]);
+        let mut payload = write_payload("claude-a", "src/lib.rs");
         payload["wrapper_session"] = serde_json::json!("pty-a");
         let result = ingest_hook(
             &state,

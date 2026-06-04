@@ -1,7 +1,7 @@
 """AgentCall v2 lifecycle runtime."""
 
 from .context import ContextPacket, ContextSufficiency
-from .drivers import AcpClaudeDriver, AgentDriver, FunctionAgentDriver, HeadlessJsonClaudeDriver
+from .drivers import AgentDriver, FunctionAgentDriver, HeadlessJsonClaudeDriver
 from .inspection import WorkflowInspection, inspect_workflow
 from .orchestrator import ParentOrchestrator, WorkflowOutcome
 from .reports import REPORT_JSON_SCHEMA, ChildReport, ReportStatus, ReportValidation
@@ -11,7 +11,6 @@ from .transcripts import TranscriptSummary, index_transcript
 from .types import ChildCallSpec, ChildMode, ChildRole
 
 __all__ = [
-    "AcpClaudeDriver",
     "AgentDriver",
     "AgentLifecycleState",
     "AgentSnapshot",

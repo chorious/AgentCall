@@ -61,7 +61,7 @@ def build_parser() -> argparse.ArgumentParser:
     event_emit.add_argument("--run-id", default=None)
     event_emit.add_argument("--data-json", default="{}")
 
-    route = sub.add_parser("route", help="Recommend ACP vs Claude Code session runtime.")
+    route = sub.add_parser("route", help="Recommend AgentCall v3 PTY utility-worker routing.")
     route.add_argument("objective")
     route.add_argument("--task-type", default=None)
     route.add_argument("--estimated-files", type=int, default=None)
@@ -78,7 +78,7 @@ def build_parser() -> argparse.ArgumentParser:
     context_create.add_argument("--call-id", required=True)
     context_create.add_argument("--phase", default="execute")
     context_create.add_argument("--role", default="executor")
-    context_create.add_argument("--runtime", default="acp")
+    context_create.add_argument("--runtime", default="pty")
     context_create.add_argument("--objective", required=True)
     context_create.add_argument("--allowed-path", action="append", default=[])
     context_create.add_argument("--acceptance-criterion", action="append", default=[])
@@ -110,20 +110,15 @@ def build_parser() -> argparse.ArgumentParser:
     workflow_simulate = workflow_sub.add_parser("simulate", help="Run a small-project v2 lifecycle simulation.")
     workflow_simulate.add_argument(
         "--driver",
-        choices=["scripted", "headless-json", "acp"],
+        choices=["scripted", "headless-json"],
         default="scripted",
         help="Child driver to use. Defaults to deterministic scripted simulation.",
-    )
-    workflow_simulate.add_argument(
-        "--acp-command",
-        default=None,
-        help="ACP stdio command string. Used only with --driver acp.",
     )
     workflow_simulate.add_argument("--claude-bin", default="claude", help="Claude CLI path for headless-json.")
     workflow_simulate.add_argument(
         "--claude-workspace",
         default=None,
-        help="Working directory for Claude ACP/headless children. Defaults to AGENTCALL_CLAUDE_WORKSPACE or current directory.",
+        help="Working directory for Claude headless children. Defaults to AGENTCALL_CLAUDE_WORKSPACE or current directory.",
     )
     workflow_simulate.add_argument("--max-turns", type=int, default=1, help="Lifecycle turn limit per child call.")
     workflow_inspect = workflow_sub.add_parser("inspect", help="Inspect a v2 workflow task.")
@@ -462,7 +457,6 @@ def handle_workflow(args: argparse.Namespace, store: Store) -> int:
             outcome = run_small_project_workflow_with_driver(
                 store.root,
                 driver_kind=args.driver,
-                acp_command=args.acp_command,
                 claude_bin=args.claude_bin,
                 claude_workspace_path=args.claude_workspace,
                 max_turns=args.max_turns,

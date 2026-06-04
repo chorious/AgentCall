@@ -1,9 +1,7 @@
 from __future__ import annotations
 
 import json
-import os
 import re
-import shutil
 import subprocess
 from collections.abc import Callable
 from pathlib import Path
@@ -11,7 +9,6 @@ from typing import Any, Protocol
 
 from .reports import ChildReport, REPORT_JSON_SCHEMA, ReportStatus, report_schema_text, validate_report_dict
 from .types import ChildCallSpec
-from .acp import AcpError, AcpStdioClient
 
 
 class AgentDriver(Protocol):
@@ -30,90 +27,11 @@ class FunctionAgentDriver:
         return self._handler(spec)
 
 
-class AcpClaudeDriver:
-    """ACP Claude driver boundary.
-
-    The real adapter is a stdio JSON-RPC server:
-    `npx -y @agentclientprotocol/claude-agent-acp`.
-    This class captures the process boundary and prompt/report contract. Full
-    JSON-RPC event handling belongs in the Rust daemon once the UI consumes the
-    same AgentState stream.
-    """
-
-    name = "claude-acp"
-
-    def __init__(self, command: list[str] | None = None, timeout_seconds: int = 900) -> None:
-        self.command = resolve_command(command or ["npx", "-y", "@agentclientprotocol/claude-agent-acp"])
-        self.timeout_seconds = timeout_seconds
-
-    def command_line(self) -> list[str]:
-        return list(self.command)
-
-    def invoke(self, spec: ChildCallSpec) -> ChildReport:
-        prompt = (
-            f"{spec.to_prompt()}\n\n"
-            "Return only a JSON report object matching this JSON Schema. "
-            "Do not include markdown fences.\n\n"
-            f"{report_schema_text()}"
-        )
-        try:
-            with AcpStdioClient(self.command, cwd=spec.workspace, timeout_seconds=self.timeout_seconds) as client:
-                initialize = client.initialize()
-                session_id = client.new_session(spec.workspace)
-                client.set_mode(session_id, spec.mode.agent_mode_id())
-                result = client.prompt(session_id, prompt)
-        except AcpError as exc:
-            return ChildReport(
-                task_id=spec.task_id,
-                call_id=spec.call_id,
-                agent=self.name,
-                status=ReportStatus.FAILED.value,
-                summary="ACP invocation failed before a valid report was returned.",
-                risks=[str(exc)],
-                next_recommended_action="Inspect ACP transport logs and retry with a scripted driver.",
-            )
-
-        text = result.text()
-        try:
-            data = extract_json_object(text)
-        except ValueError:
-            return ChildReport(
-                task_id=spec.task_id,
-                call_id=spec.call_id,
-                agent=self.name,
-                status=ReportStatus.FAILED.value,
-                summary="ACP agent completed without returning valid report JSON.",
-                risks=[text[:1000]],
-                metadata={"stopReason": result.stop_reason, "initialize": initialize},
-                next_recommended_action="Retry with a stricter report prompt or JSON schema.",
-            )
-        data["task_id"] = spec.task_id
-        data["call_id"] = spec.call_id
-        data["agent"] = self.name
-        data.setdefault("context_sufficiency", default_context_sufficiency())
-        data.setdefault("metadata", {})
-        data["metadata"].setdefault("stopReason", result.stop_reason)
-        data["metadata"].setdefault("acpUpdates", len(result.updates))
-        validation = validate_report_dict(data)
-        if not validation.ok:
-            return ChildReport(
-                task_id=spec.task_id,
-                call_id=spec.call_id,
-                agent=self.name,
-                status=ReportStatus.FAILED.value,
-                summary="ACP agent returned a report that failed schema validation.",
-                risks=validation.findings,
-                metadata={"raw": data, "stopReason": result.stop_reason},
-                next_recommended_action="Retry with a stricter child prompt.",
-            )
-        return ChildReport.from_dict(data)
-
-
 class HeadlessJsonClaudeDriver:
     """One-shot Claude fallback using `claude -p --output-format json`.
 
     It expects Claude to return a JSON object matching ChildReport fields. This
-    is not as capable as ACP, but it is useful when a bounded lifecycle is more
+    is not as capable as a supervised PTY worker, but it is useful when a bounded lifecycle is more
     important than interactive control.
     """
 
@@ -208,19 +126,3 @@ def default_context_sufficiency() -> dict[str, Any]:
         "can_parent_resolve": True,
         "recommended_parent_action": "",
     }
-
-
-def resolve_command(command: list[str]) -> list[str]:
-    if not command:
-        return command
-    executable = command[0]
-    if os.path.isabs(executable) or any(sep in executable for sep in ("\\", "/")):
-        return command
-    candidates = [executable]
-    if os.name == "nt":
-        candidates = [executable, f"{executable}.cmd", f"{executable}.exe"]
-    for candidate in candidates:
-        resolved = shutil.which(candidate)
-        if resolved:
-            return [resolved, *command[1:]]
-    return command
