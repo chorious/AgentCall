@@ -1,3 +1,4 @@
 {
-  "claude_workspace": "D:\\guKimi"
+  "claude_workspace": "D:\\guKimi",
+  "acp_command": ["npx", "-y", "@agentclientprotocol/claude-agent-acp"]
 }

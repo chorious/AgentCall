@@ -401,6 +401,7 @@ mod tests {
             workspace,
             LocalConfig {
                 claude_workspace: Some(claude_workspace.clone()),
+                ..LocalConfig::default()
             },
             None,
         );
@@ -415,6 +416,7 @@ mod tests {
             PathBuf::from("E:/Project/AgentCall"),
             LocalConfig {
                 claude_workspace: None,
+                ..LocalConfig::default()
             },
             Some("missing claude_workspace".to_string()),
         );

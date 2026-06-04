@@ -41,11 +41,12 @@ Copy-Item config\agentcall.example.json config\agentcall.local.json
 
 ```json
 {
-  "claude_workspace": "D:\\guKimi"
+  "claude_workspace": "D:\\guKimi",
+  "acp_command": ["npx", "-y", "@agentclientprotocol/claude-agent-acp"]
 }
 ```
 
-`config\agentcall.local.json` 不提交到 git。Claude PTY 的 cwd 只取这里的 `claude_workspace`；route/session 请求里的 `workspace` 只表达任务目标和上下文，不决定 Claude Code 启动目录。缺少该配置时，daemon health 会返回 `status=config_missing`，Claude PTY route 会拒绝启动并提示补配置。
+`config\agentcall.local.json` 不提交到 git。Claude PTY 的 cwd 只取这里的 `claude_workspace`；route/session 请求里的 `workspace` 只表达任务目标和上下文，不决定 Claude Code 启动目录。ACP route 默认使用这里的 `acp_command`。缺少 `claude_workspace` 时，daemon health 会返回 `status=config_missing`，Claude PTY route 会拒绝启动并提示补配置。
 
 启动 daemon：
 
@@ -101,11 +102,14 @@ config/agentcall.local.json
 
 ```json
 {
-  "claude_workspace": "D:\\guKimi"
+  "claude_workspace": "D:\\guKimi",
+  "acp_command": ["npx", "-y", "@agentclientprotocol/claude-agent-acp"]
 }
 ```
 
 `claude_workspace` 是 Claude Code 的强制启动 cwd，也是 hooks 绑定语义的一部分。所有 Claude PTY session 无论 route 传入什么 `workspace`，都会使用该值。非 Claude 命令才使用请求 cwd 或 daemon workspace。
+
+`acp_command` 是 daemon-owned ACP adapter 命令。Codex 调用 `agentcall_route(runtime=acp)` 时不需要每次传 `adapter_command`；daemon 会优先使用请求里的 `adapter_command`，其次使用 local config 的 `acp_command`，最后才看 `AGENTCALL_ACP_COMMAND`。
 
 ## MCP / Codex 配置
 

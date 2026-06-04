@@ -40,9 +40,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let (config, config_error) = match LocalConfig::load(&workspace) {
         Ok(config) => (config, None),
         Err(err) => (
-            LocalConfig {
-                claude_workspace: None,
-            },
+            LocalConfig::default(),
             Some(err),
         ),
     };

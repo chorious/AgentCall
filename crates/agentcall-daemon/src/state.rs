@@ -37,6 +37,7 @@ impl AppState {
             workspace.clone(),
             LocalConfig {
                 claude_workspace: Some(workspace),
+                ..LocalConfig::default()
             },
             None,
         )

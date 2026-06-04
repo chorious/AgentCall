@@ -113,6 +113,7 @@ pub(crate) fn runtime_health(state: &AppState) -> serde_json::Value {
         "config_path": crate::config::config_path(&state.workspace),
         "config_error": state.config_error,
         "claude_workspace": state.config.claude_workspace,
+        "acp_command_configured": state.config.acp_command.as_ref().is_some_and(|command| !command.is_empty()),
         "missing_required_config": state.config.claude_workspace.is_none(),
         "state_writer": "daemon",
         "utf8_decoder": "streaming",

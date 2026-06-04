@@ -420,7 +420,11 @@ fn start_acp_route(
 ) -> Result<(), String> {
     let invocation_id = record.route_id.replace("route-", "acp-");
     record.invocation_id = Some(invocation_id.clone());
-    let command = req.adapter_command.clone().or_else(acp_command_from_env);
+    let command = req
+        .adapter_command
+        .clone()
+        .or_else(|| state.config.acp_command.clone())
+        .or_else(acp_command_from_env);
     let timeout_seconds = req.timeout_seconds.unwrap_or(30).clamp(1, 300);
     let workspace = req
         .workspace

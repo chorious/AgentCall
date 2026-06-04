@@ -1,9 +1,10 @@
 use serde::Deserialize;
 use std::path::{Path, PathBuf};
 
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, Default, Deserialize)]
 pub(crate) struct LocalConfig {
     pub(crate) claude_workspace: Option<PathBuf>,
+    pub(crate) acp_command: Option<Vec<String>>,
 }
 
 impl LocalConfig {
