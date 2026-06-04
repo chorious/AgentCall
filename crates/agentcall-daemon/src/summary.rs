@@ -1,6 +1,6 @@
 use crate::hooks::runtime_bindings_state;
 use crate::routes::routes_state;
-use crate::session::{Session, default_claude_workspace, list_sessions};
+use crate::session::{Session, list_sessions};
 use crate::state::{AppState, read_events, read_json_file};
 use crate::terminal::{clean_terminal_text, tail_lines};
 use std::fs;
@@ -110,6 +110,10 @@ pub(crate) fn runtime_health(state: &AppState) -> serde_json::Value {
     serde_json::json!({
         "runtime": "agentcall-daemon",
         "workspace": state.workspace,
+        "config_path": crate::config::config_path(&state.workspace),
+        "config_error": state.config_error,
+        "claude_workspace": state.config.claude_workspace,
+        "missing_required_config": state.config.claude_workspace.is_none(),
         "state_writer": "daemon",
         "utf8_decoder": "streaming",
         "hook_aware_summary": true,
@@ -121,7 +125,7 @@ pub(crate) fn runtime_health(state: &AppState) -> serde_json::Value {
         "unbound_live_sessions": unbound_live_sessions,
         "restart_required_after_update": true,
         "stale_claims": stale_claims,
-        "status": "ok"
+        "status": if state.config.claude_workspace.is_some() { "ok" } else { "config_missing" }
     })
 }
 
@@ -297,7 +301,7 @@ pub(crate) fn session_summary(state: &AppState, session: &Arc<Session>) -> serde
         "decode_health": session.decode_health.lock().unwrap().clone(),
         "workspace": state.workspace,
         "cwd": session.cwd,
-        "claude_workspace": default_claude_workspace(),
+        "claude_workspace": state.config.claude_workspace,
         "last_tool": last_tool,
         "claimed_files": claimed_files,
         "files_written": [],
@@ -581,7 +585,7 @@ mod tests {
             r#"{"name":"legacy-one","status":"running","worker_pid":123,"child_pid":456}"#,
         )
         .unwrap();
-        let state = AppState::new(root.clone());
+        let state = AppState::test(root.clone());
         let board = board_state(&state, Some("compact"), None, None);
         let legacy = board["legacy_detached_sessions"].as_array().unwrap();
         assert_eq!(legacy[0]["name"], "legacy-one");

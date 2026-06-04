@@ -22,6 +22,14 @@ AgentCall 是一个本地多 Agent 协作控制面。当前主线是 Rust daemon
 
 ## 快速启动
 
+创建本机 daemon 配置：
+
+```powershell
+Copy-Item config\agentcall.example.json config\agentcall.local.json
+```
+
+`config\agentcall.local.json` 不提交到 git。Claude PTY 的 cwd 只取这里的 `claude_workspace`，route/session 请求里的 `workspace` 只表达任务目标，不决定 Claude 启动目录。
+
 构建 Rust 组件：
 
 ```powershell
@@ -31,7 +39,6 @@ cargo build -p agentcall-daemon -p agentcall-mcp
 启动 daemon：
 
 ```powershell
-$env:AGENTCALL_CLAUDE_WORKSPACE='D:\guKimi'
 target\debug\agentcall-daemon.exe --workspace E:\Project\AgentCall
 ```
 

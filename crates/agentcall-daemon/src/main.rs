@@ -1,4 +1,5 @@
 mod acp;
+mod config;
 mod hooks;
 mod http;
 mod mcp;
@@ -10,7 +11,7 @@ mod terminal;
 mod util;
 
 use crate::http::handle_connection;
-use crate::session::default_claude_workspace;
+use crate::config::LocalConfig;
 use crate::state::{AppState, append_agent_event};
 use crate::util::normalize_path;
 use std::env;
@@ -35,14 +36,29 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    let state = Arc::new(AppState::new(normalize_path(workspace)?));
+    let workspace = normalize_path(workspace)?;
+    let (config, config_error) = match LocalConfig::load(&workspace) {
+        Ok(config) => (config, None),
+        Err(err) => (
+            LocalConfig {
+                claude_workspace: None,
+            },
+            Some(err),
+        ),
+    };
+    let state = Arc::new(AppState::new(workspace, config, config_error));
     let listener = TcpListener::bind(("127.0.0.1", port))?;
     println!("AgentCall daemon: http://localhost:{port}");
     append_agent_event(
         &state,
         "daemon.started",
         "AgentCall daemon started.",
-        serde_json::json!({"port": port, "workspace": state.workspace, "default_claude_workspace": default_claude_workspace()}),
+        serde_json::json!({
+            "port": port,
+            "workspace": state.workspace,
+            "config_error": state.config_error,
+            "claude_workspace": state.config.claude_workspace
+        }),
     );
     for stream in listener.incoming() {
         match stream {

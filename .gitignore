@@ -4,6 +4,7 @@
 .agentcall_pytest/
 .claude/
 .codex/
+config/agentcall.local.json
 .pytest_cache/
 .pytest_tmp/
 .pytest_tmp*/

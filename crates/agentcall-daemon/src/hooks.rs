@@ -541,7 +541,7 @@ mod tests {
         ));
         let _ = fs::remove_dir_all(&root);
         fs::create_dir_all(root.join(".agentcall").join("state")).unwrap();
-        Arc::new(AppState::new(root))
+        Arc::new(AppState::test(root))
     }
 
     fn write_payload(session_id: &str, file: &str) -> serde_json::Value {

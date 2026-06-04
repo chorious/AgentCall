@@ -1,3 +1,4 @@
+use crate::config::LocalConfig;
 use crate::session::Session;
 use std::collections::HashMap;
 use std::fs;
@@ -8,6 +9,8 @@ use std::sync::{Arc, Mutex};
 
 pub(crate) struct AppState {
     pub(crate) workspace: PathBuf,
+    pub(crate) config: LocalConfig,
+    pub(crate) config_error: Option<String>,
     pub(crate) sessions: Mutex<HashMap<String, Arc<Session>>>,
     pub(crate) seq: AtomicU64,
     pub(crate) event_seq: AtomicU64,
@@ -15,15 +18,28 @@ pub(crate) struct AppState {
 }
 
 impl AppState {
-    pub(crate) fn new(workspace: PathBuf) -> Self {
+    pub(crate) fn new(workspace: PathBuf, config: LocalConfig, config_error: Option<String>) -> Self {
         let next_event_seq = next_event_number_from_log(&workspace);
         Self {
             workspace,
+            config,
+            config_error,
             sessions: Mutex::new(HashMap::new()),
             seq: AtomicU64::new(1),
             event_seq: AtomicU64::new(next_event_seq),
             state_writer: Mutex::new(()),
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test(workspace: PathBuf) -> Self {
+        Self::new(
+            workspace.clone(),
+            LocalConfig {
+                claude_workspace: Some(workspace),
+            },
+            None,
+        )
     }
 
     pub(crate) fn next_seq(&self) -> u64 {

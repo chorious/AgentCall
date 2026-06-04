@@ -612,7 +612,7 @@ mod tests {
 
     #[test]
     fn auto_route_requires_estimates() {
-        let state = Arc::new(AppState::new(test_workspace("auto-missing")));
+        let state = Arc::new(AppState::test(test_workspace("auto-missing")));
         let result = handle_route(
             &state,
             RouteRequest {
@@ -644,7 +644,7 @@ mod tests {
     #[test]
     fn forced_acp_route_is_daemon_recorded_without_configured_command() {
         let workspace = test_workspace("forced-acp");
-        let state = Arc::new(AppState::new(workspace.clone()));
+        let state = Arc::new(AppState::test(workspace.clone()));
         let route = handle_route(
             &state,
             RouteRequest {
@@ -680,7 +680,7 @@ mod tests {
     #[test]
     fn route_can_create_context_packet_without_separate_mcp_tool() {
         let workspace = test_workspace("route-context");
-        let state = Arc::new(AppState::new(workspace.clone()));
+        let state = Arc::new(AppState::test(workspace.clone()));
         let route = handle_route(
             &state,
             RouteRequest {
@@ -733,7 +733,7 @@ mod tests {
             .join("\n"),
         )
         .unwrap();
-        let state = Arc::new(AppState::new(workspace));
+        let state = Arc::new(AppState::test(workspace));
         let summary = index_transcript(
             &state,
             TranscriptIndexRequest {

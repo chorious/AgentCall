@@ -3,7 +3,6 @@ use crate::terminal::{DecodeHealth, append_limited_text, decode_utf8_stream};
 use crate::util::{now_ms, safe_name};
 use portable_pty::{Child, ChildKiller, CommandBuilder, MasterPty, PtySize, native_pty_system};
 use serde::{Deserialize, Serialize};
-use std::env;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -86,16 +85,8 @@ pub(crate) fn start_session(
         return Err("session already exists".to_string());
     }
 
-    let requested_cwd = req
-        .cwd
-        .as_deref()
-        .map(PathBuf::from)
-        .unwrap_or_else(default_claude_workspace);
-    let cwd = if is_claude_command(&req.command) {
-        default_claude_workspace()
-    } else {
-        requested_cwd.clone()
-    };
+    let requested_cwd = req.cwd.as_deref().map(PathBuf::from);
+    let cwd = resolve_session_cwd(state, &req.command, requested_cwd.as_ref())?;
     if !cwd.exists() {
         return Err(format!("cwd does not exist: {}", cwd.display()));
     }
@@ -162,7 +153,7 @@ pub(crate) fn start_session(
             "command": session.command,
             "cwd": session.cwd,
             "requested_cwd": requested_cwd,
-            "cwd_policy": if is_claude_command(&session.command) { "force_claude_workspace" } else { "requested_or_default" },
+            "cwd_policy": if is_claude_command(&session.command) { "force_configured_claude_workspace" } else { "requested_or_default" },
             "runtime": "pty"
         }),
     );
@@ -276,11 +267,26 @@ pub(crate) fn list_sessions(state: &AppState) -> Vec<SessionInfo> {
     sessions
 }
 
-pub(crate) fn default_claude_workspace() -> PathBuf {
-    env::var("AGENTCALL_CLAUDE_WORKSPACE")
-        .map(PathBuf::from)
-        .or_else(|_| env::current_dir())
-        .unwrap_or_else(|_| PathBuf::from("."))
+pub(crate) fn configured_claude_workspace(state: &AppState) -> Result<PathBuf, String> {
+    let Some(path) = state.config.claude_workspace.clone() else {
+        return Err(state.config_error.clone().unwrap_or_else(|| {
+            "missing required daemon config: claude_workspace. Copy config/agentcall.example.json to config/agentcall.local.json and set claude_workspace; this cwd is required for Claude hooks/runtime binding.".to_string()
+        }));
+    };
+    Ok(path)
+}
+
+pub(crate) fn resolve_session_cwd(
+    state: &AppState,
+    command: &[String],
+    requested_cwd: Option<&PathBuf>,
+) -> Result<PathBuf, String> {
+    if is_claude_command(command) {
+        return configured_claude_workspace(state);
+    }
+    Ok(requested_cwd
+        .cloned()
+        .unwrap_or_else(|| state.workspace.clone()))
 }
 
 pub(crate) fn is_claude_command(command: &[String]) -> bool {
@@ -380,6 +386,50 @@ pub(crate) fn stop_session(state: &AppState, name: &str) -> Result<(), String> {
         serde_json::json!({"name": name}),
     );
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::LocalConfig;
+
+    #[test]
+    fn claude_cwd_ignores_requested_workspace_and_uses_config() {
+        let workspace = PathBuf::from("E:/Project/AgentCall");
+        let claude_workspace = PathBuf::from("D:/guKimi");
+        let state = AppState::new(
+            workspace,
+            LocalConfig {
+                claude_workspace: Some(claude_workspace.clone()),
+            },
+            None,
+        );
+        let requested = PathBuf::from("E:/GameProject/GGMYS");
+        let cwd = resolve_session_cwd(&state, &["claude".to_string()], Some(&requested)).unwrap();
+        assert_eq!(cwd, claude_workspace);
+    }
+
+    #[test]
+    fn missing_claude_workspace_rejects_claude_cwd_resolution() {
+        let state = AppState::new(
+            PathBuf::from("E:/Project/AgentCall"),
+            LocalConfig {
+                claude_workspace: None,
+            },
+            Some("missing claude_workspace".to_string()),
+        );
+        let requested = PathBuf::from("E:/GameProject/GGMYS");
+        let err = resolve_session_cwd(&state, &["claude".to_string()], Some(&requested)).unwrap_err();
+        assert!(err.contains("missing claude_workspace"));
+    }
+
+    #[test]
+    fn non_claude_cwd_uses_requested_workspace() {
+        let state = AppState::test(PathBuf::from("E:/Project/AgentCall"));
+        let requested = PathBuf::from("E:/GameProject/GGMYS");
+        let cwd = resolve_session_cwd(&state, &["cmd".to_string()], Some(&requested)).unwrap();
+        assert_eq!(cwd, requested);
+    }
 }
 
 pub(crate) fn broadcast(session: &Arc<Session>, event: StreamEvent) {
