@@ -3,7 +3,12 @@ use std::env;
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::net::TcpStream;
 use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
+use std::thread;
 use std::time::Duration;
+
+#[cfg(windows)]
+use std::os::windows::process::CommandExt;
 
 const PROTOCOL_VERSION: &str = "2024-11-05";
 const SERVER_NAME: &str = "agentcall-mcp";
@@ -126,6 +131,18 @@ fn handle_message(config: &Config, request: Value) -> Option<Value> {
 fn tools() -> Vec<Value> {
     vec![
         json!({
+            "name": "agentcall_daemon",
+            "description": "Bootstrap or inspect the AgentCall daemon. Use action=start before board/route when the daemon is not running.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "action": {"type": "string", "enum": ["status", "start"], "default": "status"},
+                    "wait_seconds": {"type": "integer", "minimum": 0, "maximum": 30, "default": 10}
+                },
+                "additionalProperties": false
+            }
+        }),
+        json!({
             "name": "agentcall_board",
             "description": "Return unified board state. Use compact/attention views for low-friction Codex control.",
             "inputSchema": {
@@ -215,6 +232,7 @@ fn handle_tool_call(config: &Config, id: Value, params: Value) -> Value {
     let event_args = args.clone();
     let result = match name {
         "agentcall_runtime_health" => daemon_get(config, "/api/runtime/health"),
+        "agentcall_daemon" => daemon_control(config, args),
         "agentcall_project_sessions" => daemon_get(config, "/api/projects"),
         "agentcall_session_summary" => session_summary(config, args),
         "agentcall_concurrency_probe" => concurrency_probe(config),
@@ -282,6 +300,7 @@ fn capabilities(config: &Config) -> Value {
             "transcripts": true
             ,
             "runtime_health": true,
+            "daemon_bootstrap": true,
             "session_summary": true,
             "legacy_tools_supported_as_aliases": true
         },
@@ -290,6 +309,7 @@ fn capabilities(config: &Config) -> Value {
             {"kind": "pty", "available": true, "live_model": true, "costs_tokens": true, "transport": "daemon-pty"}
         ],
         "tools": [
+            "agentcall_daemon",
             "agentcall_board",
             "agentcall_route",
             "agentcall_session",
@@ -317,6 +337,104 @@ fn concurrency_probe(config: &Config) -> Result<Value, String> {
         "acceptance_source": "L0/L1/L2/L3 tests, not this probe",
         "daemon": health
     }))
+}
+
+fn daemon_control(config: &Config, args: Value) -> Result<Value, String> {
+    let action = args
+        .get("action")
+        .and_then(Value::as_str)
+        .unwrap_or("status");
+    match action {
+        "status" => Ok(match daemon_get(config, "/api/runtime/health") {
+            Ok(health) => json!({"status": "running", "daemon": health}),
+            Err(err) => json!({"status": "stopped", "daemon_url": config.daemon_url, "error": err}),
+        }),
+        "start" => start_daemon(config, args),
+        other => Err(format!("unknown daemon action: {other}")),
+    }
+}
+
+fn start_daemon(config: &Config, args: Value) -> Result<Value, String> {
+    if let Ok(health) = daemon_get(config, "/api/runtime/health") {
+        return Ok(json!({"status": "already_running", "daemon": health}));
+    }
+    let (_, port) = parse_daemon_url(&config.daemon_url)?;
+    let binary = daemon_binary_path()?;
+    let mut command = Command::new(&binary);
+    command
+        .arg("--workspace")
+        .arg(&config.workspace)
+        .arg("--port")
+        .arg(port.to_string())
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    #[cfg(windows)]
+    {
+        const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+        const DETACHED_PROCESS: u32 = 0x0000_0008;
+        command.creation_flags(CREATE_NEW_PROCESS_GROUP | DETACHED_PROCESS);
+    }
+    let child = command
+        .spawn()
+        .map_err(|err| format!("failed to start daemon {}: {err}", binary.display()))?;
+    let wait_seconds = args
+        .get("wait_seconds")
+        .and_then(Value::as_u64)
+        .unwrap_or(10)
+        .min(30);
+    let attempts = wait_seconds.saturating_mul(5).max(1);
+    let mut last_error = String::new();
+    for _ in 0..attempts {
+        thread::sleep(Duration::from_millis(200));
+        match daemon_get(config, "/api/runtime/health") {
+            Ok(health) => {
+                return Ok(json!({
+                    "status": "started",
+                    "pid": child.id(),
+                    "daemon_url": config.daemon_url,
+                    "binary": binary,
+                    "daemon": health
+                }));
+            }
+            Err(err) => last_error = err,
+        }
+    }
+    Ok(json!({
+        "status": "starting",
+        "pid": child.id(),
+        "daemon_url": config.daemon_url,
+        "binary": binary,
+        "warning": "daemon process was spawned but health did not become ready before wait_seconds",
+        "last_error": last_error
+    }))
+}
+
+fn daemon_binary_path() -> Result<PathBuf, String> {
+    if let Ok(path) = env::var("AGENTCALL_DAEMON_BIN") {
+        let path = PathBuf::from(path);
+        if path.exists() {
+            return Ok(path);
+        }
+        return Err(format!(
+            "AGENTCALL_DAEMON_BIN does not exist: {}",
+            path.display()
+        ));
+    }
+    let exe_name = if cfg!(windows) {
+        "agentcall-daemon.exe"
+    } else {
+        "agentcall-daemon"
+    };
+    if let Ok(current) = env::current_exe() {
+        if let Some(dir) = current.parent() {
+            let sibling = dir.join(exe_name);
+            if sibling.exists() {
+                return Ok(sibling);
+            }
+        }
+    }
+    Ok(PathBuf::from(exe_name))
 }
 
 fn daemon_get(config: &Config, path: &str) -> Result<Value, String> {
@@ -955,6 +1073,7 @@ mod tests {
             .into_iter()
             .map(|tool| tool["name"].as_str().unwrap().to_string())
             .collect();
+        assert!(names.contains(&"agentcall_daemon".to_string()));
         assert!(names.contains(&"agentcall_board".to_string()));
         assert!(names.contains(&"agentcall_route".to_string()));
         assert!(names.contains(&"agentcall_session".to_string()));

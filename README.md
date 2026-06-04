@@ -56,12 +56,15 @@ target\debug\agentcall-mcp.exe --workspace E:\Project\AgentCall --daemon-url htt
 `tools/list` 默认只暴露正常控制路径：
 
 ```text
+agentcall_daemon
 agentcall_board
 agentcall_route
 agentcall_session
 agentcall_session_send
 agentcall_report
 ```
+
+`agentcall_daemon(action=start)` 是 bootstrap 入口：daemon 未运行时由 MCP 拉起 daemon；已运行时返回 `already_running`。它不负责自动 kill/restart。
 
 旧 `agentcall_delegate` / `agentcall_delegate_acp` 已从默认工具面移除；隐藏兼容 handler 只返回 deprecated 提示，不再执行 Python workflow。
 
