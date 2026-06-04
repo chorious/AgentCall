@@ -53,7 +53,7 @@ pub(crate) fn run_acp_invocation(invocation: AcpInvocation) -> Result<Value, Str
                 "fs": {"readTextFile": false, "writeTextFile": false},
                 "terminal": false
             },
-            "clientInfo": {"name": "agentcall", "title": "AgentCall", "version": "0.8.1"}
+            "clientInfo": {"name": "agentcall", "title": "AgentCall", "version": "2.0.0"}
         }),
         deadline,
         &mut updates,

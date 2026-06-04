@@ -73,7 +73,7 @@ class AcpStdioClient:
                     "fs": {"readTextFile": False, "writeTextFile": False},
                     "terminal": False,
                 },
-                "clientInfo": {"name": "agentcall", "title": "AgentCall", "version": "0.7.1"},
+                "clientInfo": {"name": "agentcall", "title": "AgentCall", "version": "2.0.0"},
             },
         )
 

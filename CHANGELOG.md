@@ -1,5 +1,16 @@
 # CHANGELOG
 
+## v2.0.0 - Codex-Controlled Claude Code Cluster
+
+- 发布 AgentCall v2.0：定位为“让 Codex 指挥 Claude Code 集群协同工作”的本地多 Agent 控制面。
+- README 改为产品说明，明确 route-first MCP、PTY + ACP 双 runtime、hook-aware binding、file claim、readable wrapper 和 daemon single-writer。
+- 新增 [docs/about.md](docs/about.md)，说明 AgentCall 的产品定位、使用场景和边界。
+- daemon 读取 `config/agentcall.local.json`，模板为 `config/agentcall.example.json`；Claude PTY 的 cwd 强制取 `claude_workspace`，不再受 route/session 请求 workspace 影响。
+- README 详细说明 hooks 安装：Claude/Codex hooks 都走 daemon-first `/api/hooks/ingest`，并解释 `needs_permission`、`unbound`、`Stop` 等状态语义。
+- README 详细说明 config 配置：local config 不提交，模板可提交，本机 `D:\guKimi` 只进入 local config。
+- MCP 路线明确为稳定 bridge：本地固定工具 `agentcall_daemon`，业务工具由 daemon 动态提供。
+- 版本号同步到 `2.0.0`：Rust crates、MCP serverInfo、ACP clientInfo、Python package metadata。
+
 ## v0.8.1 - Stable MCP Bridge
 
 - MCP stdio 进程改为稳定薄外壳：本地只保留 `agentcall_daemon` bootstrap。

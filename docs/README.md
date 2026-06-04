@@ -5,6 +5,7 @@
 ## 当前入口
 
 - [项目说明](../README.md)
+- [About](about.md)
 - [版本历史](../CHANGELOG.md)
 - [当前 MCP/daemon 控制面](v3.0-mcp.md)
 - [MCP transport 恢复](mcp-transport-recovery.md)
@@ -35,4 +36,4 @@
 
 ## 当前版本提示
 
-当前主线版本是 `v0.8b`：MCP stdio 稳定桥接、daemon 提供动态工具面，ACP 默认控制逻辑迁入 Rust daemon，并用 Python reference 做同进同出 parity 验收。
+当前主线版本是 `v2.0.0`：AgentCall 已收敛为 Codex 指挥 Claude Code 集群的本地控制面，daemon 提供 route-first MCP、PTY/ACP 双 runtime、hook-aware summary、file claim 和 daemon-local config。

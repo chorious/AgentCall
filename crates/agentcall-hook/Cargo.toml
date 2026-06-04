@@ -1,6 +1,6 @@
 [package]
 name = "agentcall-hook"
-version = "0.8.2"
+version = "2.0.0"
 edition = "2024"
 
 [dependencies]
