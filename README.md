@@ -1,6 +1,6 @@
 # AgentCall
 
-当前版本：`v2.3.0`
+当前版本：`v2.4.0`
 
 AgentCall 是一个本地多 Agent 协作控制面，用来让 **Codex 指挥 Claude Code 集群协同工作**。它把 Codex 作为主控，把多个 Claude Code 实例作为可观察、可路由、可验收的工作单元，并用 Rust daemon 统一管理 PTY 会话、ACP 调用、hooks、file claim、runtime binding、summary、board 和 HTTP API。
 
@@ -15,8 +15,8 @@ AgentCall 是一个本地多 Agent 协作控制面，用来让 **Codex 指挥 Cl
 ## 产品特点
 
 - **Codex 主控，Claude Code 集群执行**：Codex 通过 `agentcall_board -> agentcall_route -> agentcall_session/agentcall_report` 组织多个 Claude Code worker。
-- **Route-first 调度**：`agentcall_route` 是唯一高层入口，支持 `runtime=auto|pty|acp`。ACP 在 v2.2 起被收敛为轻量化 SOP worker；PTY 在 v2.3 起默认走 `plan_then_auto`，先让 Claude Code 产出计划，再由主管批准进入 auto mode。
-- **ACP SOP Worker Gate**：`runtime=auto` 不再根据 `estimated_*` 猜“小任务”。调用方必须提供 `template`、`target_files`、`report_path`、`allowed_paths` 和 `acceptance_criteria`；通过 gate 才会进入 ACP，否则返回 `needs_contract`。
+- **Route-first 调度**：`agentcall_route` 是唯一高层入口，支持 `runtime=auto|pty|acp`。ACP 在 v2.2 起被收敛为轻量化 SOP worker；v2.4 起由 daemon 后台 supervisor 管理，默认 30 分钟 hard timeout。PTY 在 v2.3 起默认走 `plan_then_auto`，先让 Claude Code 产出计划，再由主管批准进入 auto mode。
+- **ACP SOP Worker Supervisor**：`runtime=auto` 不再根据 `estimated_*` 猜“小任务”。调用方必须提供 `template`、`target_files`、`report_path`、`allowed_paths` 和 `acceptance_criteria`；通过 gate 才会进入 ACP。ACP 后台运行，heartbeat 只更新 `acp_invocations.json`，无进展进入 `checkpoint_due`，超时进入 `failed_timeout`。
 - **PTY Plan Gate**：非 SOP 或复杂任务默认进入 PTY plan mode。`ExitPlanMode` 会被 hook 识别成 `plan_ready`；Codex 可用 `agentcall_session_send(action=approve_plan|revise_plan)` 批准或要求修订。
 - **Rust daemon 单写状态**：daemon 是 live events、claims、sessions、bindings、routes、summary 的权威写者，避免 Python/Rust 双写漂移。
 - **Hook-aware 状态绑定**：Claude/Codex hooks 进入 daemon，`AGENTCALL_WRAPPER_SESSION` 把 wrapper session 和 Claude hook session 可靠绑定。
@@ -44,7 +44,12 @@ Copy-Item config\agentcall.example.json config\agentcall.local.json
 ```json
 {
   "claude_workspace": "D:\\guKimi",
-  "acp_command": ["npx", "-y", "@agentclientprotocol/claude-agent-acp"]
+  "acp_command": ["npx", "-y", "@agentclientprotocol/claude-agent-acp"],
+  "acp_default_timeout_seconds": 1800,
+  "acp_max_timeout_seconds": 1800,
+  "acp_checkpoint_due_seconds": 600,
+  "acp_heartbeat_interval_seconds": 60,
+  "acp_max_active_invocations": 2
 }
 ```
 
@@ -105,13 +110,26 @@ config/agentcall.local.json
 ```json
 {
   "claude_workspace": "D:\\guKimi",
-  "acp_command": ["npx", "-y", "@agentclientprotocol/claude-agent-acp"]
+  "acp_command": ["npx", "-y", "@agentclientprotocol/claude-agent-acp"],
+  "acp_default_timeout_seconds": 1800,
+  "acp_max_timeout_seconds": 1800,
+  "acp_checkpoint_due_seconds": 600,
+  "acp_heartbeat_interval_seconds": 60,
+  "acp_max_active_invocations": 2
 }
 ```
 
 `claude_workspace` 是 Claude Code 的强制启动 cwd，也是 hooks 绑定语义的一部分。所有 Claude PTY session 无论 route 传入什么 `workspace`，都会使用该值。非 Claude 命令才使用请求 cwd 或 daemon workspace。
 
 `acp_command` 是 daemon-owned ACP adapter 命令。Codex 调用 `agentcall_route(runtime=acp)` 时不需要每次传 `adapter_command`；daemon 会优先使用请求里的 `adapter_command`，其次使用 local config 的 `acp_command`，最后才看 `AGENTCALL_ACP_COMMAND`。
+
+ACP supervisor 配置：
+
+- `acp_default_timeout_seconds`：ACP worker 默认 hard budget，默认 `1800`。
+- `acp_max_timeout_seconds`：单次 ACP 允许的最大 hard budget，默认 `1800`；请求超过该值会被拒绝。
+- `acp_checkpoint_due_seconds`：无 hook/update/report 进展多久后标记 `checkpoint_due`，默认 `600`。
+- `acp_heartbeat_interval_seconds`：后台 heartbeat 覆盖更新 state 的间隔，默认 `60`。
+- `acp_max_active_invocations`：同时运行的 ACP worker 上限，默认 `2`；超过时返回 `acp_capacity_exceeded`，不排队、不自动转 PTY。
 
 ## MCP / Codex 配置
 
@@ -149,6 +167,7 @@ GET  /api/runtime/health
 GET  /api/mcp/tools
 POST /api/mcp/call
 GET  /api/board?view=compact&filter=attention
+GET  /api/board?section=acp
 GET  /api/sessions
 GET  /api/sessions/{name}/summary
 GET  /api/sessions/{name}/output/clean
@@ -167,7 +186,7 @@ POST /api/hooks/ingest
 
 1. Codex 调用 `agentcall_board(view=compact, filter=attention)` 看全局状态。
 2. Codex 调用 `agentcall_route(mode=recommend, runtime=auto, template=..., target_files=..., report_path=..., allowed_paths=..., acceptance_criteria=...)` 让 daemon 校验 SOP contract；缺 contract 会返回 `needs_contract`。
-3. Codex 调用 `agentcall_route(mode=start, runtime=pty|acp, ...)` 派发任务；ACP 只用于 5 个 SOP worker，复杂长任务默认走 PTY `plan_then_auto`。
+3. Codex 调用 `agentcall_route(mode=start, runtime=pty|acp, ...)` 派发任务；ACP 只用于 5 个 SOP worker，快速返回 `route_id/invocation_id` 后由 daemon supervisor 后台管理，复杂长任务默认走 PTY `plan_then_auto`。
 4. Claude Code worker 执行任务，hooks 把状态和文件 claim 写回 daemon。
 5. PTY worker 若进入 `plan_ready`，Codex 或用户用 `agentcall_session_send(action=approve_plan)` 批准执行，或用 `revise_plan` 要求补计划。
 6. Codex 读取 `agentcall_session` 的 summary 和 worker report。

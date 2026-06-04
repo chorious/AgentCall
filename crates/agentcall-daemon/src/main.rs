@@ -1,4 +1,5 @@
 mod acp;
+mod acp_supervisor;
 mod config;
 mod hooks;
 mod http;
@@ -10,8 +11,8 @@ mod summary;
 mod terminal;
 mod util;
 
-use crate::http::handle_connection;
 use crate::config::LocalConfig;
+use crate::http::handle_connection;
 use crate::state::{AppState, append_agent_event};
 use crate::util::normalize_path;
 use std::env;
@@ -39,12 +40,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let workspace = normalize_path(workspace)?;
     let (config, config_error) = match LocalConfig::load(&workspace) {
         Ok(config) => (config, None),
-        Err(err) => (
-            LocalConfig::default(),
-            Some(err),
-        ),
+        Err(err) => (LocalConfig::default(), Some(err)),
     };
     let state = Arc::new(AppState::new(workspace, config, config_error));
+    acp_supervisor::mark_orphaned_on_start(&state);
     let listener = TcpListener::bind(("127.0.0.1", port))?;
     println!("AgentCall daemon: http://localhost:{port}");
     append_agent_event(

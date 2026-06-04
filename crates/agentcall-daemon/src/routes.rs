@@ -1,4 +1,8 @@
 use crate::acp::{AcpInvocation, AcpPermissionPolicy, run_acp_invocation};
+use crate::acp_supervisor::{
+    AcpInvocationStart, AcpSupervisorConfig, active_invocation_count, record_finished,
+    record_progress, record_started, start_heartbeat,
+};
 use crate::session::{
     InputRequest, StartRequest, configured_claude_workspace, start_session, write_input,
 };
@@ -8,6 +12,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -759,6 +764,42 @@ fn start_acp_route(
         .map_err(|missing| format!("ACP SOP contract is incomplete: {}", missing.join("; ")))?;
     let invocation_id = record.route_id.replace("route-", "acp-");
     record.invocation_id = Some(invocation_id.clone());
+    let supervisor_config = AcpSupervisorConfig::from_state(state);
+    let timeout_seconds = req
+        .timeout_seconds
+        .unwrap_or(supervisor_config.default_timeout_seconds);
+    if timeout_seconds == 0 || timeout_seconds > supervisor_config.max_timeout_seconds {
+        return Err(format!(
+            "timeout_seconds must be between 1 and configured acp_max_timeout_seconds ({})",
+            supervisor_config.max_timeout_seconds
+        ));
+    }
+    let active_count = active_invocation_count(state);
+    if active_count >= supervisor_config.max_active_invocations {
+        record.status = "acp_capacity_exceeded".to_string();
+        record.required_next_step =
+            "wait for an active ACP invocation to finish or force PTY".to_string();
+        record.result = json!({
+            "runtime": "acp",
+            "invocation_id": invocation_id,
+            "sop_status": "acp_capacity_exceeded",
+            "active_invocations": active_count,
+            "max_active_invocations": supervisor_config.max_active_invocations,
+            "message": "ACP active invocation cap reached; AgentCall does not queue ACP work.",
+        });
+        crate::state::append_agent_event(
+            state,
+            "acp.capacity_exceeded",
+            "ACP route rejected because the active invocation cap is reached.",
+            json!({
+                "route_id": record.route_id,
+                "invocation_id": record.invocation_id,
+                "active_invocations": active_count,
+                "max_active_invocations": supervisor_config.max_active_invocations,
+            }),
+        );
+        return Ok(());
+    }
     let child = acp_child_context(req, record, &invocation_id);
     let context_packet = create_context(
         state,
@@ -785,7 +826,6 @@ fn start_acp_route(
         .clone()
         .or_else(|| state.config.acp_command.clone())
         .or_else(acp_command_from_env);
-    let timeout_seconds = req.timeout_seconds.unwrap_or(30).clamp(1, 300);
     let workspace = req
         .workspace
         .as_deref()
@@ -835,7 +875,25 @@ fn start_acp_route(
             allowed_paths: contract.allowed_paths.clone(),
             report_path: Some(contract.report_path.clone()),
         };
+        record_started(
+            state,
+            AcpInvocationStart {
+                route_id: record.route_id.clone(),
+                invocation_id: invocation_id.clone(),
+                task_id: child.task_id.clone(),
+                call_id: child.call_id.clone(),
+                workspace: workspace.clone(),
+                cwd: cwd.clone(),
+                template: contract.template.clone(),
+                report_path: contract.report_path.clone(),
+                command: command.clone(),
+                hard_timeout_seconds: timeout_seconds,
+                checkpoint_due_after_seconds: supervisor_config.checkpoint_due_seconds,
+                heartbeat_interval_seconds: supervisor_config.heartbeat_interval_seconds,
+            },
+        )?;
         record.status = "started".to_string();
+        record.required_next_step = "inspect_board_or_report".to_string();
         record.result = json!({
             "runtime": "acp",
             "invocation_id": invocation_id,
@@ -849,32 +907,48 @@ fn start_acp_route(
             "permission_denials": [],
             "report_contract_status": "pending",
             "checkpoint_due": false,
+            "hard_timeout_seconds": timeout_seconds,
+            "checkpoint_due_after_seconds": supervisor_config.checkpoint_due_seconds,
+            "heartbeat_interval_seconds": supervisor_config.heartbeat_interval_seconds,
             "binding_gate": {
                 "required": true,
                 "expected_binding_source": "env",
                 "wrapper_session": child.call_id,
                 "status": "pending_hook"
             },
-            "timeout_seconds": timeout_seconds,
+            "required_next_step": "inspect_board_or_report",
         });
         upsert_route_record(state, record)?;
+        let done = Arc::new(AtomicBool::new(false));
+        start_heartbeat(
+            Arc::clone(&state_for_thread),
+            route_id.clone(),
+            invocation_id.clone(),
+            Arc::clone(&done),
+            supervisor_config.clone(),
+        );
         thread::spawn(move || {
             let progress_state = Arc::clone(&state_for_thread);
-            let progress_route = route_id.clone();
+            let progress_invocation = invocation_for_thread.clone();
+            let progress_route_id = route_id.clone();
             let progress = Arc::new(move |update: Value| {
-                let _ = patch_route_record(
-                    &progress_state,
-                    &progress_route,
-                    json!({
-                        "updated_at": now_ms(),
-                        "result": {
-                            "sop_status": "running",
-                            "last_acp_update": update,
-                            "last_progress_at": now_ms(),
-                            "checkpoint_due": false
-                        }
-                    }),
-                );
+                let is_denial =
+                    update.get("kind").and_then(Value::as_str) == Some("permission_denied");
+                record_progress(&progress_state, &progress_invocation, update.clone());
+                if is_denial {
+                    crate::state::append_agent_event(
+                        &progress_state,
+                        "acp.permission_denied",
+                        "ACP permission request denied by SOP policy.",
+                        json!({
+                            "route_id": progress_route_id.clone(),
+                            "invocation_id": progress_invocation.clone(),
+                            "runtime": "acp",
+                            "tool": update.get("tool").cloned().unwrap_or(Value::Null),
+                            "paths": update.get("paths").cloned().unwrap_or_else(|| json!([])),
+                        }),
+                    );
+                }
             });
             let result = run_acp_invocation(AcpInvocation {
                 command: command.clone(),
@@ -886,6 +960,7 @@ fn start_acp_route(
                 permission_policy: Some(policy),
                 progress: Some(progress),
             });
+            done.store(true, Ordering::SeqCst);
             match result {
                 Ok(result) => finish_acp_route(
                     &state_for_thread,
@@ -922,7 +997,9 @@ fn start_acp_route(
                 "wrapper_session": child.call_id,
                 "status": "no_acp_command"
             },
-            "timeout_seconds": timeout_seconds,
+            "hard_timeout_seconds": timeout_seconds,
+            "checkpoint_due_after_seconds": supervisor_config.checkpoint_due_seconds,
+            "heartbeat_interval_seconds": supervisor_config.heartbeat_interval_seconds,
             "message": "Set AGENTCALL_ACP_COMMAND or pass adapter_command to run native ACP.",
         });
         crate::state::append_agent_event(
@@ -956,6 +1033,7 @@ fn finish_acp_route(
     if let Some(result) = result {
         let report_text = report_text_from_path_or_result(&context_packet, &result);
         let report = extract_report_validation(&report_text);
+        let result_summary = acp_result_summary(&result);
         let acp_status = result["status"].as_str().unwrap_or("completed");
         let lifecycle_state = if acp_status == "completed"
             && report
@@ -967,6 +1045,18 @@ fn finish_acp_route(
         } else {
             "failed_report_contract"
         };
+        let report_contract_status = if lifecycle_state == "completed" {
+            "valid"
+        } else {
+            "failed_report_contract"
+        };
+        record_finished(
+            state,
+            invocation_id,
+            lifecycle_state,
+            report_contract_status,
+            merge_json(result_summary.clone(), json!({"report": report.clone()})),
+        );
         let _ = patch_route_record(
             state,
             route_id,
@@ -976,8 +1066,8 @@ fn finish_acp_route(
                 "result": {
                     "sop_status": lifecycle_state,
                     "report": report,
-                    "report_contract_status": if lifecycle_state == "completed" { "valid" } else { "failed_report_contract" },
-                    "acp_result": result,
+                    "report_contract_status": report_contract_status,
+                    "acp_result_summary": result_summary,
                     "checkpoint_due": false
                 }
             }),
@@ -1001,14 +1091,26 @@ fn finish_acp_route(
             ),
         );
     } else if let Some(error) = error {
+        let lifecycle_state = if error.to_ascii_lowercase().contains("timed out") {
+            "failed_timeout"
+        } else {
+            "failed"
+        };
+        record_finished(
+            state,
+            invocation_id,
+            lifecycle_state,
+            "not_available",
+            json!({"error": error.clone()}),
+        );
         let _ = patch_route_record(
             state,
             route_id,
             json!({
-                "status": "failed",
+                "status": lifecycle_state,
                 "updated_at": now_ms(),
                 "result": {
-                    "sop_status": "failed",
+                    "sop_status": lifecycle_state,
                     "report_contract_status": "not_available",
                     "error": error.clone(),
                     "checkpoint_due": false
@@ -1021,7 +1123,7 @@ fn finish_acp_route(
             "ACP child failed before report was received.",
             merge_json(
                 lifecycle_base.clone(),
-                json!({"status": "failed", "error": error}),
+                json!({"status": lifecycle_state, "error": error}),
             ),
         );
         crate::state::append_agent_event(
@@ -1030,10 +1132,20 @@ fn finish_acp_route(
             "ACP child failed.",
             merge_json(
                 lifecycle_base,
-                json!({"state": "failed", "agent": "rust_native_acp", "invocation_id": invocation_id, "error": error}),
+                json!({"state": lifecycle_state, "agent": "rust_native_acp", "invocation_id": invocation_id, "error": error}),
             ),
         );
     }
+}
+
+fn acp_result_summary(result: &Value) -> Value {
+    json!({
+        "status": result.get("status").and_then(Value::as_str),
+        "stop_reason": result.get("stop_reason").and_then(Value::as_str),
+        "update_count": result.get("update_count").and_then(Value::as_u64).unwrap_or(0),
+        "process": result.get("process").cloned().unwrap_or(Value::Null),
+        "session_id": result.get("session_id").and_then(Value::as_str),
+    })
 }
 
 fn report_text_from_path_or_result(context_packet: &Value, result: &Value) -> String {
@@ -1531,6 +1643,7 @@ mod tests {
             LocalConfig {
                 claude_workspace: Some(claude_workspace.clone()),
                 acp_command: None,
+                ..LocalConfig::default()
             },
             None,
         ));
@@ -1638,6 +1751,141 @@ mod tests {
         assert!(events.contains(r#""type":"agent.state_changed""#));
         assert!(events.contains(r#""state":"running""#));
         assert!(events.contains(r#""state":"failed""#));
+    }
+
+    #[test]
+    fn forced_acp_route_rejects_timeout_above_configured_cap() {
+        let workspace = test_workspace("forced-acp-timeout-cap");
+        let state = Arc::new(AppState::new(
+            workspace.clone(),
+            LocalConfig {
+                claude_workspace: Some(workspace.clone()),
+                acp_max_timeout_seconds: Some(1800),
+                ..LocalConfig::default()
+            },
+            None,
+        ));
+        let err = handle_route(
+            &state,
+            RouteRequest {
+                objective: "bounded review".to_string(),
+                workspace: None,
+                mode: Some("start".to_string()),
+                runtime: Some("acp".to_string()),
+                estimated_minutes: None,
+                estimated_files: None,
+                estimated_loc: None,
+                needs_continuity: None,
+                risk: None,
+                session_name: None,
+                command: None,
+                adapter_command: None,
+                timeout_seconds: Some(1801),
+                task_id: None,
+                call_id: None,
+                phase: None,
+                role: None,
+                allowed_paths: Some(vec![workspace.display().to_string()]),
+                acceptance_criteria: Some(vec!["produce report".to_string()]),
+                persist_context: None,
+                template: Some("read-and-report".to_string()),
+                target_files: Some(vec![workspace.join("README.md").display().to_string()]),
+                report_path: Some(
+                    workspace
+                        .join(".agentcall/reports/timeout_cap.md")
+                        .display()
+                        .to_string(),
+                ),
+                max_reads: None,
+                max_writes: Some(1),
+                pty_workflow: None,
+                initial_permission_mode: None,
+            },
+        )
+        .unwrap_err();
+        assert!(err.contains("acp_max_timeout_seconds (1800)"));
+    }
+
+    #[test]
+    fn forced_acp_route_rejects_when_active_capacity_is_full() {
+        let workspace = test_workspace("forced-acp-capacity");
+        let state = Arc::new(AppState::test(workspace.clone()));
+        record_started(
+            &state,
+            AcpInvocationStart {
+                route_id: "route-existing".to_string(),
+                invocation_id: "acp-existing".to_string(),
+                task_id: "task".to_string(),
+                call_id: "call".to_string(),
+                workspace: workspace.clone(),
+                cwd: workspace.clone(),
+                template: "read-and-report".to_string(),
+                report_path: workspace.join("existing.md").display().to_string(),
+                command: vec!["fake-acp".to_string()],
+                hard_timeout_seconds: 1800,
+                checkpoint_due_after_seconds: 600,
+                heartbeat_interval_seconds: 60,
+            },
+        )
+        .unwrap();
+        record_started(
+            &state,
+            AcpInvocationStart {
+                route_id: "route-existing-2".to_string(),
+                invocation_id: "acp-existing-2".to_string(),
+                task_id: "task".to_string(),
+                call_id: "call".to_string(),
+                workspace: workspace.clone(),
+                cwd: workspace.clone(),
+                template: "read-and-report".to_string(),
+                report_path: workspace.join("existing-2.md").display().to_string(),
+                command: vec!["fake-acp".to_string()],
+                hard_timeout_seconds: 1800,
+                checkpoint_due_after_seconds: 600,
+                heartbeat_interval_seconds: 60,
+            },
+        )
+        .unwrap();
+        let route = handle_route(
+            &state,
+            RouteRequest {
+                objective: "bounded review".to_string(),
+                workspace: None,
+                mode: Some("start".to_string()),
+                runtime: Some("acp".to_string()),
+                estimated_minutes: None,
+                estimated_files: None,
+                estimated_loc: None,
+                needs_continuity: None,
+                risk: None,
+                session_name: None,
+                command: None,
+                adapter_command: None,
+                timeout_seconds: None,
+                task_id: None,
+                call_id: None,
+                phase: None,
+                role: None,
+                allowed_paths: Some(vec![workspace.display().to_string()]),
+                acceptance_criteria: Some(vec!["produce report".to_string()]),
+                persist_context: None,
+                template: Some("read-and-report".to_string()),
+                target_files: Some(vec![workspace.join("README.md").display().to_string()]),
+                report_path: Some(
+                    workspace
+                        .join(".agentcall/reports/capacity.md")
+                        .display()
+                        .to_string(),
+                ),
+                max_reads: None,
+                max_writes: Some(1),
+                pty_workflow: None,
+                initial_permission_mode: None,
+            },
+        )
+        .unwrap();
+        assert_eq!(route["status"], "acp_capacity_exceeded");
+        assert_eq!(route["result"]["max_active_invocations"], 2);
     }
 
     #[test]

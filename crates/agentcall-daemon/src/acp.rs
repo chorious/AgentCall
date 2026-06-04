@@ -33,10 +33,12 @@ pub(crate) fn run_acp_invocation(invocation: AcpInvocation) -> Result<Value, Str
     if invocation.command.is_empty() {
         return Err("ACP command cannot be empty".to_string());
     }
-    let timeout = Duration::from_secs(invocation.timeout_seconds.clamp(1, 900));
+    let timeout = Duration::from_secs(invocation.timeout_seconds.max(1));
     let deadline = Instant::now() + timeout;
     let mut command = Command::new(&invocation.command[0]);
-    command.args(&invocation.command[1..]).current_dir(&invocation.cwd);
+    command
+        .args(&invocation.command[1..])
+        .current_dir(&invocation.cwd);
     for (key, value) in acp_env_vars(&invocation.wrapper_session) {
         command.env(key, value);
     }
@@ -46,6 +48,9 @@ pub(crate) fn run_acp_invocation(invocation: AcpInvocation) -> Result<Value, Str
         .stderr(Stdio::piped())
         .spawn()
         .map_err(|err| format!("failed to start ACP server: {err}"))?;
+    if let Some(progress) = &invocation.progress {
+        progress(json!({"kind": "process_started", "pid": child.id()}));
+    }
 
     let mut stdin = child
         .stdin
@@ -123,7 +128,7 @@ fn run_acp_protocol(
                 "fs": {"readTextFile": false, "writeTextFile": false},
                 "terminal": false
             },
-            "clientInfo": {"name": "agentcall", "title": "AgentCall", "version": "2.3.0"}
+            "clientInfo": {"name": "agentcall", "title": "AgentCall", "version": env!("CARGO_PKG_VERSION")}
         }),
         deadline,
         updates,
@@ -273,6 +278,18 @@ impl<'a> JsonRpcClient<'a> {
         let method = message.get("method").and_then(Value::as_str).unwrap_or("");
         let request_id = message.get("id").cloned().unwrap_or_else(|| json!(null));
         if method == "session/request_permission" {
+            if let Some(policy) = self.permission_policy.as_ref() {
+                if !permission_request_allowed(message, policy) {
+                    if let Some(progress) = &self.progress {
+                        progress(json!({
+                            "kind": "permission_denied",
+                            "tool": extract_tool_name(message),
+                            "paths": collect_path_strings(message),
+                            "reason": "ACP SOP policy denied the permission request",
+                        }));
+                    }
+                }
+            }
             let selected = select_permission_option(message, self.permission_policy.as_ref());
             return self.write(json!({
                 "jsonrpc": "2.0",
@@ -360,7 +377,9 @@ fn select_permission_option(message: &Value, policy: Option<&AcpPermissionPolicy
         }
         if !allowed {
             for option in options {
-                let text = serde_json::to_string(option).unwrap_or_default().to_ascii_lowercase();
+                let text = serde_json::to_string(option)
+                    .unwrap_or_default()
+                    .to_ascii_lowercase();
                 if text.contains("deny") || text.contains("reject") {
                     return option.get("optionId").cloned().unwrap_or(Value::Null);
                 }
@@ -389,7 +408,9 @@ fn permission_request_allowed(message: &Value, policy: &AcpPermissionPolicy) -> 
     let haystack = serde_json::to_string(message)
         .unwrap_or_default()
         .to_ascii_lowercase();
-    let tool = extract_tool_name(message).unwrap_or_default().to_ascii_lowercase();
+    let tool = extract_tool_name(message)
+        .unwrap_or_default()
+        .to_ascii_lowercase();
     if tool.contains("bash") || haystack.contains("\"bash\"") || haystack.contains("\"command\"") {
         return bash_request_allowed(message);
     }
@@ -421,7 +442,7 @@ fn permission_request_allowed(message: &Value, policy: &AcpPermissionPolicy) -> 
                     .allowed_paths
                     .iter()
                     .any(|allowed| path_within(path, allowed))
-            });
+        });
     }
     let paths = collect_path_strings(message);
     if !paths.is_empty() {
@@ -447,14 +468,38 @@ fn bash_request_allowed(message: &Value) -> bool {
         return false;
     }
     let forbidden = [
-        ">", ">>", "| tee", "set-content", "out-file", "new-item", "remove-item", "del ", "erase ",
-        "rm ", "move-item", "mv ", "copy-item", "cp ", "mkdir", "rmdir", "echo ",
+        ">",
+        ">>",
+        "| tee",
+        "set-content",
+        "out-file",
+        "new-item",
+        "remove-item",
+        "del ",
+        "erase ",
+        "rm ",
+        "move-item",
+        "mv ",
+        "copy-item",
+        "cp ",
+        "mkdir",
+        "rmdir",
+        "echo ",
     ];
     if forbidden.iter().any(|needle| trimmed.contains(needle)) {
         return false;
     }
     let readonly = [
-        "pwd", "cd", "ls", "dir", "cat ", "type ", "rg ", "findstr ", "git status", "git diff",
+        "pwd",
+        "cd",
+        "ls",
+        "dir",
+        "cat ",
+        "type ",
+        "rg ",
+        "findstr ",
+        "git status",
+        "git diff",
         "git show",
     ];
     readonly.iter().any(|prefix| trimmed.starts_with(prefix))
@@ -519,7 +564,10 @@ fn looks_like_path(value: &str) -> bool {
 }
 
 fn normalize_path(value: &str) -> String {
-    value.replace('/', "\\").trim_end_matches('\\').to_ascii_lowercase()
+    value
+        .replace('/', "\\")
+        .trim_end_matches('\\')
+        .to_ascii_lowercase()
 }
 
 fn same_normalized_path(left: &str, right: &str) -> bool {
@@ -609,7 +657,10 @@ mod tests {
                 ]
             }
         });
-        assert_eq!(select_permission_option(&message, None), json!("allow-once"));
+        assert_eq!(
+            select_permission_option(&message, None),
+            json!("allow-once")
+        );
     }
 
     #[test]
@@ -632,7 +683,10 @@ mod tests {
                 ]
             }
         });
-        assert_eq!(select_permission_option(&message, Some(&policy)), json!("reject-once"));
+        assert_eq!(
+            select_permission_option(&message, Some(&policy)),
+            json!("reject-once")
+        );
     }
 
     #[test]
@@ -657,7 +711,10 @@ mod tests {
                 ]
             }
         });
-        assert_eq!(select_permission_option(&message, Some(&policy)), json!("allow-once"));
+        assert_eq!(
+            select_permission_option(&message, Some(&policy)),
+            json!("allow-once")
+        );
     }
 
     #[test]
@@ -673,11 +730,14 @@ mod tests {
     #[test]
     fn acp_env_vars_include_wrapper_session() {
         let vars = acp_env_vars("acp-child-1");
-        assert!(vars.iter().any(|(key, value)| {
-            *key == "AGENTCALL_WRAPPER_SESSION" && value == "acp-child-1"
-        }));
-        assert!(vars.iter().any(|(key, value)| {
-            *key == "PYTHONIOENCODING" && value == "utf-8"
-        }));
+        assert!(
+            vars.iter().any(|(key, value)| {
+                *key == "AGENTCALL_WRAPPER_SESSION" && value == "acp-child-1"
+            })
+        );
+        assert!(
+            vars.iter()
+                .any(|(key, value)| { *key == "PYTHONIOENCODING" && value == "utf-8" })
+        );
     }
 }

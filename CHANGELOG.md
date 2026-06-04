@@ -1,5 +1,17 @@
 # CHANGELOG
 
+## v2.4.0 - ACP Background Supervisor
+
+- ACP route 改为后台 supervisor 模式：`agentcall_route(runtime=acp)` 快速返回 `route_id/invocation_id`，daemon 后台拥有 ACP child process。
+- ACP 默认 hard timeout 调整为 30 分钟（`1800s`），请求超过 `acp_max_timeout_seconds` 会被拒绝，超时进入 `failed_timeout`。
+- 新增 daemon 单写 `.agentcall/state/acp_invocations.json`，记录 ACP heartbeat、progress、permission denials、report contract status 和 orphan 状态。
+- heartbeat 默认 60 秒覆盖更新 invocation state，不再把每次 ACP update append 到 route/events；route 只保留 compact projection。
+- 10 分钟无进展标记 `checkpoint_due`，作为软信号提示可能应改派 PTY，不自动 kill。
+- daemon 启动时把失去 ownership 的 running ACP 标记为 `orphaned_after_daemon_restart`，不宣称可恢复。
+- ACP active invocation 默认上限为 2，超过时返回 `acp_capacity_exceeded`，不排队、不自动转 PTY。
+- `runtime_health` 和 board attention 增加 ACP supervisor 状态投影。
+- 新增 [docs/v2.4-acp-background-supervisor.md](docs/v2.4-acp-background-supervisor.md)。
+
 ## v2.3.0 - PTY Plan Gate
 
 - PTY route 默认改为 `plan_then_auto`：`agentcall_route(mode=start,runtime=pty)` 默认启动 `claude --permission-mode plan --session-id <uuid>`。

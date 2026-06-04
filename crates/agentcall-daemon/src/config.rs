@@ -5,6 +5,11 @@ use std::path::{Path, PathBuf};
 pub(crate) struct LocalConfig {
     pub(crate) claude_workspace: Option<PathBuf>,
     pub(crate) acp_command: Option<Vec<String>>,
+    pub(crate) acp_default_timeout_seconds: Option<u64>,
+    pub(crate) acp_max_timeout_seconds: Option<u64>,
+    pub(crate) acp_checkpoint_due_seconds: Option<u64>,
+    pub(crate) acp_heartbeat_interval_seconds: Option<u64>,
+    pub(crate) acp_max_active_invocations: Option<usize>,
 }
 
 impl LocalConfig {
@@ -16,12 +21,8 @@ impl LocalConfig {
                 path.display()
             )
         })?;
-        serde_json::from_str(&text).map_err(|err| {
-            format!(
-                "invalid local daemon config: {} ({err})",
-                path.display()
-            )
-        })
+        serde_json::from_str(&text)
+            .map_err(|err| format!("invalid local daemon config: {} ({err})", path.display()))
     }
 }
 

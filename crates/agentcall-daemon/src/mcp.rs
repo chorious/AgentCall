@@ -25,7 +25,7 @@ pub(crate) fn mcp_tools() -> Vec<Value> {
                     "root": {"type": "string"},
                     "view": {"type": "string", "enum": ["full", "compact"], "default": "full"},
                     "filter": {"type": "string", "enum": ["all", "attention"], "default": "all"},
-                    "section": {"type": "string", "enum": ["all", "sessions", "events", "reports", "claims", "transcripts", "routes"], "default": "all"}
+                    "section": {"type": "string", "enum": ["all", "sessions", "events", "reports", "claims", "transcripts", "routes", "acp"], "default": "all"}
                 },
                 "additionalProperties": false
             }
