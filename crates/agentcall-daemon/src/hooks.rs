@@ -1,3 +1,4 @@
+use crate::routes::{patch_route_record_locked, route_for_wrapper_session};
 use crate::state::{
     AppState, append_agent_event, append_agent_event_locked, read_json_file, write_json_file,
 };
@@ -313,6 +314,13 @@ pub(crate) fn pre_tool_use_claim_locked(
             }));
         }
     }
+    if let Some(wrapper) = wrapper_session {
+        if let Some(decision) =
+            pty_plan_policy_decision(state, state_dir, wrapper, tool_name, payload)?
+        {
+            return Ok(decision);
+        }
+    }
     if !is_write_tool(tool_name) {
         return Ok(
             serde_json::json!({"allowed": true, "reason": "tool does not claim files", "files": [], "conflicts": []}),
@@ -572,6 +580,99 @@ fn sop_policy_denial(
     None
 }
 
+fn pty_plan_policy_decision(
+    state: &AppState,
+    state_dir: &Path,
+    wrapper_session: &str,
+    tool_name: &str,
+    payload: &serde_json::Value,
+) -> Result<Option<serde_json::Value>, String> {
+    let Some((route_id, route)) = route_for_wrapper_session(state, wrapper_session) else {
+        return Ok(None);
+    };
+    if route
+        .get("recommended_runtime")
+        .and_then(serde_json::Value::as_str)
+        != Some("pty")
+    {
+        return Ok(None);
+    }
+    let result = route.get("result").unwrap_or(&serde_json::Value::Null);
+    if result
+        .get("pty_workflow")
+        .and_then(serde_json::Value::as_str)
+        != Some("plan_then_auto")
+    {
+        return Ok(None);
+    }
+    let phase = result
+        .get("phase")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("plan");
+    if phase != "plan" {
+        return Ok(None);
+    }
+    if tool_name == "ExitPlanMode" {
+        let agent_dir = state_dir
+            .parent()
+            .unwrap_or_else(|| Path::new(".agentcall"));
+        patch_route_record_locked(
+            state,
+            agent_dir,
+            &route_id,
+            serde_json::json!({
+                "status": "plan_ready",
+                "updated_at": crate::util::now_ms(),
+                "result": {
+                    "workflow_status": "plan_ready",
+                    "phase": "plan",
+                    "permission_mode": "plan",
+                    "mode_source": "hook",
+                    "last_plan_ready_at": chrono::Utc::now().to_rfc3339()
+                }
+            }),
+        )?;
+        return Ok(Some(serde_json::json!({
+            "allowed": true,
+            "reason": "plan ready; waiting for explicit approve_plan/start_auto",
+            "route_id": route_id,
+            "files": extract_tool_files(payload),
+            "conflicts": []
+        })));
+    }
+    if tool_name == "Bash" {
+        if bash_readonly_allowed(payload) {
+            return Ok(None);
+        }
+        return Ok(Some(serde_json::json!({
+            "allowed": false,
+            "reason": "plan phase denies non-read-only bash command",
+            "route_id": route_id,
+            "files": extract_tool_files(payload),
+            "conflicts": []
+        })));
+    }
+    if is_write_tool(tool_name) {
+        let files = extract_tool_files(payload);
+        if files.iter().all(|file| is_claude_plan_file(file)) {
+            return Ok(None);
+        }
+        return Ok(Some(serde_json::json!({
+            "allowed": false,
+            "reason": "plan phase denies project file writes before approve_plan/start_auto",
+            "route_id": route_id,
+            "files": files,
+            "conflicts": []
+        })));
+    }
+    Ok(None)
+}
+
+fn is_claude_plan_file(path: &str) -> bool {
+    let normalized = normalize_workspace_path(path).to_ascii_lowercase();
+    normalized.contains("/.claude/plans/") || normalized.starts_with(".claude/plans/")
+}
+
 fn bash_readonly_allowed(payload: &serde_json::Value) -> bool {
     let command = payload
         .get("tool_input")
@@ -585,14 +686,38 @@ fn bash_readonly_allowed(payload: &serde_json::Value) -> bool {
         return false;
     }
     let forbidden = [
-        ">", ">>", "| tee", "set-content", "out-file", "new-item", "remove-item", "del ",
-        "erase ", "rm ", "move-item", "mv ", "copy-item", "cp ", "mkdir", "rmdir", "echo ",
+        ">",
+        ">>",
+        "| tee",
+        "set-content",
+        "out-file",
+        "new-item",
+        "remove-item",
+        "del ",
+        "erase ",
+        "rm ",
+        "move-item",
+        "mv ",
+        "copy-item",
+        "cp ",
+        "mkdir",
+        "rmdir",
+        "echo ",
     ];
     if forbidden.iter().any(|needle| command.contains(needle)) {
         return false;
     }
     let allowed = [
-        "pwd", "cd", "ls", "dir", "cat ", "type ", "rg ", "findstr ", "git status", "git diff",
+        "pwd",
+        "cd",
+        "ls",
+        "dir",
+        "cat ",
+        "type ",
+        "rg ",
+        "findstr ",
+        "git status",
+        "git diff",
         "git show",
     ];
     allowed.iter().any(|prefix| command.starts_with(prefix))
@@ -693,6 +818,12 @@ pub(crate) fn infer_hook_status(event: &str, payload: &serde_json::Value) -> Str
         return status.to_string();
     }
     match event {
+        "PreToolUse"
+            if string_field(payload, &["tool_name", "toolName"]).as_deref()
+                == Some("ExitPlanMode") =>
+        {
+            "plan_ready".to_string()
+        }
         "SessionStart" | "UserPromptSubmit" | "PreToolUse" | "PostToolUse" => "working".to_string(),
         "Notification" => {
             let message = payload
@@ -770,6 +901,32 @@ mod tests {
         .unwrap();
     }
 
+    fn install_pty_plan_route(state: &AppState, wrapper_session: &str) {
+        let path = state
+            .workspace
+            .join(".agentcall")
+            .join("state")
+            .join("routes.json");
+        write_json_file(
+            &path,
+            &serde_json::json!({
+                "route-pty": {
+                    "route_id": "route-pty",
+                    "recommended_runtime": "pty",
+                    "session_name": wrapper_session,
+                    "result": {
+                        "pty_workflow": "plan_then_auto",
+                        "workflow_status": "plan_running",
+                        "phase": "plan",
+                        "permission_mode": "plan",
+                        "plan_session_name": wrapper_session
+                    }
+                }
+            }),
+        )
+        .unwrap();
+    }
+
     #[test]
     fn sop_hook_policy_denies_write_outside_report_path() {
         let state = test_state("sop-deny-write");
@@ -786,10 +943,12 @@ mod tests {
         )
         .unwrap();
         assert_eq!(result["decision"]["allowed"], false);
-        assert!(result["decision"]["reason"]
-            .as_str()
-            .unwrap()
-            .contains("outside report_path"));
+        assert!(
+            result["decision"]["reason"]
+                .as_str()
+                .unwrap()
+                .contains("outside report_path")
+        );
     }
 
     #[test]
@@ -808,6 +967,84 @@ mod tests {
         )
         .unwrap();
         assert_eq!(result["decision"]["allowed"], true);
+    }
+
+    #[test]
+    fn pty_plan_phase_denies_project_file_writes() {
+        let state = test_state("pty-plan-deny-write");
+        install_pty_plan_route(&state, "pty-a");
+        let mut payload = write_payload("claude-a", "src/lib.rs");
+        payload["wrapper_session"] = serde_json::json!("pty-a");
+        let result = ingest_hook(
+            &state,
+            HookIngestRequest {
+                event: "PreToolUse".to_string(),
+                payload,
+                runtime: Some("claude-code-session".to_string()),
+            },
+        )
+        .unwrap();
+        assert_eq!(result["decision"]["allowed"], false);
+        assert!(
+            result["decision"]["reason"]
+                .as_str()
+                .unwrap()
+                .contains("plan phase denies")
+        );
+    }
+
+    #[test]
+    fn pty_plan_phase_allows_claude_plan_file_write() {
+        let state = test_state("pty-plan-allow-plan-file");
+        install_pty_plan_route(&state, "pty-a");
+        let mut payload =
+            write_payload("claude-a", "C:/Users/MUSHI/.claude/plans/agentcall-plan.md");
+        payload["wrapper_session"] = serde_json::json!("pty-a");
+        let result = ingest_hook(
+            &state,
+            HookIngestRequest {
+                event: "PreToolUse".to_string(),
+                payload,
+                runtime: Some("claude-code-session".to_string()),
+            },
+        )
+        .unwrap();
+        assert_eq!(result["decision"]["allowed"], true);
+    }
+
+    #[test]
+    fn exit_plan_mode_marks_route_plan_ready() {
+        let state = test_state("pty-plan-ready");
+        install_pty_plan_route(&state, "pty-a");
+        let result = ingest_hook(
+            &state,
+            HookIngestRequest {
+                event: "PreToolUse".to_string(),
+                payload: serde_json::json!({
+                    "session_id": "claude-a",
+                    "wrapper_session": "pty-a",
+                    "tool_name": "ExitPlanMode",
+                    "tool_input": {"plan": "do the thing"}
+                }),
+                runtime: Some("claude-code-session".to_string()),
+            },
+        )
+        .unwrap();
+        assert_eq!(result["status"], "plan_ready");
+        assert_eq!(result["decision"]["allowed"], true);
+        let routes = read_json_file(
+            &state
+                .workspace
+                .join(".agentcall")
+                .join("state")
+                .join("routes.json"),
+            serde_json::json!({}),
+        );
+        assert_eq!(routes["route-pty"]["status"], "plan_ready");
+        assert_eq!(
+            routes["route-pty"]["result"]["workflow_status"],
+            "plan_ready"
+        );
     }
 
     #[test]

@@ -1,5 +1,14 @@
 # CHANGELOG
 
+## v2.3.0 - PTY Plan Gate
+
+- PTY route 默认改为 `plan_then_auto`：`agentcall_route(mode=start,runtime=pty)` 默认启动 `claude --permission-mode plan --session-id <uuid>`。
+- route result/summary 增加 `pty_workflow`、`workflow_status`、`permission_mode` 和 route-derived mode，减少对 TUI grep 的依赖。
+- Claude 调用 `ExitPlanMode` 时，hook 将 route 标记为 `plan_ready`，board/summary 可把它作为需要主管批准的 checkpoint。
+- plan 阶段新增 hook gate：允许读操作和 Claude 自己的 `.claude/plans` 文件写入，拒绝项目实现文件写入和非只读 Bash。
+- `agentcall_session_send` 增加 `approve_plan`、`start_auto`、`revise_plan`，用于批准计划进入 auto 或要求修订计划。
+- 新增 [docs/v2.3-pty-plan-gate.md](docs/v2.3-pty-plan-gate.md)。
+
 ## v2.2.0 - ACP SOP Worker Gate
 
 - `agentcall_route(runtime=auto)` 不再用 `estimated_minutes/files/loc` 打分猜测 ACP；ACP 必须提供合法 SOP contract。

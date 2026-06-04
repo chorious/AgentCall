@@ -8,6 +8,7 @@
 - [About](about.md)
 - [版本历史](../CHANGELOG.md)
 - [当前 MCP/daemon 控制面](v3.0-mcp.md)
+- [PTY Plan Gate](v2.3-pty-plan-gate.md)
 - [MCP transport 恢复](mcp-transport-recovery.md)
 
 ## 架构与主线说明
@@ -17,6 +18,7 @@
 - [session-supervisor.md](session-supervisor.md)
 - [sop-protocol.md](sop-protocol.md)
 - [v2.0-architecture.md](v2.0-architecture.md)
+- [v2.3-pty-plan-gate.md](v2.3-pty-plan-gate.md)
 - [v2.2-acp-sop-worker-gate.md](v2.2-acp-sop-worker-gate.md)
 - [v3.0-mcp.md](v3.0-mcp.md)
 - [agentapi-adapter.md](agentapi-adapter.md)
@@ -37,4 +39,4 @@
 
 ## 当前版本提示
 
-当前主线版本是 `v2.2.0`：AgentCall 已收敛为 Codex 指挥 Claude Code 集群的本地控制面。v2.2 将 ACP 定义为轻量化 SOP worker：route 不再用 estimated size 猜小任务，而是由 daemon 校验 SOP contract，并在 ACP permission 与 hooks 层强制执行 report-only 写入边界。
+当前主线版本是 `v2.3.0`：AgentCall 已收敛为 Codex 指挥 Claude Code 集群的本地控制面。v2.2 将 ACP 定义为轻量化 SOP worker；v2.3 将 PTY 默认改为 `plan_then_auto`，让复杂任务先进入 plan mode，再由主管批准进入 auto mode。

@@ -156,6 +156,8 @@ pub(crate) fn session_summary(state: &AppState, session: &Arc<Session>) -> serde
             .to_ascii_lowercase()
             .contains("tasks completed");
     let agent_dir = state.workspace.join(".agentcall");
+    let routes = routes_state(state);
+    let route_result = route_result_for_session(&routes, &session.name);
     let bindings = runtime_bindings_state(state);
     let binding = binding_for_wrapper(&bindings, &session.name);
     let binding_source = binding
@@ -217,6 +219,16 @@ pub(crate) fn session_summary(state: &AppState, session: &Arc<Session>) -> serde
     }
     if liveness_status == "failed" {
         attention_status = "failed".to_string();
+    }
+    if route_result
+        .as_ref()
+        .and_then(|result| result.get("workflow_status"))
+        .and_then(|value| value.as_str())
+        == Some("plan_ready")
+    {
+        liveness_status = "plan_ready".to_string();
+        attention_status = "checkpoint_due".to_string();
+        status_source = "route".to_string();
     }
     let claims = read_json_file(
         &agent_dir.join("state").join("file_claims.json"),
@@ -295,7 +307,22 @@ pub(crate) fn session_summary(state: &AppState, session: &Arc<Session>) -> serde
         "reports": reports,
         "tokens": extract_after_marker(&clean_output, "tokens"),
         "context_used": extract_context_used(&clean_output),
-        "mode": extract_mode(&clean_output),
+        "mode": route_result
+            .as_ref()
+            .and_then(|result| result.get("permission_mode"))
+            .and_then(|value| value.as_str())
+            .map(str::to_string)
+            .unwrap_or_else(|| extract_mode(&clean_output)),
+        "pty_workflow": route_result
+            .as_ref()
+            .and_then(|result| result.get("pty_workflow"))
+            .cloned()
+            .unwrap_or(serde_json::Value::Null),
+        "workflow_status": route_result
+            .as_ref()
+            .and_then(|result| result.get("workflow_status"))
+            .cloned()
+            .unwrap_or(serde_json::Value::Null),
         "last_error": last_error(&clean_output),
         "needs_attention": needs_attention,
         "confidence": confidence,
@@ -427,6 +454,7 @@ fn hook_status_dimensions(status: &str) -> (String, String) {
         ),
         "waiting_input" => ("waiting_input".to_string(), "waiting_input".to_string()),
         "checkpoint_due" => ("checkpoint_due".to_string(), "checkpoint_due".to_string()),
+        "plan_ready" => ("plan_ready".to_string(), "checkpoint_due".to_string()),
         "idle" => ("idle".to_string(), "none".to_string()),
         "completed" | "ended" => ("completed".to_string(), "none".to_string()),
         "failed" => ("failed".to_string(), "failed".to_string()),
@@ -434,6 +462,42 @@ fn hook_status_dimensions(status: &str) -> (String, String) {
             ("working".to_string(), "none".to_string())
         }
         _ => ("unknown".to_string(), "low_confidence".to_string()),
+    }
+}
+
+fn route_result_for_session(
+    routes: &serde_json::Value,
+    session_name: &str,
+) -> Option<serde_json::Value> {
+    if let Some(object) = routes.as_object() {
+        return object
+            .values()
+            .find_map(|route| route_result_match(route, session_name));
+    }
+    routes.as_array().and_then(|items| {
+        items
+            .iter()
+            .find_map(|route| route_result_match(route, session_name))
+    })
+}
+
+fn route_result_match(route: &serde_json::Value, session_name: &str) -> Option<serde_json::Value> {
+    let session_match =
+        route.get("session_name").and_then(|value| value.as_str()) == Some(session_name);
+    let plan_match = route
+        .get("result")
+        .and_then(|result| result.get("plan_session_name"))
+        .and_then(|value| value.as_str())
+        == Some(session_name);
+    let auto_match = route
+        .get("result")
+        .and_then(|result| result.get("auto_session_name"))
+        .and_then(|value| value.as_str())
+        == Some(session_name);
+    if session_match || plan_match || auto_match {
+        route.get("result").cloned()
+    } else {
+        None
     }
 }
 
@@ -593,5 +657,23 @@ mod tests {
         assert_eq!(legacy[0]["status_class"], "legacy_detached");
         assert_eq!(legacy[0]["live"], false);
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn route_result_for_session_supports_board_array_shape() {
+        let routes = serde_json::json!([
+            {
+                "route_id": "route-1",
+                "session_name": "pty-a",
+                "result": {
+                    "pty_workflow": "plan_then_auto",
+                    "workflow_status": "plan_running",
+                    "permission_mode": "plan"
+                }
+            }
+        ]);
+        let result = route_result_for_session(&routes, "pty-a").unwrap();
+        assert_eq!(result["pty_workflow"], "plan_then_auto");
+        assert_eq!(result["permission_mode"], "plan");
     }
 }

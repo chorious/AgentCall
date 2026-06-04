@@ -46,6 +46,8 @@ pub(crate) struct RouteRequest {
     report_path: Option<String>,
     max_reads: Option<u64>,
     max_writes: Option<u64>,
+    pty_workflow: Option<String>,
+    initial_permission_mode: Option<String>,
 }
 
 #[derive(Clone, Serialize)]
@@ -66,6 +68,31 @@ struct RouteRecord {
     created_at: u64,
     updated_at: u64,
     result: Value,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum PtyWorkflow {
+    PlanThenAuto,
+    Normal,
+}
+
+impl PtyWorkflow {
+    pub(crate) fn from_request(value: Option<&str>) -> Result<Self, String> {
+        match value.unwrap_or("plan_then_auto") {
+            "plan_then_auto" => Ok(Self::PlanThenAuto),
+            "normal" => Ok(Self::Normal),
+            other => Err(format!(
+                "pty_workflow must be plan_then_auto or normal, got {other}"
+            )),
+        }
+    }
+
+    pub(crate) fn as_str(&self) -> &'static str {
+        match self {
+            Self::PlanThenAuto => "plan_then_auto",
+            Self::Normal => "normal",
+        }
+    }
 }
 
 pub(crate) fn handle_route(state: &Arc<AppState>, req: RouteRequest) -> Result<Value, String> {
@@ -126,7 +153,10 @@ pub(crate) fn handle_route(state: &Arc<AppState>, req: RouteRequest) -> Result<V
         let context_packet = create_context(
             state,
             ContextRequest {
-                task_id: req.task_id.clone().unwrap_or_else(|| record.route_id.clone()),
+                task_id: req
+                    .task_id
+                    .clone()
+                    .unwrap_or_else(|| record.route_id.clone()),
                 call_id: req.call_id.clone().unwrap_or(default_call_id),
                 objective: req.objective.clone(),
                 phase: req.phase.clone(),
@@ -440,7 +470,9 @@ fn validate_sop_contract(req: &RouteRequest) -> Result<SopContract, Vec<String>>
     {
         missing.push("acceptance_criteria is required".to_string());
     }
-    let max_reads = req.max_reads.unwrap_or_else(|| target_files.len().max(1) as u64 + 5);
+    let max_reads = req
+        .max_reads
+        .unwrap_or_else(|| target_files.len().max(1) as u64 + 5);
     let max_writes = req.max_writes.unwrap_or(1);
     if max_writes > 1 {
         missing.push("max_writes must be <= 1 for ACP SOP workers".to_string());
@@ -455,7 +487,9 @@ fn validate_sop_contract(req: &RouteRequest) -> Result<SopContract, Vec<String>>
     }
     if template == "single-report-update"
         && !report_path.is_empty()
-        && target_files.iter().any(|file| !same_path(file, &report_path))
+        && target_files
+            .iter()
+            .any(|file| !same_path(file, &report_path))
     {
         missing.push("single-report-update target_files must only include report_path".to_string());
     }
@@ -495,8 +529,14 @@ fn sop_contract_from_context(packet: &Value) -> Result<SopContract, String> {
         target_files,
         allowed_paths,
         report_path,
-        max_reads: packet.get("max_reads").and_then(Value::as_u64).unwrap_or(20),
-        max_writes: packet.get("max_writes").and_then(Value::as_u64).unwrap_or(1),
+        max_reads: packet
+            .get("max_reads")
+            .and_then(Value::as_u64)
+            .unwrap_or(20),
+        max_writes: packet
+            .get("max_writes")
+            .and_then(Value::as_u64)
+            .unwrap_or(1),
     })
 }
 
@@ -514,7 +554,10 @@ fn string_array(value: Option<&Value>) -> Vec<String> {
 }
 
 fn normalized_path(value: &str) -> String {
-    value.replace('/', "\\").trim_end_matches('\\').to_ascii_lowercase()
+    value
+        .replace('/', "\\")
+        .trim_end_matches('\\')
+        .to_ascii_lowercase()
 }
 
 fn same_path(left: &str, right: &str) -> bool {
@@ -556,13 +599,13 @@ fn start_pty_route(
     if !safe_name(&session_name) {
         return Err("unsafe session_name".to_string());
     }
-    let command = req.command.clone().unwrap_or_else(|| {
-        vec![
-            "claude".to_string(),
-            "--permission-mode".to_string(),
-            "auto".to_string(),
-        ]
-    });
+    let workflow = PtyWorkflow::from_request(req.pty_workflow.as_deref())?;
+    let claude_session_id = if workflow == PtyWorkflow::PlanThenAuto {
+        Some(new_claude_session_id(state))
+    } else {
+        None
+    };
+    let command = pty_command(req, &workflow, claude_session_id.as_deref())?;
     let info = start_session(
         state,
         StartRequest {
@@ -591,9 +634,18 @@ fn start_pty_route(
         Err(_) => "started_pending_prompt",
     };
     record.status = prompt_status.to_string();
-    record.session_name = Some(session_name);
+    record.session_name = Some(session_name.clone());
+    let permission_mode = pty_initial_permission_mode(req, &workflow);
     record.result = json!({
         "runtime": "pty",
+        "pty_workflow": workflow.as_str(),
+        "workflow_status": if workflow == PtyWorkflow::PlanThenAuto { "plan_running" } else { "running" },
+        "phase": if workflow == PtyWorkflow::PlanThenAuto { "plan" } else { "execute" },
+        "permission_mode": permission_mode,
+        "mode_source": "route",
+        "claude_session_id": claude_session_id,
+        "plan_session_name": if workflow == PtyWorkflow::PlanThenAuto { Some(session_name.clone()) } else { None },
+        "auto_session_name": serde_json::Value::Null,
         "session": info,
         "prompt_gate": {
             "status": prompt_status,
@@ -606,6 +658,70 @@ fn start_pty_route(
         }
     });
     Ok(())
+}
+
+pub(crate) fn route_for_wrapper_session(
+    state: &AppState,
+    wrapper_session: &str,
+) -> Option<(String, Value)> {
+    let routes = read_routes(state);
+    let object = routes.as_object()?;
+    object.iter().find_map(|(route_id, route)| {
+        let session_match =
+            route.get("session_name").and_then(Value::as_str) == Some(wrapper_session);
+        let plan_match = route
+            .get("result")
+            .and_then(|result| result.get("plan_session_name"))
+            .and_then(Value::as_str)
+            == Some(wrapper_session);
+        let auto_match = route
+            .get("result")
+            .and_then(|result| result.get("auto_session_name"))
+            .and_then(Value::as_str)
+            == Some(wrapper_session);
+        let binding_match = route
+            .get("result")
+            .and_then(|result| result.get("binding_gate"))
+            .and_then(|gate| gate.get("wrapper_session"))
+            .and_then(Value::as_str)
+            == Some(wrapper_session);
+        if session_match || plan_match || auto_match || binding_match {
+            Some((route_id.clone(), route.clone()))
+        } else {
+            None
+        }
+    })
+}
+
+pub(crate) fn patch_route_record(
+    state: &AppState,
+    route_id: &str,
+    patch: Value,
+) -> Result<(), String> {
+    let agent_dir = state.workspace.join(".agentcall");
+    let _guard = state.state_writer.lock().unwrap();
+    patch_route_record_locked(state, &agent_dir, route_id, patch)
+}
+
+pub(crate) fn patch_route_record_locked(
+    state: &AppState,
+    agent_dir: &std::path::Path,
+    route_id: &str,
+    patch: Value,
+) -> Result<(), String> {
+    let path = agent_dir.join("state").join("routes.json");
+    let mut routes = read_json_file(&path, json!({}));
+    if let Some(route) = routes.get_mut(route_id) {
+        deep_merge(route, &patch);
+    }
+    write_json_file(&path, &routes)?;
+    append_agent_event_locked(
+        state,
+        &agent_dir,
+        "route.updated",
+        "Route updated by daemon.",
+        json!({"route_id": route_id}),
+    )
 }
 
 struct AcpChildContext {
@@ -639,12 +755,8 @@ fn start_acp_route(
     req: &RouteRequest,
     record: &mut RouteRecord,
 ) -> Result<(), String> {
-    let contract = validate_sop_contract(req).map_err(|missing| {
-        format!(
-            "ACP SOP contract is incomplete: {}",
-            missing.join("; ")
-        )
-    })?;
+    let contract = validate_sop_contract(req)
+        .map_err(|missing| format!("ACP SOP contract is incomplete: {}", missing.join("; ")))?;
     let invocation_id = record.route_id.replace("route-", "acp-");
     record.invocation_id = Some(invocation_id.clone());
     let child = acp_child_context(req, record, &invocation_id);
@@ -938,24 +1050,6 @@ fn report_text_from_path_or_result(context_packet: &Value, result: &Value) -> St
         .to_string()
 }
 
-fn patch_route_record(state: &Arc<AppState>, route_id: &str, patch: Value) -> Result<(), String> {
-    let agent_dir = state.workspace.join(".agentcall");
-    let _guard = state.state_writer.lock().unwrap();
-    let path = agent_dir.join("state").join("routes.json");
-    let mut routes = read_json_file(&path, json!({}));
-    if let Some(route) = routes.get_mut(route_id) {
-        deep_merge(route, &patch);
-    }
-    write_json_file(&path, &routes)?;
-    append_agent_event_locked(
-        state,
-        &agent_dir,
-        "route.updated",
-        "Route updated by daemon.",
-        json!({"route_id": route_id}),
-    )
-}
-
 fn deep_merge(target: &mut Value, patch: &Value) {
     match (target, patch) {
         (Value::Object(target), Value::Object(patch)) => {
@@ -1076,6 +1170,54 @@ fn wait_for_user_prompt_submit(
     false
 }
 
+fn pty_initial_permission_mode(req: &RouteRequest, workflow: &PtyWorkflow) -> String {
+    match workflow {
+        PtyWorkflow::PlanThenAuto => "plan".to_string(),
+        PtyWorkflow::Normal => req
+            .initial_permission_mode
+            .clone()
+            .unwrap_or_else(|| "auto".to_string()),
+    }
+}
+
+fn pty_command(
+    req: &RouteRequest,
+    workflow: &PtyWorkflow,
+    claude_session_id: Option<&str>,
+) -> Result<Vec<String>, String> {
+    if let Some(command) = &req.command {
+        return Ok(command.clone());
+    }
+    let permission_mode = pty_initial_permission_mode(req, workflow);
+    if !matches!(permission_mode.as_str(), "plan" | "auto" | "default") {
+        return Err("initial_permission_mode must be plan, auto, or default".to_string());
+    }
+    let mut command = vec!["claude".to_string()];
+    if permission_mode != "default" {
+        command.push("--permission-mode".to_string());
+        command.push(permission_mode);
+    }
+    if let Some(session_id) = claude_session_id {
+        command.push("--session-id".to_string());
+        command.push(session_id.to_string());
+    }
+    Ok(command)
+}
+
+fn new_claude_session_id(state: &AppState) -> String {
+    let seq = state.next_seq();
+    let now = now_ms();
+    let pid = std::process::id() as u64;
+    format!(
+        "{:08x}-{:04x}-4{:03x}-8{:03x}-{:012x}",
+        (now & 0xffff_ffff) as u32,
+        ((now >> 32) & 0xffff) as u16,
+        (seq & 0x0fff) as u16,
+        ((seq >> 12) & 0x0fff) as u16,
+        ((now << 20) ^ (seq << 8) ^ pid) & 0x0000_ffff_ffff_ffff
+    )
+}
+
 fn pty_prompt(req: &RouteRequest) -> String {
     let criteria = req
         .acceptance_criteria
@@ -1089,10 +1231,18 @@ fn pty_prompt(req: &RouteRequest) -> String {
         .map(|items| items.join("\n- "))
         .filter(|value| !value.is_empty())
         .unwrap_or_else(|| "Use the task workspace carefully.".to_string());
-    format!(
-        "AgentCall PTY handoff.\n\nObjective:\n{}\n\nAllowed paths / ownership:\n- {}\n\nAcceptance criteria:\n- {}\n\nWhen finished, write a report and stop at the prompt for review.\n",
-        req.objective, allowed, criteria
-    )
+    let workflow =
+        PtyWorkflow::from_request(req.pty_workflow.as_deref()).unwrap_or(PtyWorkflow::PlanThenAuto);
+    match workflow {
+        PtyWorkflow::PlanThenAuto => format!(
+            "AgentCall PTY handoff. Start in PLAN MODE.\n\nObjective:\n{}\n\nAllowed paths / ownership:\n- {}\n\nAcceptance criteria:\n- {}\n\nPlan-phase rules:\n- Inspect the code and write a concrete plan only.\n- If anything important is unclear, ask concise clarification questions instead of guessing.\n- Do not modify project files during plan phase.\n- When the plan is ready, use ExitPlanMode and wait for approval. After approval, continue in auto mode and write the requested report.\n",
+            req.objective, allowed, criteria
+        ),
+        PtyWorkflow::Normal => format!(
+            "AgentCall PTY handoff.\n\nObjective:\n{}\n\nAllowed paths / ownership:\n- {}\n\nAcceptance criteria:\n- {}\n\nWhen finished, write a report and stop at the prompt for review.\n",
+            req.objective, allowed, criteria
+        ),
+    }
 }
 
 fn acp_prompt(req: &RouteRequest, context_packet: &Value) -> String {
@@ -1315,6 +1465,8 @@ mod tests {
                 report_path: None,
                 max_reads: None,
                 max_writes: None,
+                pty_workflow: None,
+                initial_permission_mode: None,
             },
         )
         .unwrap();
@@ -1359,6 +1511,8 @@ mod tests {
                 ),
                 max_reads: None,
                 max_writes: Some(1),
+                pty_workflow: None,
+                initial_permission_mode: None,
             },
         )
         .unwrap();
@@ -1413,12 +1567,17 @@ mod tests {
                 ),
                 max_reads: None,
                 max_writes: Some(1),
+                pty_workflow: None,
+                initial_permission_mode: None,
             },
         )
         .unwrap();
 
         assert_eq!(route["result"]["workspace"], "E:/GameProject/GGMYS");
-        assert_eq!(route["result"]["cwd"], claude_workspace.display().to_string());
+        assert_eq!(
+            route["result"]["cwd"],
+            claude_workspace.display().to_string()
+        );
     }
 
     #[test]
@@ -1458,6 +1617,8 @@ mod tests {
                 ),
                 max_reads: None,
                 max_writes: Some(1),
+                pty_workflow: None,
+                initial_permission_mode: None,
             },
         )
         .unwrap();
@@ -1520,6 +1681,8 @@ mod tests {
                 report_path: Some("src/report.md".to_string()),
                 max_reads: Some(10),
                 max_writes: Some(1),
+                pty_workflow: None,
+                initial_permission_mode: None,
             },
         )
         .unwrap();
@@ -1532,6 +1695,74 @@ mod tests {
             workspace
                 .join(".agentcall/tasks/task-route/calls/call-a/context.json")
                 .exists()
+        );
+    }
+
+    #[test]
+    fn plan_then_auto_forces_plan_even_when_caller_requests_auto() {
+        let req = RouteRequest {
+            objective: "review only".to_string(),
+            workspace: None,
+            mode: Some("start".to_string()),
+            runtime: Some("pty".to_string()),
+            estimated_minutes: None,
+            estimated_files: None,
+            estimated_loc: None,
+            needs_continuity: None,
+            risk: None,
+            session_name: None,
+            command: None,
+            adapter_command: None,
+            timeout_seconds: None,
+            task_id: None,
+            call_id: None,
+            phase: None,
+            role: None,
+            allowed_paths: None,
+            acceptance_criteria: None,
+            persist_context: None,
+            template: None,
+            target_files: None,
+            report_path: None,
+            max_reads: None,
+            max_writes: None,
+            pty_workflow: None,
+            initial_permission_mode: Some("auto".to_string()),
+        };
+        let command = pty_command(
+            &req,
+            &PtyWorkflow::PlanThenAuto,
+            Some("11111111-1111-4111-8111-111111111111"),
+        )
+        .unwrap();
+        assert_eq!(
+            command,
+            vec![
+                "claude",
+                "--permission-mode",
+                "plan",
+                "--session-id",
+                "11111111-1111-4111-8111-111111111111"
+            ]
+        );
+    }
+
+    #[test]
+    fn generated_claude_session_id_has_uuid_shape() {
+        let workspace = test_workspace("uuid-shape");
+        let state = Arc::new(AppState::test(workspace));
+        let session_id = new_claude_session_id(&state);
+        let parts: Vec<&str> = session_id.split('-').collect();
+        assert_eq!(parts.len(), 5);
+        assert_eq!(parts[0].len(), 8);
+        assert_eq!(parts[1].len(), 4);
+        assert_eq!(parts[2].len(), 4);
+        assert_eq!(parts[3].len(), 4);
+        assert_eq!(parts[4].len(), 12);
+        assert!(
+            parts
+                .iter()
+                .all(|part| part.chars().all(|ch| ch.is_ascii_hexdigit()))
         );
     }
 

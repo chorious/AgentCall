@@ -1,4 +1,6 @@
-use crate::routes::{RouteRequest, checkpoint_session, handle_route};
+use crate::routes::{
+    RouteRequest, checkpoint_session, handle_route, patch_route_record, route_for_wrapper_session,
+};
 use crate::session::{InputRequest, get_session, write_input};
 use crate::state::{AppState, append_agent_event};
 use crate::summary::{board_state, clean_session_output, session_summary};
@@ -58,6 +60,8 @@ pub(crate) fn mcp_tools() -> Vec<Value> {
                     "report_path": {"type": "string"},
                     "max_reads": {"type": "integer", "minimum": 0},
                     "max_writes": {"type": "integer", "minimum": 0},
+                    "pty_workflow": {"type": "string", "enum": ["plan_then_auto", "normal"], "default": "plan_then_auto"},
+                    "initial_permission_mode": {"type": "string", "enum": ["plan", "auto", "default"]},
                     "persist_context": {"type": "boolean", "default": true}
                 },
                 "required": ["objective"],
@@ -86,7 +90,7 @@ pub(crate) fn mcp_tools() -> Vec<Value> {
                 "properties": {
                     "root": {"type": "string"},
                     "name": {"type": "string"},
-                    "action": {"type": "string", "enum": ["send", "continue", "stop", "request_report"], "default": "send"},
+                    "action": {"type": "string", "enum": ["send", "continue", "stop", "request_report", "revise_plan", "approve_plan", "start_auto"], "default": "send"},
                     "text": {"type": "string"},
                     "enter": {"type": "boolean", "default": true}
                 },
@@ -183,6 +187,27 @@ fn mcp_session_send(state: &AppState, args: &Value) -> Result<Value, String> {
     if action == "stop" {
         return crate::session::stop_session(state, name).map(|_| json!({"ok": true}));
     }
+    if action == "approve_plan" || action == "start_auto" {
+        if !is_plan_then_auto_session(state, name) {
+            return Err("session is not a plan_then_auto PTY route".to_string());
+        }
+        write_input(
+            state,
+            name,
+            InputRequest {
+                text: "1".to_string(),
+                enter: Some(true),
+            },
+        )?;
+        update_pty_workflow_route(
+            state,
+            name,
+            "auto_running",
+            "auto",
+            "approved via session_send action",
+        )?;
+        return Ok(json!({"ok": true, "action": action, "workflow_status": "auto_running"}));
+    }
     let text = args
         .get("text")
         .and_then(Value::as_str)
@@ -190,6 +215,7 @@ fn mcp_session_send(state: &AppState, args: &Value) -> Result<Value, String> {
         .unwrap_or_else(|| match action {
             "continue" => "Continue from the current state. If the task is complete, write the requested report now.".to_string(),
             "request_report" => "Stop new implementation work and write the requested report with exact changes, tests, failures, and remaining risks.".to_string(),
+            "revise_plan" => "Revise the current plan according to the latest supervisor feedback. Stay in plan mode and use ExitPlanMode again when ready.".to_string(),
             _ => "".to_string(),
         });
     if text.is_empty() {
@@ -203,7 +229,58 @@ fn mcp_session_send(state: &AppState, args: &Value) -> Result<Value, String> {
             enter: args.get("enter").and_then(Value::as_bool),
         },
     )?;
+    if action == "revise_plan" {
+        let _ = update_pty_workflow_route(
+            state,
+            name,
+            "plan_revision_requested",
+            "plan",
+            "revision requested via session_send action",
+        );
+    }
     Ok(json!({"ok": true}))
+}
+
+fn is_plan_then_auto_session(state: &AppState, session_name: &str) -> bool {
+    let Some((_route_id, route)) = route_for_wrapper_session(state, session_name) else {
+        return false;
+    };
+    route.get("recommended_runtime").and_then(Value::as_str) == Some("pty")
+        && route
+            .get("result")
+            .and_then(|result| result.get("pty_workflow"))
+            .and_then(Value::as_str)
+            == Some("plan_then_auto")
+}
+
+fn update_pty_workflow_route(
+    state: &AppState,
+    session_name: &str,
+    workflow_status: &str,
+    permission_mode: &str,
+    reason: &str,
+) -> Result<(), String> {
+    let Some((route_id, route)) = route_for_wrapper_session(state, session_name) else {
+        return Ok(());
+    };
+    if route.get("recommended_runtime").and_then(Value::as_str) != Some("pty") {
+        return Ok(());
+    }
+    patch_route_record(
+        state,
+        &route_id,
+        json!({
+            "status": workflow_status,
+            "updated_at": crate::util::now_ms(),
+            "result": {
+                "workflow_status": workflow_status,
+                "phase": if permission_mode == "auto" { "execute" } else { "plan" },
+                "permission_mode": permission_mode,
+                "mode_source": "session_send",
+                "last_control_action": reason
+            }
+        }),
+    )
 }
 
 fn mcp_report(state: &Arc<AppState>, args: &Value) -> Result<Value, String> {

@@ -123,7 +123,7 @@ fn run_acp_protocol(
                 "fs": {"readTextFile": false, "writeTextFile": false},
                 "terminal": false
             },
-            "clientInfo": {"name": "agentcall", "title": "AgentCall", "version": "2.2.0"}
+            "clientInfo": {"name": "agentcall", "title": "AgentCall", "version": "2.3.0"}
         }),
         deadline,
         updates,
