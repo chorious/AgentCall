@@ -45,6 +45,7 @@ pub(crate) fn mcp_tools() -> Vec<Value> {
                     "risk": {"type": "string", "enum": ["low", "medium", "high"], "default": "medium"},
                     "session_name": {"type": "string"},
                     "command": {"type": "array", "items": {"type": "string"}},
+                    "adapter_command": {"type": "array", "items": {"type": "string"}},
                     "timeout_seconds": {"type": "integer", "minimum": 1},
                     "task_id": {"type": "string"},
                     "call_id": {"type": "string"},

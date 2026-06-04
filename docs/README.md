@@ -34,4 +34,4 @@
 
 ## 当前版本提示
 
-当前主线版本是 `v0.8.1`：MCP stdio 稳定桥接、daemon 提供动态工具面、route-first 控制面继续作为默认路径。
+当前主线版本是 `v0.8b`：MCP stdio 稳定桥接、daemon 提供动态工具面，ACP 默认控制逻辑迁入 Rust daemon，并用 Python reference 做同进同出 parity 验收。

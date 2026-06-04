@@ -2,7 +2,7 @@
 
 AgentCall 是一个本地多 Agent 协作控制面。当前主线是 Rust daemon 单写模型：daemon 负责 PTY 会话、hook ingest、file claim、runtime binding、route、summary、board 和 HTTP API；Python 只保留薄脚本、installer、测试辅助与显式 legacy/debug 路线。
 
-当前版本：`v0.8.1`
+当前版本：`v0.8b`
 
 - 版本历史：[CHANGELOG.md](CHANGELOG.md)
 - 文档索引：[docs/README.md](docs/README.md)
@@ -12,6 +12,7 @@ AgentCall 是一个本地多 Agent 协作控制面。当前主线是 Rust daemon
 - Rust daemon 是 live 状态唯一写者。
 - MCP 正常路径是 `agentcall_board -> agentcall_route -> agentcall_session/agentcall_report`。
 - `agentcall_route` 是唯一高层调度入口；ACP 和 PTY 是 route 的 runtime 参数。
+- ACP 默认控制逻辑在 Rust daemon 内；Python ACP driver 只保留为 reference/legacy/debug。
 - MCP stdio 进程保持稳定，只做 bootstrap 与 daemon bridge。
 - Claude/Codex hooks 走 daemon-first：POST `/api/hooks/ingest`。
 - Codex 默认读 board/session summary，不默认读 raw terminal。
@@ -87,6 +88,18 @@ POST /api/sessions/{name}/stop
 POST /api/context
 POST /api/transcripts/index
 POST /api/hooks/ingest
+```
+
+ACP route 需要显式传入 `adapter_command` 或设置 `AGENTCALL_ACP_COMMAND`，例如：
+
+```json
+{
+  "objective": "bounded review",
+  "mode": "start",
+  "runtime": "acp",
+  "adapter_command": ["npx", "-y", "@agentclientprotocol/claude-agent-acp"],
+  "timeout_seconds": 120
+}
 ```
 
 ## 测试

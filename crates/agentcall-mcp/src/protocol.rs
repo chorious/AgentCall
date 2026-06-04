@@ -5,7 +5,7 @@ use std::io::{self, BufRead, Write};
 
 const PROTOCOL_VERSION: &str = "2024-11-05";
 const SERVER_NAME: &str = "agentcall-mcp";
-const SERVER_VERSION: &str = "0.8.1";
+const SERVER_VERSION: &str = "0.8.2";
 
 pub(crate) fn serve(config: Config) -> io::Result<()> {
     let stdin = io::stdin();

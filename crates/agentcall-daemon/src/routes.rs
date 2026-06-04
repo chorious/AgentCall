@@ -1,13 +1,11 @@
+use crate::acp::{AcpInvocation, run_acp_invocation};
 use crate::session::{StartRequest, start_session};
 use crate::state::{AppState, append_agent_event_locked, read_json_file, write_json_file};
 use crate::util::{now_ms, safe_name};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use std::io::{Read, Write};
-use std::process::{Command, Stdio};
+use std::path::PathBuf;
 use std::sync::Arc;
-use std::thread;
-use std::time::{Duration, Instant};
 
 #[derive(Deserialize)]
 pub(crate) struct RouteRequest {
@@ -422,28 +420,56 @@ fn start_acp_route(
 ) -> Result<(), String> {
     let invocation_id = record.route_id.replace("route-", "acp-");
     record.invocation_id = Some(invocation_id.clone());
-    let command = req
-        .adapter_command
-        .clone()
-        .or_else(adapter_command_from_env);
+    let command = req.adapter_command.clone().or_else(acp_command_from_env);
     let timeout_seconds = req.timeout_seconds.unwrap_or(30).clamp(1, 300);
+    let workspace = req
+        .workspace
+        .as_deref()
+        .map(PathBuf::from)
+        .unwrap_or_else(|| state.workspace.clone());
+    let prompt = acp_prompt(req, &invocation_id);
     if let Some(command) = command {
-        let result = run_bounded_adapter(&command, &req.objective, timeout_seconds)?;
-        record.status = result["status"].as_str().unwrap_or("completed").to_string();
-        record.result = json!({
-            "runtime": "acp",
-            "invocation_id": invocation_id,
-            "adapter": "daemon_owned_transitional",
-            "timeout_seconds": timeout_seconds,
-            "adapter_result": result,
-        });
+        match run_acp_invocation(AcpInvocation {
+            command: command.clone(),
+            cwd: workspace.clone(),
+            mode: acp_mode_id(req),
+            prompt,
+            timeout_seconds,
+        }) {
+            Ok(result) => {
+                record.status = result["status"].as_str().unwrap_or("completed").to_string();
+                record.result = json!({
+                    "runtime": "acp",
+                    "invocation_id": invocation_id,
+                    "adapter": "rust_native_acp",
+                    "command": command,
+                    "workspace": workspace,
+                    "timeout_seconds": timeout_seconds,
+                    "acp_result": result,
+                });
+            }
+            Err(err) => {
+                record.status = "failed".to_string();
+                record.result = json!({
+                    "runtime": "acp",
+                    "invocation_id": invocation_id,
+                    "adapter": "rust_native_acp",
+                    "command": command,
+                    "workspace": workspace,
+                    "timeout_seconds": timeout_seconds,
+                    "error": err,
+                });
+            }
+        }
     } else {
-        record.status = "adapter_not_configured".to_string();
+        record.status = "acp_command_not_configured".to_string();
         record.result = json!({
             "runtime": "acp",
             "invocation_id": invocation_id,
-            "adapter": "not_configured",
-            "message": "Set AGENTCALL_ACP_ADAPTER_COMMAND or pass adapter_command for v0.8a transitional ACP execution.",
+            "adapter": "rust_native_acp",
+            "workspace": workspace,
+            "timeout_seconds": timeout_seconds,
+            "message": "Set AGENTCALL_ACP_COMMAND or pass adapter_command to run native ACP.",
         });
     }
     crate::state::append_agent_event(
@@ -511,69 +537,50 @@ fn merge_result_field(result: &mut Value, key: &str, value: Value) {
     }
 }
 
-fn adapter_command_from_env() -> Option<Vec<String>> {
-    let value = std::env::var("AGENTCALL_ACP_ADAPTER_COMMAND").ok()?;
+fn acp_command_from_env() -> Option<Vec<String>> {
+    let value = std::env::var("AGENTCALL_ACP_COMMAND").ok()?;
     let parts: Vec<String> = value.split_whitespace().map(str::to_string).collect();
     if parts.is_empty() { None } else { Some(parts) }
 }
 
-fn run_bounded_adapter(
-    command: &[String],
-    objective: &str,
-    timeout_seconds: u64,
-) -> Result<Value, String> {
-    if command.is_empty() {
-        return Err("adapter_command cannot be empty".to_string());
+fn acp_mode_id(req: &RouteRequest) -> String {
+    match req.phase.as_deref().unwrap_or("execute") {
+        "plan" | "review" => "plan".to_string(),
+        _ => "acceptEdits".to_string(),
     }
-    let mut child = Command::new(&command[0])
-        .args(&command[1..])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|err| format!("failed to start ACP adapter: {err}"))?;
-    if let Some(mut stdin) = child.stdin.take() {
-        let payload =
-            json!({"objective": objective, "runtime": "acp", "source": "agentcall-daemon"});
-        let _ = writeln!(
-            stdin,
-            "{}",
-            serde_json::to_string(&payload).unwrap_or_default()
-        );
-    }
-    let stdout = child.stdout.take();
-    let stderr = child.stderr.take();
-    let out_thread = thread::spawn(move || read_pipe(stdout));
-    let err_thread = thread::spawn(move || read_pipe(stderr));
-    let started = Instant::now();
-    let status = loop {
-        if let Some(status) = child.try_wait().map_err(|err| err.to_string())? {
-            break json!({"kind": "exited", "code": status.code(), "success": status.success()});
-        }
-        if started.elapsed() > Duration::from_secs(timeout_seconds) {
-            let _ = child.kill();
-            let _ = child.wait();
-            break json!({"kind": "timeout", "success": false});
-        }
-        thread::sleep(Duration::from_millis(50));
-    };
-    let stdout = out_thread.join().unwrap_or_default();
-    let stderr = err_thread.join().unwrap_or_default();
-    Ok(json!({
-        "status": if status["success"].as_bool().unwrap_or(false) { "completed" } else { "failed" },
-        "process": status,
-        "stdout": stdout,
-        "stderr": stderr,
-    }))
 }
 
-fn read_pipe(pipe: Option<impl Read>) -> String {
-    let Some(mut pipe) = pipe else {
-        return String::new();
-    };
-    let mut bytes = Vec::new();
-    let _ = pipe.read_to_end(&mut bytes);
-    String::from_utf8_lossy(&bytes).to_string()
+fn acp_prompt(req: &RouteRequest, invocation_id: &str) -> String {
+    let task_id = req.task_id.as_deref().unwrap_or("route-task");
+    let call_id = req.call_id.as_deref().unwrap_or(invocation_id);
+    let role = req.role.as_deref().unwrap_or("executor");
+    let phase = req.phase.as_deref().unwrap_or("execute");
+    let allowed = req
+        .allowed_paths
+        .as_ref()
+        .map(|items| items.join("\n- "))
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| "Entire workspace".to_string());
+    let criteria = req
+        .acceptance_criteria
+        .as_ref()
+        .map(|items| items.join("\n- "))
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| "Produce a valid report".to_string());
+    format!(
+        "# AgentCall ACP Invocation: {call_id}\n\n\
+Task: `{task_id}`\n\
+Role: `{role}`\n\
+Mode: `{phase}`\n\n\
+## Objective\n\n{}\n\n\
+## Allowed Paths\n\n- {allowed}\n\n\
+## Acceptance Criteria\n\n- {criteria}\n\n\
+## Required Report Contract\n\n\
+Return exactly one structured report with status, summary, changed_files, commands_run, tests, risks, open_questions, and next_recommended_action. \
+Include context_sufficiency with status, missing, can_parent_resolve, and recommended_parent_action. \
+Do not continue beyond this lifecycle.\n",
+        req.objective
+    )
 }
 
 fn count_tools(value: &Value, tool_uses: &mut u64, tool_results: &mut u64) {
@@ -635,7 +642,7 @@ mod tests {
     }
 
     #[test]
-    fn forced_acp_route_is_daemon_recorded_without_python_adapter() {
+    fn forced_acp_route_is_daemon_recorded_without_configured_command() {
         let workspace = test_workspace("forced-acp");
         let state = Arc::new(AppState::new(workspace.clone()));
         let route = handle_route(
@@ -665,8 +672,8 @@ mod tests {
         )
         .unwrap();
         assert_eq!(route["recommended_runtime"], "acp");
-        assert_eq!(route["status"], "adapter_not_configured");
-        assert_eq!(route["result"]["adapter"], "not_configured");
+        assert_eq!(route["status"], "acp_command_not_configured");
+        assert_eq!(route["result"]["adapter"], "rust_native_acp");
         assert!(workspace.join(".agentcall/state/routes.json").exists());
     }
 

@@ -14,6 +14,15 @@
 - 更新策略变更：频繁业务更新应改 daemon 并重启 daemon；只有 MCP 协议外壳变化才需要重启 Codex MCP transport。
 - 已知事实：已经断开的 Codex MCP transport 不能由代码热修复，需要一次 MCP 重连；本版本的目标是避免后续业务更新继续触发同类断连。
 
+## v0.8b - Rust Native ACP Client
+
+- daemon 新增 Rust 原生 ACP stdio JSON-RPC client，不再通过 Python workflow 承担默认 ACP 控制逻辑。
+- ACP route 使用 daemon-owned bounded invocation：initialize、session/new、session/set_mode、session/prompt、permission request、session/update 均由 Rust client 处理。
+- request id 对齐 Python `AcpStdioClient` reference，从 `0` 开始。
+- stdout 和 stderr 并发读取；timeout 到期由 daemon kill 自己派生的 ACP 子进程。
+- `agentcall_route(runtime=acp)` 必须显式提供 `adapter_command` 或设置 `AGENTCALL_ACP_COMMAND`，避免隐式触发 `npx` 下载或真实模型调用。
+- 新增同进同出 parity 验收：同一个 fake ACP server、同一个 prompt/工作目录/模式，Python reference 和 Rust daemon native ACP 的 JSON-RPC 客户端消息序列及输出必须一致。
+
 ## v0.8a - Route-First MCP 收敛
 
 - MCP 默认工具面收敛为 `board -> route -> session/report`。

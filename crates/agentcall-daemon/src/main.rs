@@ -1,3 +1,4 @@
+mod acp;
 mod hooks;
 mod http;
 mod mcp;
