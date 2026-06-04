@@ -1,6 +1,6 @@
 # AgentCall
 
-当前版本：`v2.0.0`
+当前版本：`v2.2.0`
 
 AgentCall 是一个本地多 Agent 协作控制面，用来让 **Codex 指挥 Claude Code 集群协同工作**。它把 Codex 作为主控，把多个 Claude Code 实例作为可观察、可路由、可验收的工作单元，并用 Rust daemon 统一管理 PTY 会话、ACP 调用、hooks、file claim、runtime binding、summary、board 和 HTTP API。
 
@@ -15,7 +15,8 @@ AgentCall 是一个本地多 Agent 协作控制面，用来让 **Codex 指挥 Cl
 ## 产品特点
 
 - **Codex 主控，Claude Code 集群执行**：Codex 通过 `agentcall_board -> agentcall_route -> agentcall_session/agentcall_report` 组织多个 Claude Code worker。
-- **Route-first 调度**：`agentcall_route` 是唯一高层入口，支持 `runtime=auto|pty|acp`。PTY 适合可视化 handoff 和长任务，ACP 适合 bounded 子任务。
+- **Route-first 调度**：`agentcall_route` 是唯一高层入口，支持 `runtime=auto|pty|acp`。PTY 适合可视化 handoff 和长任务；ACP 在 v2.2 起被收敛为轻量化 SOP worker，只接受可模板化、可容纳、可验收的小任务契约。
+- **ACP SOP Worker Gate**：`runtime=auto` 不再根据 `estimated_*` 猜“小任务”。调用方必须提供 `template`、`target_files`、`report_path`、`allowed_paths` 和 `acceptance_criteria`；通过 gate 才会进入 ACP，否则返回 `needs_contract`。
 - **Rust daemon 单写状态**：daemon 是 live events、claims、sessions、bindings、routes、summary 的权威写者，避免 Python/Rust 双写漂移。
 - **Hook-aware 状态绑定**：Claude/Codex hooks 进入 daemon，`AGENTCALL_WRAPPER_SESSION` 把 wrapper session 和 Claude hook session 可靠绑定。
 - **File claim 冲突保护**：`Write/Edit/MultiEdit/NotebookEdit` 才 claim；`Read/Glob/Grep` 只 observe。同文件并发写入会被 daemon 稳定拒绝。
@@ -164,8 +165,8 @@ POST /api/hooks/ingest
 ## 典型工作流
 
 1. Codex 调用 `agentcall_board(view=compact, filter=attention)` 看全局状态。
-2. Codex 调用 `agentcall_route(mode=recommend, runtime=auto, ...)` 获得 runtime 建议。
-3. Codex 调用 `agentcall_route(mode=start, runtime=pty|acp, ...)` 派发任务。
+2. Codex 调用 `agentcall_route(mode=recommend, runtime=auto, template=..., target_files=..., report_path=..., allowed_paths=..., acceptance_criteria=...)` 让 daemon 校验 SOP contract；缺 contract 会返回 `needs_contract`。
+3. Codex 调用 `agentcall_route(mode=start, runtime=pty|acp, ...)` 派发任务；ACP 只用于 5 个 SOP worker，复杂长任务继续走 PTY。
 4. Claude Code worker 执行任务，hooks 把状态和文件 claim 写回 daemon。
 5. Codex 读取 `agentcall_session` 的 summary 和 worker report。
 6. 无风险直接接受；只有 conflict、drift、blocked、failed、low confidence 时复派或 review。

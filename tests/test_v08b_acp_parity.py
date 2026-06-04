@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import socket
 import subprocess
 import sys
@@ -16,7 +17,12 @@ from agentcall.v2.acp import AcpStdioClient
 
 
 def test_rust_native_acp_matches_python_reference_io(tmp_path: Path) -> None:
-    daemon = Path("target/debug/agentcall-daemon.exe" if sys.platform == "win32" else "target/debug/agentcall-daemon")
+    daemon = Path(
+        os.environ.get(
+            "AGENTCALL_DAEMON_EXE",
+            "target/debug/agentcall-daemon.exe" if sys.platform == "win32" else "target/debug/agentcall-daemon",
+        )
+    )
     if not daemon.exists():
         pytest.skip("agentcall-daemon debug binary is required for ACP parity smoke")
 
@@ -29,7 +35,11 @@ def test_rust_native_acp_matches_python_reference_io(tmp_path: Path) -> None:
         call_id="call-a",
         role="executor",
         phase="execute",
-        allowed_paths=["src"],
+        workspace=str(workspace),
+        allowed_paths=[str(workspace)],
+        template="read-and-report",
+        target_files=["src/lib.rs"],
+        report_path=str(workspace / ".agentcall" / "reports" / "acp_parity.md"),
         acceptance_criteria=["same protocol transcript"],
     )
 
@@ -41,8 +51,15 @@ def test_rust_native_acp_matches_python_reference_io(tmp_path: Path) -> None:
         python_result = client.prompt(session_id, prompt)
 
     port = free_port()
+    agentcall_root = tmp_path / "agentcall"
+    config_dir = agentcall_root / "config"
+    config_dir.mkdir(parents=True)
+    (config_dir / "agentcall.local.json").write_text(
+        json.dumps({"claude_workspace": str(workspace)}, ensure_ascii=False),
+        encoding="utf-8",
+    )
     daemon_proc = subprocess.Popen(
-        [str(daemon), "--workspace", str(tmp_path / "agentcall"), "--port", str(port)],
+        [str(daemon), "--workspace", str(agentcall_root), "--port", str(port)],
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
         text=True,
@@ -64,10 +81,15 @@ def test_rust_native_acp_matches_python_reference_io(tmp_path: Path) -> None:
                 "call_id": "call-a",
                 "phase": "execute",
                 "role": "executor",
-                "allowed_paths": ["src"],
+                "allowed_paths": [str(workspace)],
+                "template": "read-and-report",
+                "target_files": ["src/lib.rs"],
+                "report_path": str(workspace / ".agentcall" / "reports" / "acp_parity.md"),
+                "max_writes": 1,
                 "acceptance_criteria": ["same protocol transcript"],
             },
         )
+        route = wait_for_route(port, route["route_id"])
     finally:
         daemon_proc.terminate()
         try:
@@ -137,6 +159,8 @@ def write_fake_acp_server(tmp_path: Path) -> Path:
                         "method": "session/request_permission",
                         "params": {
                             "sessionId": "sess_fake",
+                            "tool": "Read",
+                            "file_path": "src/lib.rs",
                             "toolCall": {"toolCallId": "call_1"},
                             "options": [
                                 {"optionId": "allow-once", "name": "Allow once", "kind": "allow_once"},
@@ -172,23 +196,60 @@ def route_prompt(
     call_id: str,
     role: str,
     phase: str,
+    workspace: str,
     allowed_paths: list[str],
+    template: str,
+    target_files: list[str],
+    report_path: str,
     acceptance_criteria: list[str],
 ) -> str:
     allowed = "\n- ".join(allowed_paths) or "Entire workspace"
     criteria = "\n- ".join(acceptance_criteria) or "Produce a valid report"
+    context_packet = {
+        "task_id": task_id,
+        "call_id": call_id,
+        "phase": phase,
+        "role": role,
+        "runtime": "acp",
+        "workspace": workspace,
+        "objective": objective,
+        "allowed_paths": allowed_paths,
+        "acceptance_criteria": acceptance_criteria,
+        "template": template,
+        "target_files": target_files,
+        "report_path": report_path,
+        "max_reads": None,
+        "max_writes": 1,
+    }
+    target = "\n- ".join(target_files) or "No target files supplied"
     return (
         f"# AgentCall ACP Invocation: {call_id}\n\n"
         f"Task: `{task_id}`\n"
         f"Role: `{role}`\n"
         f"Mode: `{phase}`\n\n"
+        f"## SOP Template\n\n`{template}`\n\n"
         f"## Objective\n\n{objective}\n\n"
+        f"## Target Files\n\n- {target}\n\n"
+        f"## Writable Report Path\n\n`{report_path}`\n\n"
         f"## Allowed Paths\n\n- {allowed}\n\n"
         f"## Acceptance Criteria\n\n- {criteria}\n\n"
+        "## Context Packet\n\n"
+        "Use this packet as the authoritative project context for this lifecycle.\n\n"
+        "```json\n"
+        f"{json.dumps(context_packet, ensure_ascii=False, indent=2, sort_keys=True)}\n"
+        "```\n\n"
+        "## Mode Rules\n\n"
+        "- This is an ACP SOP worker, not a free implementation runtime.\n"
+        "- Read only the target files or allowed paths needed for evidence.\n"
+        "- Write/Edit/MultiEdit is only allowed for the single report path above.\n"
+        "- Do not modify implementation files.\n"
+        "- Bash write, redirect, delete, move, and copy commands are forbidden.\n"
+        "- Stop after producing the report; do not continue into another lifecycle.\n\n"
         "## Required Report Contract\n\n"
-        "Return exactly one structured report with status, summary, changed_files, commands_run, tests, risks, open_questions, and next_recommended_action. "
-        "Include context_sufficiency with status, missing, can_parent_resolve, and recommended_parent_action. "
-        "Do not continue beyond this lifecycle.\n"
+        "Return exactly one structured report at the report path and in final text when possible. It must include these fields: "
+        "status, summary, verdict, evidence, files_read, changed_files, risks, next_recommended_action, context_sufficiency. "
+        "`changed_files` must contain only the report path. "
+        "`context_sufficiency` must say whether the provided target files and criteria were enough.\n"
     )
 
 
@@ -242,3 +303,18 @@ def post_json(port: int, path: str, payload: dict[str, Any]) -> dict[str, Any]:
     )
     with urllib.request.urlopen(request, timeout=15) as response:
         return json.loads(response.read().decode("utf-8"))
+
+
+def get_json(port: int, path: str) -> dict[str, Any]:
+    with urllib.request.urlopen(f"http://127.0.0.1:{port}{path}", timeout=15) as response:
+        return json.loads(response.read().decode("utf-8"))
+
+
+def wait_for_route(port: int, route_id: str) -> dict[str, Any]:
+    deadline = time.time() + 15
+    while time.time() < deadline:
+        route = get_json(port, f"/api/routes/{route_id}")
+        if route.get("status") not in {"started", "running"}:
+            return route
+        time.sleep(0.1)
+    raise AssertionError(f"route {route_id} did not finish")

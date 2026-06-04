@@ -53,6 +53,11 @@ pub(crate) fn mcp_tools() -> Vec<Value> {
                     "role": {"type": "string", "default": "executor"},
                     "allowed_paths": {"type": "array", "items": {"type": "string"}},
                     "acceptance_criteria": {"type": "array", "items": {"type": "string"}},
+                    "template": {"type": "string", "enum": ["read-and-report", "evidence-check", "contract-check", "diff-review", "single-report-update"]},
+                    "target_files": {"type": "array", "items": {"type": "string"}},
+                    "report_path": {"type": "string"},
+                    "max_reads": {"type": "integer", "minimum": 0},
+                    "max_writes": {"type": "integer", "minimum": 0},
                     "persist_context": {"type": "boolean", "default": true}
                 },
                 "required": ["objective"],

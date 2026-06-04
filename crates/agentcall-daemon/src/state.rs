@@ -20,12 +20,13 @@ pub(crate) struct AppState {
 impl AppState {
     pub(crate) fn new(workspace: PathBuf, config: LocalConfig, config_error: Option<String>) -> Self {
         let next_event_seq = next_event_number_from_log(&workspace);
+        let next_seq = next_runtime_seq_from_state(&workspace);
         Self {
             workspace,
             config,
             config_error,
             sessions: Mutex::new(HashMap::new()),
-            seq: AtomicU64::new(1),
+            seq: AtomicU64::new(next_seq),
             event_seq: AtomicU64::new(next_event_seq),
             state_writer: Mutex::new(()),
         }
@@ -157,4 +158,87 @@ pub(crate) fn next_event_number_from_log(workspace: &Path) -> u64 {
         max_seen = max_seen.max(number);
     }
     max_seen + 1
+}
+
+pub(crate) fn next_runtime_seq_from_state(workspace: &Path) -> u64 {
+    let mut max_seen = 0u64;
+    let routes_path = workspace
+        .join(".agentcall")
+        .join("state")
+        .join("routes.json");
+    if let Ok(text) = fs::read_to_string(routes_path) {
+        if let Ok(value) = serde_json::from_str::<serde_json::Value>(&text) {
+            collect_route_numbers(&value, &mut max_seen);
+        }
+    }
+    let events_path = workspace.join(".agentcall").join("events.ndjson");
+    if let Ok(text) = fs::read_to_string(events_path) {
+        for line in text.lines() {
+            if let Ok(value) = serde_json::from_str::<serde_json::Value>(line) {
+                collect_route_numbers(&value, &mut max_seen);
+            }
+        }
+    }
+    max_seen + 1
+}
+
+fn collect_route_numbers(value: &serde_json::Value, max_seen: &mut u64) {
+    match value {
+        serde_json::Value::String(text) => {
+            if let Some(number) = route_number(text) {
+                *max_seen = (*max_seen).max(number);
+            }
+        }
+        serde_json::Value::Array(items) => {
+            for item in items {
+                collect_route_numbers(item, max_seen);
+            }
+        }
+        serde_json::Value::Object(object) => {
+            for (key, value) in object {
+                if let Some(number) = route_number(key) {
+                    *max_seen = (*max_seen).max(number);
+                }
+                collect_route_numbers(value, max_seen);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn route_number(text: &str) -> Option<u64> {
+    text.strip_prefix("route-")?.parse::<u64>().ok()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn runtime_seq_recovers_from_routes_and_events() {
+        let root = test_workspace("runtime-seq");
+        let state_dir = root.join(".agentcall").join("state");
+        fs::create_dir_all(&state_dir).unwrap();
+        fs::write(
+            state_dir.join("routes.json"),
+            r#"{"route-9":{"route_id":"route-9"}}"#,
+        )
+        .unwrap();
+        fs::write(
+            root.join(".agentcall").join("events.ndjson"),
+            r#"{"data":{"route_id":"route-12"}}"#,
+        )
+        .unwrap();
+        assert_eq!(next_runtime_seq_from_state(&root), 13);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    fn test_workspace(name: &str) -> PathBuf {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir().join(format!("agentcall-state-{name}-{nonce}"))
+    }
 }

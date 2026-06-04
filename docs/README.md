@@ -17,6 +17,7 @@
 - [session-supervisor.md](session-supervisor.md)
 - [sop-protocol.md](sop-protocol.md)
 - [v2.0-architecture.md](v2.0-architecture.md)
+- [v2.2-acp-sop-worker-gate.md](v2.2-acp-sop-worker-gate.md)
 - [v3.0-mcp.md](v3.0-mcp.md)
 - [agentapi-adapter.md](agentapi-adapter.md)
 
@@ -36,4 +37,4 @@
 
 ## 当前版本提示
 
-当前主线版本是 `v2.0.0`：AgentCall 已收敛为 Codex 指挥 Claude Code 集群的本地控制面，daemon 提供 route-first MCP、PTY/ACP 双 runtime、hook-aware summary、file claim 和 daemon-local config。
+当前主线版本是 `v2.2.0`：AgentCall 已收敛为 Codex 指挥 Claude Code 集群的本地控制面。v2.2 将 ACP 定义为轻量化 SOP worker：route 不再用 estimated size 猜小任务，而是由 daemon 校验 SOP contract，并在 ACP permission 与 hooks 层强制执行 report-only 写入边界。

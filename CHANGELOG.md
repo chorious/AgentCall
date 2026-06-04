@@ -1,5 +1,27 @@
 # CHANGELOG
 
+## v2.2.0 - ACP SOP Worker Gate
+
+- `agentcall_route(runtime=auto)` 不再用 `estimated_minutes/files/loc` 打分猜测 ACP；ACP 必须提供合法 SOP contract。
+- 首版 ACP SOP 支持 `read-and-report`、`evidence-check`、`contract-check`、`diff-review`、`single-report-update`。
+- route 新增 `template`、`target_files`、`report_path`、`max_reads`、`max_writes` 字段；缺 contract 返回 `needs_contract`，不启动 ACP。
+- ACP permission policy 改为 template-aware default-deny：写工具只能命中 `report_path`，Bash 写入/重定向/删除/移动默认 deny。
+- hook policy 根据 `AGENTCALL_WRAPPER_SESSION` 绑定 route contract，在 `PreToolUse` 拦截 ACP 越界写入。
+- ACP route 改为 daemon-owned 后台 invocation，route 快速返回 `started`，完成后回写 `completed`、`failed` 或 `failed_report_contract`。
+- ACP report contract 固定校验 `status/summary/verdict/evidence/files_read/changed_files/risks/next_recommended_action/context_sufficiency`。
+- PTY route 自动提交 objective/context prompt，并返回 `started_and_prompt_submitted` 或 `started_pending_prompt`，避免“400 但 session 已创建”的后置校验问题。
+- 新增 [docs/v2.2-acp-sop-worker-gate.md](docs/v2.2-acp-sop-worker-gate.md)。
+
+## v2.1.0 - ACP Child Lifecycle Binding
+
+- ACP route 与 PTY 一样强制使用 daemon local config 的 `claude_workspace` 作为 child cwd；route `workspace` 只表达任务目标。
+- ACP invocation 注入 `AGENTCALL_WRAPPER_SESSION`，Claude hooks 能以 `binding_source=env` 绑定回 AgentCall child call。
+- `agentcall_route(mode=start,runtime=acp)` 自动生成或保留 `task_id/call_id/role/phase`，并创建 context packet。
+- ACP route 投影为可被 Codex/board 识别的 child lifecycle：`child.call_started`、`agent.state_changed`、`child.report_received`。
+- ACP result 增加 `binding_gate`、`context_packet` 和最小 report validation，不再把 raw text 直接等同于已验收 report。
+- daemon 重启后从既有 routes/events 恢复 route sequence，避免重新从 `route-1` 开始覆盖旧 route。
+- 新增 [docs/v2.1-acp-python-vs-rust.md](docs/v2.1-acp-python-vs-rust.md)，记录 Python reference、Rust native ACP 和子智能体协作层差异。
+
 ## v2.0.0 - Codex-Controlled Claude Code Cluster
 
 - 发布 AgentCall v2.0：定位为“让 Codex 指挥 Claude Code 集群协同工作”的本地多 Agent 控制面。
