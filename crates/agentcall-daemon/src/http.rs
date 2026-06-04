@@ -2,6 +2,7 @@ use crate::hooks::{
     EventAppendRequest, HookIngestRequest, append_event_request, file_claims_state, ingest_hook,
     unmatched_hooks_state,
 };
+use crate::mcp::{McpCallRequest, mcp_call, mcp_tools};
 use crate::routes::{
     ContextRequest, RouteRequest, TranscriptIndexRequest, checkpoint_session, create_context,
     handle_route, index_transcript, route_state,
@@ -148,6 +149,13 @@ pub(crate) fn route(request: Request, state: Arc<AppState>) -> Response {
         ("GET", "/api/projects") => json_response(&projects_state(&state)),
         ("GET", "/api/file-claims") => json_response(&file_claims_state(&state)),
         ("GET", "/api/hooks/unmatched") => json_response(&unmatched_hooks_state(&state)),
+        ("GET", "/api/mcp/tools") => json_response(&mcp_tools()),
+        ("POST", "/api/mcp/call") => match parse_json::<McpCallRequest>(&request.body)
+            .and_then(|req| mcp_call(&state, req))
+        {
+            Ok(result) => json_response(&result),
+            Err(err) => error_response(400, &err),
+        },
         ("POST", "/api/events") => match parse_json::<EventAppendRequest>(&request.body)
             .map(|req| append_event_request(&state, req))
         {

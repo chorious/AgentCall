@@ -6,6 +6,7 @@
 
 - [项目说明](../README.md)
 - [版本历史](../CHANGELOG.md)
+- [当前 MCP/daemon 控制面](v3.0-mcp.md)
 
 ## 架构与主线说明
 
@@ -33,4 +34,4 @@
 
 ## 当前版本提示
 
-当前主线版本是 `v0.8a`：Route-first MCP 收敛、daemon routes 控制面、delegate 退场、checkpoint/context/transcript 默认写路迁入 daemon。
+当前主线版本是 `v0.8.1`：MCP stdio 稳定桥接、daemon 提供动态工具面、route-first 控制面继续作为默认路径。

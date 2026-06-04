@@ -62,8 +62,8 @@ pub(crate) struct StartRequest {
 
 #[derive(Deserialize)]
 pub(crate) struct InputRequest {
-    text: String,
-    enter: Option<bool>,
+    pub(crate) text: String,
+    pub(crate) enter: Option<bool>,
 }
 
 #[derive(Deserialize)]

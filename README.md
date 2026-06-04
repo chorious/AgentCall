@@ -1,21 +1,22 @@
 # AgentCall
 
-AgentCall 是一个面向复杂工程协作的本地 Agent 编排底座，特别适配 Codex 调用 Claude Code。当前主线是 Rust daemon 单写模型：daemon 负责 PTY 会话、hook ingest、file claim、runtime binding、route、summary、board 和 HTTP API；Python 只保留薄脚本、installer、测试辅助和显式 legacy/debug 路径。
+AgentCall 是一个本地多 Agent 协作控制面。当前主线是 Rust daemon 单写模型：daemon 负责 PTY 会话、hook ingest、file claim、runtime binding、route、summary、board 和 HTTP API；Python 只保留薄脚本、installer、测试辅助与显式 legacy/debug 路线。
 
-当前版本：`v0.8a`
+当前版本：`v0.8.1`
 
-版本历史见 [CHANGELOG.md](CHANGELOG.md)，文档索引见 [docs/README.md](docs/README.md)。
+- 版本历史：[CHANGELOG.md](CHANGELOG.md)
+- 文档索引：[docs/README.md](docs/README.md)
 
 ## 当前原则
 
-- Rust daemon 是 live 状态唯一写者：`events`、`file_claims`、`active_sessions`、`runtime_binding`、`routes` 和 `session_summary`。
-- MCP 正常路径简并为 `agentcall_board -> agentcall_route -> agentcall_session/agentcall_report`。
+- Rust daemon 是 live 状态唯一写者。
+- MCP 正常路径是 `agentcall_board -> agentcall_route -> agentcall_session/agentcall_report`。
 - `agentcall_route` 是唯一高层调度入口；ACP 和 PTY 是 route 的 runtime 参数。
+- MCP stdio 进程保持稳定，只做 bootstrap 与 daemon bridge。
 - Claude/Codex hooks 走 daemon-first：POST `/api/hooks/ingest`。
 - Codex 默认读 board/session summary，不默认读 raw terminal。
-- PTY wrapper 用于人类可视化、handoff 和 debug；状态判断优先 hook/report/daemon 结构化事件。
-- `D:\guKimi` 只能通过 `AGENTCALL_CLAUDE_WORKSPACE` 注入，不作为发布硬编码默认。
-- 更新后必须重启 daemon、MCP/viewer 和旧 Claude PTY；旧 PID 不假定能吃到新配置。
+- `D:\guKimi` 只能通过 `AGENTCALL_CLAUDE_WORKSPACE` 等本机配置注入，不作为发布硬编码默认。
+- 更新 daemon 后需要重启 daemon、viewer 和旧 Claude PTY；但业务工具面更新不应再要求重启 MCP transport。
 
 ## 快速启动
 
@@ -51,12 +52,11 @@ python scripts\install_codex_hooks.py  --root E:\Project\AgentCall
 target\debug\agentcall-mcp.exe --workspace E:\Project\AgentCall --daemon-url http://127.0.0.1:3293
 ```
 
-## MCP 默认工具
+## MCP 工具
 
-`tools/list` 默认只暴露正常控制路径：
+本地 MCP 只固定暴露 `agentcall_daemon`。其余业务工具由 daemon 动态提供：
 
 ```text
-agentcall_daemon
 agentcall_board
 agentcall_route
 agentcall_session
@@ -64,9 +64,7 @@ agentcall_session_send
 agentcall_report
 ```
 
-`agentcall_daemon(action=start)` 是 bootstrap 入口：daemon 未运行时由 MCP 拉起 daemon；已运行时返回 `already_running`。它不负责自动 kill/restart。
-
-旧 `agentcall_delegate` / `agentcall_delegate_acp` 已从默认工具面移除；隐藏兼容 handler 只返回 deprecated 提示，不再执行 Python workflow。
+`agentcall_daemon(action=start)` 是 bootstrap 入口：daemon 未运行时由 MCP 拉起 daemon；daemon 已运行时返回 `already_running`。
 
 ## Daemon API
 
@@ -74,6 +72,8 @@ agentcall_report
 
 ```text
 GET  /api/runtime/health
+GET  /api/mcp/tools
+POST /api/mcp/call
 GET  /api/board?view=compact&filter=attention
 GET  /api/sessions
 GET  /api/sessions/{name}/summary
@@ -87,49 +87,6 @@ POST /api/sessions/{name}/stop
 POST /api/context
 POST /api/transcripts/index
 POST /api/hooks/ingest
-```
-
-`agentcall_route` 支持：
-
-```text
-mode: recommend | start
-runtime: auto | pty | acp
-task_id / call_id / phase / role
-allowed_paths / acceptance_criteria
-persist_context
-```
-
-`runtime=auto` 必须提供估计字段：`estimated_minutes`，以及 `estimated_files` 或 `estimated_loc`。
-如果传入 `task_id` 和 `call_id`，route 会同步生成 context packet 并写入 `.agentcall/tasks/{task_id}/calls/{call_id}/`，不需要再调用单独的 context 工具。
-
-## 项目结构
-
-```text
-.agentcall/
-  events.ndjson
-  state/
-    active_sessions.json
-    file_claims.json
-    runtime_binding.json
-    routes.json
-    transcripts.json
-  sessions/                 # legacy detached Python PTY，仅 debug/manual
-  tasks/
-    task-0001/
-      calls/
-      reports/
-      review.md             # 只有 drift/blocker/revision 时需要
-
-crates/
-  agentcall-daemon/          # Rust daemon、HTTP API、PTY、hooks、route、summary
-  agentcall-mcp/             # Rust MCP server
-  agentcall-hook/            # legacy standalone hook receiver
-
-scripts/
-  agentcall-claude-hook.py
-  agentcall-codex-hook.py
-  install_claude_hooks.py
-  install_codex_hooks.py
 ```
 
 ## 测试
