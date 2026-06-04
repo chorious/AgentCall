@@ -7,6 +7,7 @@
 - [项目说明](../README.md)
 - [版本历史](../CHANGELOG.md)
 - [当前 MCP/daemon 控制面](v3.0-mcp.md)
+- [MCP transport 恢复](mcp-transport-recovery.md)
 
 ## 架构与主线说明
 

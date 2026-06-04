@@ -6,6 +6,7 @@ AgentCall 是一个本地多 Agent 协作控制面。当前主线是 Rust daemon
 
 - 版本历史：[CHANGELOG.md](CHANGELOG.md)
 - 文档索引：[docs/README.md](docs/README.md)
+- MCP transport 恢复：[docs/mcp-transport-recovery.md](docs/mcp-transport-recovery.md)
 
 ## 当前原则
 
