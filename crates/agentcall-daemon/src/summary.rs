@@ -3,6 +3,7 @@ use crate::routes::routes_state;
 use crate::session::{Session, list_sessions};
 use crate::state::{AppState, read_events, read_json_file};
 use crate::terminal::{clean_terminal_text, tail_lines};
+use crate::util::now_ms;
 use std::fs;
 use std::path::Path;
 use std::sync::Arc;
@@ -276,6 +277,13 @@ pub(crate) fn session_summary(state: &AppState, session: &Arc<Session>) -> serde
     };
     let needs_user_input =
         attention_status == "waiting_input" || attention_status == "needs_permission";
+    let last_progress_age_seconds =
+        now_ms().saturating_sub(session.updated_at.load(Ordering::Relaxed)) / 1000;
+    let patience = patience_contract(
+        &liveness_status,
+        &attention_status,
+        last_progress_age_seconds,
+    );
     let hint_source = if waiting_input || interrupted || report_ready {
         Some("tui")
     } else {
@@ -286,7 +294,7 @@ pub(crate) fn session_summary(state: &AppState, session: &Arc<Session>) -> serde
         .and_then(|value| value.get("last_tool"))
         .cloned()
         .unwrap_or(serde_json::Value::Null);
-    serde_json::json!({
+    let mut payload = serde_json::json!({
         "session": session.name,
         "project": state.workspace.file_name().and_then(|name| name.to_str()).unwrap_or("workspace"),
         "transport": "pty",
@@ -344,12 +352,81 @@ pub(crate) fn session_summary(state: &AppState, session: &Arc<Session>) -> serde
         "needs_user_input": needs_user_input,
         "warnings": [],
         "conflicts": []
-    })
+    });
+    if let Some(object) = payload.as_object_mut() {
+        object.insert("patience_hint".to_string(), patience["hint"].clone());
+        object.insert("patience_status".to_string(), patience["status"].clone());
+        object.insert(
+            "last_progress_age_seconds".to_string(),
+            serde_json::json!(last_progress_age_seconds),
+        );
+        object.insert(
+            "suggested_wait_seconds".to_string(),
+            patience["suggested_wait_seconds"].clone(),
+        );
+        object.insert(
+            "do_not_retry_before_seconds".to_string(),
+            patience["do_not_retry_before_seconds"].clone(),
+        );
+        object.insert(
+            "stall_threshold_seconds".to_string(),
+            patience["stall_threshold_seconds"].clone(),
+        );
+    }
+    payload
 }
 
 pub(crate) fn clean_session_output(session: &Arc<Session>) -> String {
     let text = session.clean_replay.lock().unwrap().clone();
     tail_lines(&clean_terminal_text(&text), 120)
+}
+
+fn patience_contract(
+    liveness_status: &str,
+    attention_status: &str,
+    last_progress_age_seconds: u64,
+) -> serde_json::Value {
+    let suggested_wait_seconds = 45u64;
+    let do_not_retry_before_seconds = 60u64;
+    let stall_threshold_seconds = 180u64;
+    if attention_status != "none" {
+        return serde_json::json!({
+            "status": "attention_required",
+            "hint": "Attention status is active; inspect summary/report before waiting longer.",
+            "suggested_wait_seconds": 0,
+            "do_not_retry_before_seconds": 0,
+            "stall_threshold_seconds": stall_threshold_seconds
+        });
+    }
+    if matches!(liveness_status, "working" | "idle" | "unknown")
+        && last_progress_age_seconds < do_not_retry_before_seconds
+    {
+        return serde_json::json!({
+            "status": "inside_patience_window",
+            "hint": "Worker recently started or produced output. Wait before retrying, nudging, or declaring it stuck.",
+            "suggested_wait_seconds": suggested_wait_seconds,
+            "do_not_retry_before_seconds": do_not_retry_before_seconds,
+            "stall_threshold_seconds": stall_threshold_seconds
+        });
+    }
+    if matches!(liveness_status, "working" | "unknown")
+        && last_progress_age_seconds >= stall_threshold_seconds
+    {
+        return serde_json::json!({
+            "status": "inspect_progress",
+            "hint": "No recent progress past the stall threshold. Inspect clean_tail or request a concise status before restarting.",
+            "suggested_wait_seconds": 0,
+            "do_not_retry_before_seconds": 0,
+            "stall_threshold_seconds": stall_threshold_seconds
+        });
+    }
+    serde_json::json!({
+        "status": "normal",
+        "hint": "Use board/session summary before nudging; Claude Code PTY work can be quiet while reading or thinking.",
+        "suggested_wait_seconds": suggested_wait_seconds,
+        "do_not_retry_before_seconds": do_not_retry_before_seconds,
+        "stall_threshold_seconds": stall_threshold_seconds
+    })
 }
 
 pub(crate) fn looks_like_waiting_for_input(text: &str) -> bool {
@@ -421,6 +498,9 @@ fn attention_items(state: &AppState) -> serde_json::Value {
                 "attention_status": attention_status,
                 "status_source": summary.get("status_source").cloned().unwrap_or(serde_json::Value::Null),
                 "binding_source": summary.get("binding_source").cloned().unwrap_or(serde_json::Value::Null),
+                "patience_status": summary.get("patience_status").cloned().unwrap_or(serde_json::Value::Null),
+                "patience_hint": summary.get("patience_hint").cloned().unwrap_or(serde_json::Value::Null),
+                "last_progress_age_seconds": summary.get("last_progress_age_seconds").cloned().unwrap_or(serde_json::Value::Null),
                 "needs_attention": true,
             }));
         }
@@ -447,6 +527,9 @@ fn recent_route_summaries(routes: &serde_json::Value) -> serde_json::Value {
                 "session_name": route.get("session_name").cloned().unwrap_or(serde_json::Value::Null),
                 "worker_kind": route.get("result").and_then(|result| result.get("worker_kind")).cloned().unwrap_or(serde_json::Value::Null),
                 "workflow_status": route.get("result").and_then(|result| result.get("workflow_status")).cloned().unwrap_or(serde_json::Value::Null),
+                "required_next_step": route.get("required_next_step").cloned().unwrap_or(serde_json::Value::Null),
+                "suggested_wait_seconds": route.get("suggested_wait_seconds").cloned().unwrap_or(serde_json::Value::Null),
+                "do_not_retry_before_seconds": route.get("do_not_retry_before_seconds").cloned().unwrap_or(serde_json::Value::Null),
                 "updated_at": route.get("updated_at").cloned().unwrap_or(serde_json::Value::Null),
             })
         })

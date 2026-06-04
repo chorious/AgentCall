@@ -12,6 +12,7 @@ AgentCall 是一个本地多 Agent 协作控制面，用来让 **Codex 指挥 Cl
 - **Plan gate 可选**：plan workflow 会让 Claude Code 先产出计划并等待批准，Codex 可用 `approve_plan`、`revise_plan`、`start_auto` 继续控制。
 - **Hooks 绑定状态**：Claude/Codex hooks POST 到 daemon `/api/hooks/ingest`，并通过 `AGENTCALL_WRAPPER_SESSION` 绑定 wrapper session 与 Claude hook session。
 - **Readable wrapper**：daemon 维护 raw output、clean output、llm summary 三层输出；Codex 默认读取 compact board 和 summary。
+- **Patience contract**：route/session summary 会返回 `suggested_wait_seconds`、`do_not_retry_before_seconds`、`last_progress_age_seconds` 和 `patience_hint`，提醒 Codex 把 PTY worker 当作异步后台工作，而不是同步函数调用。
 - **Daemon single-writer**：live events、claims、sessions、bindings、routes、summary 都由 Rust daemon 统一写入。
 
 ## 为什么移除 ACP
@@ -95,7 +96,7 @@ agentcall_report
 1. `agentcall_daemon(action=start)` 确保 daemon 正在运行。
 2. `agentcall_board(view=compact, filter=attention)` 查看需要介入的 worker。
 3. `agentcall_route(mode=start, runtime=auto, objective=..., allowed_paths=..., acceptance_criteria=...)` 启动 PTY utility worker。
-4. `agentcall_session(name=..., include=["summary"])` 查看紧凑状态。
+4. 等待 route 返回的 `suggested_wait_seconds`，再用 `agentcall_session(name=..., include=["summary"])` 查看紧凑状态。
 5. `agentcall_session_send(action=continue|request_report|revise_plan|approve_plan|start_auto)` 控制 worker。
 6. `agentcall_report(action=request|accept)` 请求或接受报告。
 

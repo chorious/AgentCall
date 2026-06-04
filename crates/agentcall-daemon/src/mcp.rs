@@ -18,7 +18,7 @@ pub(crate) fn mcp_tools() -> Vec<Value> {
     vec![
         json!({
             "name": "agentcall_board",
-            "description": "Return unified board state. Use compact/attention views for low-friction Codex control.",
+            "description": "Return unified board state. Use compact/attention views for low-friction Codex control. PTY workers are asynchronous; inspect attention and patience hints before retrying or declaring a worker stuck.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -32,7 +32,7 @@ pub(crate) fn mcp_tools() -> Vec<Value> {
         }),
         json!({
             "name": "agentcall_route",
-            "description": "Recommend or start a Claude Code PTY utility worker. Use pty_workflow=plan_then_auto only when the supervisor explicitly wants a plan gate.",
+            "description": "Recommend or start a Claude Code PTY utility worker. PTY workers are asynchronous background workers, not synchronous function calls; after start, wait for prompt_gate/hooks/session summary before retrying. Use pty_workflow=plan_then_auto only when the supervisor explicitly wants a plan gate.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -64,7 +64,7 @@ pub(crate) fn mcp_tools() -> Vec<Value> {
         }),
         json!({
             "name": "agentcall_session",
-            "description": "Return one daemon PTY session llm_summary, with optional clean output tail.",
+            "description": "Return one daemon PTY session llm_summary, with optional clean output tail. Prefer summary patience_hint, last_progress_age_seconds, and attention_status over impatient raw-terminal polling.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -78,7 +78,7 @@ pub(crate) fn mcp_tools() -> Vec<Value> {
         }),
         json!({
             "name": "agentcall_session_send",
-            "description": "Send text or a high-level nudge action to a daemon PTY session.",
+            "description": "Send text or a high-level nudge action to a daemon PTY session. Avoid repeated continue nudges while the session is still inside its patience window unless attention_status requires intervention.",
             "inputSchema": {
                 "type": "object",
                 "properties": {

@@ -45,6 +45,9 @@ struct RouteRecord {
     reason: String,
     score_breakdown: Value,
     required_next_step: String,
+    suggested_wait_seconds: u64,
+    do_not_retry_before_seconds: u64,
+    slow_worker_policy: String,
     session_name: Option<String>,
     created_at: u64,
     updated_at: u64,
@@ -102,10 +105,13 @@ pub(crate) fn handle_route(state: &Arc<AppState>, req: RouteRequest) -> Result<V
         reason: decision.reason.clone(),
         score_breakdown: decision.score_breakdown.clone(),
         required_next_step: if mode == "start" {
-            "inspect board/session/report".to_string()
+            "wait_then_inspect_session".to_string()
         } else {
             "call agentcall_route with mode=start to launch a PTY utility worker".to_string()
         },
+        suggested_wait_seconds: 45,
+        do_not_retry_before_seconds: 60,
+        slow_worker_policy: "Claude Code PTY is an asynchronous worker. Wait for prompt_gate, hooks, or session summary progress before retrying; do not treat quiet reading/thinking as failure unless attention_status or prompt_gate reports a problem.".to_string(),
         session_name: None,
         created_at: now_ms(),
         updated_at: now_ms(),
@@ -426,6 +432,12 @@ fn start_pty_route(
             "required": true,
             "expected_binding_source": "env",
             "status": "pending_hook"
+        },
+        "patience_policy": {
+            "suggested_wait_seconds": 45,
+            "do_not_retry_before_seconds": 60,
+            "stall_threshold_seconds": 180,
+            "hint": "Claude Code PTY may spend time reading files, thinking, or preparing tool calls. Inspect session summary/attention before retrying or restarting."
         },
         "containment": {
             "mode": if req.allowed_paths.as_ref().map(|items| items.is_empty()).unwrap_or(true) { "prompt_only" } else { "enforced" },
