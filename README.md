@@ -94,9 +94,13 @@ POST /api/hooks/ingest
 ```text
 mode: recommend | start
 runtime: auto | pty | acp
+task_id / call_id / phase / role
+allowed_paths / acceptance_criteria
+persist_context
 ```
 
 `runtime=auto` 必须提供估计字段：`estimated_minutes`，以及 `estimated_files` 或 `estimated_loc`。
+如果传入 `task_id` 和 `call_id`，route 会同步生成 context packet 并写入 `.agentcall/tasks/{task_id}/calls/{call_id}/`，不需要再调用单独的 context 工具。
 
 ## 项目结构
 

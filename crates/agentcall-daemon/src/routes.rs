@@ -24,6 +24,13 @@ pub(crate) struct RouteRequest {
     command: Option<Vec<String>>,
     adapter_command: Option<Vec<String>>,
     timeout_seconds: Option<u64>,
+    task_id: Option<String>,
+    call_id: Option<String>,
+    phase: Option<String>,
+    role: Option<String>,
+    allowed_paths: Option<Vec<String>>,
+    acceptance_criteria: Option<Vec<String>>,
+    persist_context: Option<bool>,
 }
 
 #[derive(Clone, Serialize)]
@@ -94,6 +101,30 @@ pub(crate) fn handle_route(state: &Arc<AppState>, req: RouteRequest) -> Result<V
             "acp" => start_acp_route(state, &req, &mut record)?,
             other => return Err(format!("unsupported route runtime: {other}")),
         }
+    }
+    if route_has_context_fields(&req) {
+        let context_packet = create_context(
+            state,
+            ContextRequest {
+                task_id: req
+                    .task_id
+                    .clone()
+                    .ok_or("task_id is required when route context fields are provided")?,
+                call_id: req
+                    .call_id
+                    .clone()
+                    .ok_or("call_id is required when route context fields are provided")?,
+                objective: req.objective.clone(),
+                phase: req.phase.clone(),
+                role: req.role.clone(),
+                runtime: Some(decision.runtime.clone()),
+                workspace: req.workspace.clone(),
+                allowed_paths: req.allowed_paths.clone(),
+                acceptance_criteria: req.acceptance_criteria.clone(),
+                persist: req.persist_context,
+            },
+        )?;
+        merge_result_field(&mut record.result, "context_packet", context_packet);
     }
 
     upsert_route_record(state, &record)?;
@@ -166,6 +197,7 @@ pub(crate) struct ContextRequest {
     phase: Option<String>,
     role: Option<String>,
     runtime: Option<String>,
+    workspace: Option<String>,
     allowed_paths: Option<Vec<String>>,
     acceptance_criteria: Option<Vec<String>>,
     persist: Option<bool>,
@@ -184,6 +216,7 @@ pub(crate) fn create_context(state: &Arc<AppState>, req: ContextRequest) -> Resu
         "phase": req.phase.unwrap_or_else(|| "execute".to_string()),
         "role": req.role.unwrap_or_else(|| "executor".to_string()),
         "runtime": req.runtime.unwrap_or_else(|| "acp".to_string()),
+        "workspace": req.workspace,
         "objective": req.objective,
         "allowed_paths": req.allowed_paths.unwrap_or_default(),
         "acceptance_criteria": req.acceptance_criteria.unwrap_or_default(),
@@ -459,6 +492,25 @@ fn has_auto_estimates(req: &RouteRequest) -> bool {
         && (req.estimated_files.is_some() || req.estimated_loc.is_some())
 }
 
+fn route_has_context_fields(req: &RouteRequest) -> bool {
+    req.task_id.is_some()
+        || req.call_id.is_some()
+        || req.phase.is_some()
+        || req.role.is_some()
+        || req.allowed_paths.is_some()
+        || req.acceptance_criteria.is_some()
+        || req.persist_context.is_some()
+}
+
+fn merge_result_field(result: &mut Value, key: &str, value: Value) {
+    if !result.is_object() {
+        *result = json!({});
+    }
+    if let Some(object) = result.as_object_mut() {
+        object.insert(key.to_string(), value);
+    }
+}
+
 fn adapter_command_from_env() -> Option<Vec<String>> {
     let value = std::env::var("AGENTCALL_ACP_ADAPTER_COMMAND").ok()?;
     let parts: Vec<String> = value.split_whitespace().map(str::to_string).collect();
@@ -570,6 +622,13 @@ mod tests {
                 command: None,
                 adapter_command: None,
                 timeout_seconds: None,
+                task_id: None,
+                call_id: None,
+                phase: None,
+                role: None,
+                allowed_paths: None,
+                acceptance_criteria: None,
+                persist_context: None,
             },
         );
         assert!(result.unwrap_err().contains("runtime=auto requires"));
@@ -595,6 +654,13 @@ mod tests {
                 command: None,
                 adapter_command: None,
                 timeout_seconds: None,
+                task_id: None,
+                call_id: None,
+                phase: None,
+                role: None,
+                allowed_paths: None,
+                acceptance_criteria: None,
+                persist_context: None,
             },
         )
         .unwrap();
@@ -602,6 +668,48 @@ mod tests {
         assert_eq!(route["status"], "adapter_not_configured");
         assert_eq!(route["result"]["adapter"], "not_configured");
         assert!(workspace.join(".agentcall/state/routes.json").exists());
+    }
+
+    #[test]
+    fn route_can_create_context_packet_without_separate_mcp_tool() {
+        let workspace = test_workspace("route-context");
+        let state = Arc::new(AppState::new(workspace.clone()));
+        let route = handle_route(
+            &state,
+            RouteRequest {
+                objective: "audit route context".to_string(),
+                workspace: Some("E:/GameProject/GGMYS".to_string()),
+                mode: Some("start".to_string()),
+                runtime: Some("acp".to_string()),
+                estimated_minutes: None,
+                estimated_files: None,
+                estimated_loc: None,
+                needs_continuity: None,
+                risk: None,
+                session_name: None,
+                command: None,
+                adapter_command: None,
+                timeout_seconds: None,
+                task_id: Some("task-route".to_string()),
+                call_id: Some("call-a".to_string()),
+                phase: Some("execute".to_string()),
+                role: Some("reviewer".to_string()),
+                allowed_paths: Some(vec!["src".to_string()]),
+                acceptance_criteria: Some(vec!["report risks".to_string()]),
+                persist_context: Some(true),
+            },
+        )
+        .unwrap();
+        let packet = &route["result"]["context_packet"];
+        assert_eq!(packet["task_id"], "task-route");
+        assert_eq!(packet["call_id"], "call-a");
+        assert_eq!(packet["runtime"], "acp");
+        assert_eq!(packet["workspace"], "E:/GameProject/GGMYS");
+        assert!(
+            workspace
+                .join(".agentcall/tasks/task-route/calls/call-a/context.json")
+                .exists()
+        );
     }
 
     #[test]

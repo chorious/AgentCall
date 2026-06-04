@@ -173,7 +173,14 @@ fn tools() -> Vec<Value> {
                     "risk": {"type": "string", "enum": ["low", "medium", "high"], "default": "medium"},
                     "session_name": {"type": "string"},
                     "command": {"type": "array", "items": {"type": "string"}},
-                    "timeout_seconds": {"type": "integer", "minimum": 1}
+                    "timeout_seconds": {"type": "integer", "minimum": 1},
+                    "task_id": {"type": "string"},
+                    "call_id": {"type": "string"},
+                    "phase": {"type": "string", "default": "execute"},
+                    "role": {"type": "string", "default": "executor"},
+                    "allowed_paths": {"type": "array", "items": {"type": "string"}},
+                    "acceptance_criteria": {"type": "array", "items": {"type": "string"}},
+                    "persist_context": {"type": "boolean", "default": true}
                 },
                 "required": ["objective"],
                 "additionalProperties": false
@@ -1012,16 +1019,6 @@ fn report_schema() -> Value {
     })
 }
 
-fn parse_key_value_output(output: &str) -> Value {
-    let mut object = serde_json::Map::new();
-    for line in output.lines() {
-        if let Some((key, value)) = line.split_once(':') {
-            object.insert(key.trim().to_string(), json!(value.trim()));
-        }
-    }
-    Value::Object(object)
-}
-
 fn required_str<'a>(args: &'a Value, name: &str) -> Result<&'a str, String> {
     args.get(name)
         .and_then(Value::as_str)
@@ -1085,14 +1082,6 @@ mod tests {
         assert!(!names.contains(&"agentcall_session_spawn".to_string()));
         assert!(!names.contains(&"agentcall_session_list".to_string()));
         assert!(!names.contains(&"agentcall_events_tail".to_string()));
-    }
-
-    #[test]
-    fn parses_key_value_output() {
-        let parsed = parse_key_value_output("task_id: task-0001\nstatus: accepted\nreports: 2");
-        assert_eq!(parsed["task_id"], "task-0001");
-        assert_eq!(parsed["status"], "accepted");
-        assert_eq!(parsed["reports"], "2");
     }
 
     #[test]

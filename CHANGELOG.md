@@ -5,6 +5,7 @@
 - MCP 默认工具面收敛为 `agentcall_board`、`agentcall_route`、`agentcall_session`、`agentcall_session_send`、`agentcall_report`。
 - 新增 `agentcall_daemon(action=status|start)`，MCP 可在 daemon 未运行时直接启动 Rust daemon。
 - 新增 canonical `agentcall_route`：支持 `mode=recommend|start` 与 `runtime=auto|pty|acp`。
+- 扩展 `agentcall_route` 参数空间：`task_id/call_id/phase/role/allowed_paths/acceptance_criteria/persist_context`，route 可直接生成 context packet。
 - `runtime=auto` 要求调用方提供估计字段，避免 Codex 盲目推断任务规模。
 - `agentcall_delegate` / `agentcall_delegate_acp` 从默认工具面移除；隐藏兼容 handler 只返回 deprecated 提示，不再执行 Python workflow。
 - daemon 新增 `/api/routes`、`/api/routes/{id}`，route 和 invocation 状态由 daemon 记录并投影到 board。
