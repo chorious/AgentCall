@@ -70,6 +70,15 @@ pub(crate) fn ingest_hook(
     let workspace = string_field(&payload, &["workspace", "cwd"]);
     let transcript_path = string_field(&payload, &["transcript_path"]);
     let status = infer_hook_status(&req.event, &payload);
+    let runtime = req
+        .runtime
+        .clone()
+        .unwrap_or_else(|| "claude-code-session".to_string());
+    let context_injection = if matches!(req.event.as_str(), "SessionStart" | "UserPromptSubmit") {
+        Some(context_injection(state, &runtime))
+    } else {
+        None
+    };
     let env_wrapper_session = string_field(&payload, &["wrapper_session", "wrapperSession"]);
     let (wrapper_session, binding_source) = upsert_runtime_binding_locked(
         &state_dir,
@@ -106,7 +115,7 @@ pub(crate) fn ingest_hook(
         &session_id,
         serde_json::json!({
             "session_id": session_id,
-            "runtime": req.runtime.unwrap_or_else(|| "claude-code-session".to_string()),
+            "runtime": runtime,
             "status": status,
             "agent": string_field(&payload, &["agent", "agent_name"]).unwrap_or_else(|| "claude-code".to_string()),
             "pid": payload.get("pid").cloned().unwrap_or(serde_json::Value::Null),
@@ -139,7 +148,7 @@ pub(crate) fn ingest_hook(
         }),
     )?;
 
-    Ok(serde_json::json!({
+    let mut response = serde_json::json!({
         "event_type": format!("hook.{}", req.event),
         "session_id": session_id,
         "status": status,
@@ -147,7 +156,61 @@ pub(crate) fn ingest_hook(
         "binding_source": binding_source,
         "decision": decision,
         "unmatched": unmatched
-    }))
+    });
+    if let Some(context_injection) = context_injection {
+        response["context_injection"] = serde_json::json!(context_injection);
+    }
+    Ok(response)
+}
+
+fn context_injection(state: &AppState, runtime: &str) -> String {
+    let state_dir = state.workspace.join(".agentcall").join("state");
+    let sessions = read_json_file(&state_dir.join("active_sessions.json"), serde_json::json!({}));
+    let claims = read_json_file(&state_dir.join("file_claims.json"), serde_json::json!({}));
+    let active_sessions = sessions.as_object().map(|items| items.len()).unwrap_or(0);
+    let active_claims = claims
+        .as_object()
+        .map(|items| {
+            items
+                .values()
+                .filter(|claim| claim.get("status").and_then(|value| value.as_str()) == Some("active"))
+                .count()
+        })
+        .unwrap_or(0);
+    let structured_reports = count_reports(&state.workspace.join(".agentcall"));
+    format!(
+        "# AgentCall Context\n\n- runtime: {runtime}\n- workspace: {}\n- active_sessions: {active_sessions}\n- active_file_claims: {active_claims}\n- structured_reports: {structured_reports}\n\nAgentCall discipline:\n- Inspect the board before delegation or handoff.\n- Use AgentCall PTY utility workers for child work.\n- Respect allowed_paths and file claims; do not write outside assigned ownership.\n- Require a concise report or exact change summary at lifecycle end.\n- Write review only for drift, blockers, failed validation, or revision.\n",
+        state.workspace.display()
+    )
+}
+
+fn count_reports(agent_dir: &Path) -> usize {
+    let mut count = 0usize;
+    count_report_files(&agent_dir.join("tasks"), &mut count);
+    count_report_files(&agent_dir.join("reports"), &mut count);
+    count
+}
+
+fn count_report_files(path: &Path, count: &mut usize) {
+    let Ok(entries) = fs::read_dir(path) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            count_report_files(&path, count);
+            continue;
+        }
+        let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+            continue;
+        };
+        if name.eq_ignore_ascii_case("report.md")
+            || name.starts_with("Report_")
+            || name.ends_with(".report.json")
+        {
+            *count += 1;
+        }
+    }
 }
 
 pub(crate) fn append_event_request(state: &AppState, req: EventAppendRequest) -> serde_json::Value {
@@ -873,6 +936,35 @@ mod tests {
             }),
         )
         .unwrap();
+    }
+
+    #[test]
+    fn session_start_returns_context_injection_but_tool_hooks_do_not() {
+        let state = test_state("context-injection");
+        let session_start = ingest_hook(
+            &state,
+            HookIngestRequest {
+                event: "SessionStart".to_string(),
+                payload: serde_json::json!({"session_id": "claude-a"}),
+                runtime: Some("claude".to_string()),
+            },
+        )
+        .unwrap();
+        assert!(session_start["context_injection"]
+            .as_str()
+            .unwrap()
+            .contains("AgentCall Context"));
+
+        let pre_tool = ingest_hook(
+            &state,
+            HookIngestRequest {
+                event: "PreToolUse".to_string(),
+                payload: write_payload("claude-a", "src/lib.rs"),
+                runtime: Some("claude".to_string()),
+            },
+        )
+        .unwrap();
+        assert!(pre_tool.get("context_injection").is_none());
     }
 
     #[test]

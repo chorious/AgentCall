@@ -26,6 +26,9 @@ use std::sync::Arc;
 use std::sync::mpsc;
 use std::thread;
 
+const MAX_HTTP_BODY_BYTES: usize = 1024 * 1024;
+const MAX_WS_FRAME_BYTES: u64 = 64 * 1024;
+
 pub(crate) fn handle_connection(
     mut stream: TcpStream,
     state: Arc<AppState>,
@@ -109,6 +112,14 @@ pub(crate) fn read_request(stream: &mut TcpStream) -> std::io::Result<Request> {
             headers.insert(name, value);
         }
     }
+    if content_length > MAX_HTTP_BODY_BYTES {
+        return Ok(Request {
+            method: "__payload_too_large".to_string(),
+            path: String::new(),
+            headers,
+            body: vec![],
+        });
+    }
 
     let mut body = vec![0u8; content_length];
     if content_length > 0 {
@@ -125,6 +136,9 @@ pub(crate) fn read_request(stream: &mut TcpStream) -> std::io::Result<Request> {
 
 pub(crate) fn route(request: Request, state: Arc<AppState>) -> Response {
     let path = request.path.split('?').next().unwrap_or("/");
+    if request.method == "__payload_too_large" {
+        return error_response(413, "payload too large");
+    }
     match (request.method.as_str(), path) {
         ("GET", "/") => static_file("web/index.html"),
         ("GET", "/board") => static_file("web/board.html"),
@@ -339,7 +353,21 @@ pub(crate) fn write_ws(
         }
     });
 
-    while let Some(frame) = read_ws_frame(&mut stream)? {
+    loop {
+        let frame = match read_ws_frame(&mut stream) {
+            Ok(Some(frame)) => frame,
+            Ok(None) => break,
+            Err(err) if err.kind() == std::io::ErrorKind::InvalidData => {
+                append_agent_event(
+                    &state,
+                    "ws.frame_too_large",
+                    "WebSocket frame exceeded AgentCall limit.",
+                    serde_json::json!({"name": session.name, "limit_bytes": MAX_WS_FRAME_BYTES}),
+                );
+                break;
+            }
+            Err(err) => return Err(err),
+        };
         match frame.opcode {
             0x1 => {
                 if let Ok(text) = String::from_utf8(frame.payload) {
@@ -415,6 +443,12 @@ fn read_ws_frame(stream: &mut TcpStream) -> std::io::Result<Option<WsFrame>> {
         let mut buf = [0u8; 8];
         stream.read_exact(&mut buf)?;
         len = u64::from_be_bytes(buf);
+    }
+    if len > MAX_WS_FRAME_BYTES {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "websocket frame too large",
+        ));
     }
     let mut mask = [0u8; 4];
     if masked {
@@ -604,6 +638,7 @@ pub(crate) fn write_fixed(
     let reason = match status {
         200 => "OK",
         400 => "Bad Request",
+        413 => "Payload Too Large",
         404 => "Not Found",
         _ => "Error",
     };

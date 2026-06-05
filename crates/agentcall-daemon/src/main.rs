@@ -3,6 +3,7 @@ mod hooks;
 mod http;
 mod mcp;
 mod routes;
+mod runtime_lock;
 mod session;
 mod state;
 mod summary;
@@ -36,6 +37,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let workspace = normalize_path(workspace)?;
+    runtime_lock::acquire_runtime_lock(&workspace, "daemon", &format!("port:{port}"))?;
     let (config, config_error) = match LocalConfig::load(&workspace) {
         Ok(config) => (config, None),
         Err(err) => (LocalConfig::default(), Some(err)),

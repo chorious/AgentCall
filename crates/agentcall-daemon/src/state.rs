@@ -118,8 +118,10 @@ pub(crate) fn append_agent_event_locked(
 ) -> Result<(), String> {
     fs::create_dir_all(&agent_dir).map_err(|err| err.to_string())?;
     let path = agent_dir.join("events.ndjson");
+    let event_id = state.next_event_id();
+    let data = sanitize_event_data(agent_dir, event_type, &event_id, data)?;
     let event = serde_json::json!({
-        "id": state.next_event_id(),
+        "id": event_id,
         "ts": chrono::Utc::now().to_rfc3339(),
         "type": event_type,
         "task_id": null,
@@ -133,6 +135,113 @@ pub(crate) fn append_agent_event_locked(
         .open(path)
         .map_err(|err| err.to_string())?;
     let text = serde_json::to_string(&event).unwrap_or_else(|_| "{}".to_string());
+    writeln!(file, "{text}").map_err(|err| err.to_string())?;
+    append_hook_index(agent_dir, event_type, &event)
+}
+
+const TOOL_OUTPUT_INLINE_LIMIT: usize = 4096;
+
+fn sanitize_event_data(
+    agent_dir: &Path,
+    event_type: &str,
+    event_id: &str,
+    mut data: serde_json::Value,
+) -> Result<serde_json::Value, String> {
+    if event_type != "hook.PostToolUse" {
+        return Ok(data);
+    }
+    truncate_tool_response_field(agent_dir, event_id, &mut data, "stdout")?;
+    truncate_tool_response_field(agent_dir, event_id, &mut data, "stderr")?;
+    Ok(data)
+}
+
+fn truncate_tool_response_field(
+    agent_dir: &Path,
+    event_id: &str,
+    data: &mut serde_json::Value,
+    field: &str,
+) -> Result<(), String> {
+    let Some(tool_response) = data
+        .get_mut("raw")
+        .and_then(|raw| raw.get_mut("tool_response"))
+        .and_then(|value| value.as_object_mut())
+    else {
+        return Ok(());
+    };
+    let Some(original) = tool_response
+        .get(field)
+        .and_then(|value| value.as_str())
+        .map(str::to_string)
+    else {
+        return Ok(());
+    };
+    let original_bytes = original.as_bytes().len();
+    if original_bytes <= TOOL_OUTPUT_INLINE_LIMIT {
+        return Ok(());
+    }
+    let artifact_dir = agent_dir
+        .join("logs")
+        .join("artifacts")
+        .join("PostToolUse");
+    fs::create_dir_all(&artifact_dir).map_err(|err| err.to_string())?;
+    let artifact_path = artifact_dir.join(format!("{event_id}-{field}.txt"));
+    fs::write(&artifact_path, &original).map_err(|err| err.to_string())?;
+    let truncated = format!(
+        "{}\n...[AgentCall truncated {} bytes; full output: {}]",
+        safe_prefix(&original, TOOL_OUTPUT_INLINE_LIMIT),
+        original_bytes,
+        artifact_path.display()
+    );
+    tool_response.insert(field.to_string(), serde_json::json!(truncated));
+    tool_response.insert(
+        format!("{field}_artifact"),
+        serde_json::json!({
+            "path": artifact_path,
+            "original_bytes": original_bytes,
+            "hash": fnv1a_hex(original.as_bytes()),
+            "truncated": true
+        }),
+    );
+    Ok(())
+}
+
+fn safe_prefix(text: &str, max_bytes: usize) -> String {
+    if text.len() <= max_bytes {
+        return text.to_string();
+    }
+    let mut end = max_bytes;
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    text[..end].to_string()
+}
+
+fn fnv1a_hex(bytes: &[u8]) -> String {
+    let mut hash = 0xcbf29ce484222325u64;
+    for byte in bytes {
+        hash ^= *byte as u64;
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    format!("{hash:016x}")
+}
+
+fn append_hook_index(
+    agent_dir: &Path,
+    event_type: &str,
+    event: &serde_json::Value,
+) -> Result<(), String> {
+    let Some(hook_name) = event_type.strip_prefix("hook.") else {
+        return Ok(());
+    };
+    let log_dir = agent_dir.join("logs").join("hooks");
+    fs::create_dir_all(&log_dir).map_err(|err| err.to_string())?;
+    let path = log_dir.join(format!("{hook_name}.ndjson"));
+    let mut file = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .map_err(|err| err.to_string())?;
+    let text = serde_json::to_string(event).unwrap_or_else(|_| "{}".to_string());
     writeln!(file, "{text}").map_err(|err| err.to_string())
 }
 
@@ -231,6 +340,46 @@ mod tests {
         )
         .unwrap();
         assert_eq!(next_runtime_seq_from_state(&root), 13);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn posttooluse_output_is_truncated_and_indexed_by_hook_type() {
+        let root = test_workspace("posttooluse-index");
+        let agent_dir = root.join(".agentcall");
+        let state = AppState::test(root.clone());
+        fs::create_dir_all(agent_dir.join("state")).unwrap();
+        let large_stdout = "x".repeat(TOOL_OUTPUT_INLINE_LIMIT + 128);
+
+        append_agent_event_locked(
+            &state,
+            &agent_dir,
+            "hook.PostToolUse",
+            "post tool use",
+            serde_json::json!({
+                "raw": {
+                    "tool_response": {
+                        "stdout": large_stdout,
+                        "stderr": "short"
+                    }
+                }
+            }),
+        )
+        .unwrap();
+
+        let events_text = fs::read_to_string(agent_dir.join("events.ndjson")).unwrap();
+        let event: serde_json::Value = serde_json::from_str(events_text.lines().next().unwrap()).unwrap();
+        let stdout = event["data"]["raw"]["tool_response"]["stdout"]
+            .as_str()
+            .unwrap();
+        assert!(stdout.contains("AgentCall truncated"));
+        let artifact = event["data"]["raw"]["tool_response"]["stdout_artifact"]["path"]
+            .as_str()
+            .unwrap();
+        assert!(Path::new(artifact).exists());
+
+        let hook_index = agent_dir.join("logs").join("hooks").join("PostToolUse.ndjson");
+        assert!(hook_index.exists());
         let _ = fs::remove_dir_all(root);
     }
 
