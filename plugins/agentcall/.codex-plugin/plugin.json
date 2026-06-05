@@ -1,6 +1,6 @@
 {
   "name": "agentcall",
-  "version": "4.0.0",
+  "version": "4.0.1",
   "description": "AgentCall coordination tools for Codex-driven Claude Code PTY workers.",
   "author": {
     "name": "MUSHI"

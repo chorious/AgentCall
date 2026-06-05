@@ -1,5 +1,11 @@
 # CHANGELOG
 
+## v4.0.1 - AgentCall MCP Smoke Clarification
+
+- 插件 skill 明确：不要用 `tool_search agentcall` 判断 AgentCall 是否可用。
+- AgentCall MCP 可用性验收改为直接调用 `agentcall_daemon(action="status")`。
+- 修正派生线程反复误判 “AgentCall 不存在” 的操作路径。
+
 ## v4.0.0 - Plugin-Provided MCP
 
 - 新增 repo 内 Codex plugin：`plugins/agentcall`。
