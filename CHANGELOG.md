@@ -1,22 +1,38 @@
 # CHANGELOG
 
+## v4.0.0 - Plugin-Provided MCP
+
+- 新增 repo 内 Codex plugin：`plugins/agentcall`。
+- 插件通过 `.codex-plugin/plugin.json` 声明 `mcpServers`，通过 `.mcp.json` 暴露 AgentCall MCP server。
+- 新增 `skills/agentcall/SKILL.md`，把 AgentCall 默认协作流程、耐心策略、禁止 HTTP fallback 等规则交给 Codex。
+- 新增 `.agents/plugins/marketplace.json`，允许通过 `codex plugin marketplace add E:\Project\AgentCall` 安装本地 marketplace。
+- README 改为干净 UTF-8，明确 v4.0 的产品定位、hooks 配置、daemon config 和 plugin-provided MCP 安装方式。
+
+## v3.0.1 - Daemon Hook Hardening
+
+- `SessionStart` / `UserPromptSubmit` hook 返回 `context_injection`，把 AgentCall board discipline 注入 worker 上下文。
+- HTTP body 增加 1 MiB 上限，超限返回 `413 Payload Too Large`。
+- WebSocket frame 增加 64 KiB 上限，超限记录 `ws.frame_too_large` 并断开。
+- daemon 增加单实例 runtime lock，避免多个 daemon 同时写共享状态。
+- hook event 按类型写入 `.agentcall/logs/hooks/{HookType}.ndjson`。
+- `hook.PostToolUse` 的大 stdout/stderr 会写入 artifact，事件里只保留压缩摘要。
+- 新增 `scripts/align_hook_logs.py`，用于把旧 events 重新整理成分类 hook 日志。
+
 ## v3.0.0 - PTY Utility Workers
 
 - 产品面收敛为 PTY-first：`agentcall_route(runtime=auto|pty)` 启动 Claude Code PTY utility worker。
-- ACP 从当前实现中移除：MCP schema 不暴露 ACP 参数，`runtime=acp` 返回非法 runtime，daemon 不再启动 ACP worker。
-- 删除 Rust ACP runtime/supervisor 和 Python ACP driver/test，避免残留路线误导调用方。
-- PTY worker 默认 `permission-mode auto`；`plan_then_auto` 只在调用方显式请求时启用。
-- route 增加 `worker_kind=utility`、`containment`、prompt submit gate，降低“session 创建了但任务没送达”的误判。
-- hook policy 增加 PTY path enforcement；带 `allowed_paths` 的 PTY route 会拒绝越界写入。
+- 移除 ACP 作为默认 runtime；`runtime=acp` 不再作为当前主线能力。
+- PTY worker 默认 `permission-mode auto`；复杂任务可显式使用 `pty_workflow=plan_then_auto`。
+- route 增加 `worker_kind=utility`、`containment`、prompt submit gate，降低 session 已创建但任务未送达的误判。
+- hook policy 增加 PTY path enforcement，带 `allowed_paths` 的 PTY route 会参与写入边界判断。
 - MCP 工具面收敛为 `agentcall_daemon / board / route / session / session_send / report`。
-- README、about、v3 文档更新为 PTY-first 当前能力说明。
 - 新增 [docs/v3.0-pty-utility-workers.md](docs/v3.0-pty-utility-workers.md)。
 
 ## v2.4.0 - ACP Background Supervisor
 
-- ACP route 曾改为后台 supervisor 模式，默认 30 分钟 hard timeout。
+- ACP route 改为后台 supervisor 模式，默认 30 分钟 hard timeout。
 - 新增 ACP invocation state、heartbeat、checkpoint_due、capacity cap 与 orphan 标记。
-- 该路线在 v3.0 被移除，不再作为当前产品能力。
+- 该路线在 v3.0 被移除出当前产品能力。
 
 ## v2.3.0 - PTY Plan Gate
 
@@ -26,19 +42,18 @@
 
 ## v2.2.0 - ACP SOP Worker Gate
 
-- ACP 曾收敛为 SOP worker，支持 read/report 类模板。
+- ACP 收敛为 SOP worker，首版只允许 read/report 类模板。
 - 新增 template-aware permission policy 与 report contract。
-- 该路线在 v3.0 被移除。
+- 该路线在 v3.0 被移除出当前产品能力。
 
 ## v2.1.0 - ACP Child Lifecycle Binding
 
-- ACP route 曾注入 `AGENTCALL_WRAPPER_SESSION` 并投影 child lifecycle。
+- ACP route 注入 `AGENTCALL_WRAPPER_SESSION` 并投影 child lifecycle。
 - 修正 ACP cwd 与 PTY 一致，均使用 daemon local config 的 `claude_workspace`。
-- 该路线在 v3.0 被移除。
 
 ## v2.0.0 - Codex-Controlled Claude Code Cluster
 
-- AgentCall 定位为让 Codex 指挥 Claude Code 集群协同工作的本地控制面。
+- AgentCall 定位为让 Codex 指挥 Claude Code 集群协作的本地控制面。
 - README 改为产品说明，明确 route-first MCP、hook-aware binding、file claim、readable wrapper 和 daemon single-writer。
 
 ## v0.8.1 - Stable MCP Bridge
@@ -58,8 +73,8 @@
 
 ## v0.7 - Readable Wrapper + Low-Friction Codex Control
 
-- PTY 输出拆为 `raw_output`、`clean_output`、`llm_summary`。
-- 修复 UTF-8 chunk 边界解码并新增 `decode_health`。
+- PTY 输出拆成 `raw_output`、`clean_output`、`llm_summary`。
+- 修复 UTF-8 chunk 边界解码，新增 `decode_health`。
 
 ## v0.6.1 - Close Daemon Single-Writer Gap
 

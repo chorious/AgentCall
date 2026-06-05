@@ -1,27 +1,23 @@
 # AgentCall
 
-当前版本：`v3.0.0`
+当前版本：`v4.0.0`
 
-AgentCall 是一个本地多 Agent 协作控制面，用来让 **Codex 指挥 Claude Code 集群协同工作**。v3.0 把产品面收敛为 PTY-first：daemon 负责拉起受控 Claude Code PTY utility worker，Codex 通过 board、route、session、report 低成本地派工、观察、追问和验收。
+AgentCall 是一个本地多 Agent 协作控制面，目标是让 **Codex 指挥 Claude Code PTY worker 集群** 完成工程协作。Codex 负责拆分、监督、验收和整合；Claude Code worker 负责执行清晰边界内的实现、检查、报告等任务。
+
+v4.0 的重点是 **plugin-provided MCP**：AgentCall 不再只依赖用户级 `~/.codex/config.toml` 裸 MCP 配置，而是提供一个 Codex plugin，让 MCP server 和使用说明一起随插件加载，降低不同 Codex session / CODEX_HOME 下工具不注入的问题。
 
 ## 产品特点
 
-- **Codex 主管，Claude Code 执行**：Codex 不直接长时间盯 raw terminal，而是通过 AgentCall board 和 session summary 管理多个 worker。
-- **PTY-first**：`agentcall_route(runtime=auto|pty)` 只启动 Claude Code PTY utility worker。`runtime=acp` 在 v3.0 已移除，不再是可用 runtime。
-- **默认 auto mode**：普通 utility worker 使用 `claude --permission-mode auto`。遇到不清楚或高风险任务时，调用方可显式请求 `pty_workflow=plan_then_auto`。
-- **Plan gate 可选**：plan workflow 会让 Claude Code 先产出计划并等待批准，Codex 可用 `approve_plan`、`revise_plan`、`start_auto` 继续控制。
-- **Hooks 绑定状态**：Claude/Codex hooks POST 到 daemon `/api/hooks/ingest`，并通过 `AGENTCALL_WRAPPER_SESSION` 绑定 wrapper session 与 Claude hook session。
-- **Readable wrapper**：daemon 维护 raw output、clean output、llm summary 三层输出；Codex 默认读取 compact board 和 summary。
-- **Patience contract**：route/session summary 会返回 `suggested_wait_seconds`、`do_not_retry_before_seconds`、`last_progress_age_seconds` 和 `patience_hint`，提醒 Codex 把 PTY worker 当作异步后台工作，而不是同步函数调用。
-- **Daemon single-writer**：live events、claims、sessions、bindings、routes、summary 都由 Rust daemon 统一写入。
+- **Codex 主控，Claude Code 执行**：Codex 通过 AgentCall board、route、session、report 管理多个 Claude Code worker。
+- **PTY-first**：默认使用 Claude Code PTY utility worker，保留人类可视化和 handoff 能力。
+- **Plan gate 可选**：复杂任务可以先走 plan mode，确认后切到 auto mode；默认 utility worker 走 auto，Codex 可显式要求 plan。
+- **Daemon single-writer**：live events、claims、sessions、bindings、routes、summary 由 Rust daemon 统一写入。
+- **Hook-aware 状态**：Claude/Codex hooks 写入 daemon，summary 优先使用结构化 hook/report 状态，TUI 只做辅助摘要。
+- **Readable wrapper**：daemon 维护 raw output、clean output、llm summary，Codex 默认读取紧凑状态。
+- **Patience contract**：summary 提供 wait/retry 提示，减少 Codex 误判 worker 过慢。
+- **Plugin-provided MCP**：v4.0 新增 repo 内 Codex plugin，解决裸 MCP 配置在 Codex Desktop / background thread 中不稳定加载的问题。
 
-## 为什么移除 ACP
-
-ACP 曾经用于 bounded child invocation，但在当前实战中存在三类问题：Codex App 原生侧栏不可见、子智能体生命周期投影不稳定、权限/进度体验难以确认。v3.0 选择先把 Claude Code PTY 集群协作做稳定，ACP 相关 Rust runtime、supervisor 和 Python driver 已从当前实现中删除。
-
-复杂任务、长任务、并行 review、文件实现修改都走 PTY utility worker。需要先计划的任务使用 `pty_workflow=plan_then_auto`。
-
-## 快速启动
+## 快速开始
 
 构建 Rust 组件：
 
@@ -43,7 +39,7 @@ Copy-Item config\agentcall.example.json config\agentcall.local.json
 }
 ```
 
-`config\agentcall.local.json` 不提交到 git。`claude_workspace` 是 Claude Code PTY 的强制启动 cwd，也是 hooks 绑定的基础。route 请求里的 `workspace` 只表示任务目标，不决定 Claude Code 进程启动目录。
+`claude_workspace` 是 Claude Code PTY 的强制启动 cwd，也是 hook binding 的基础。route 请求中的 `workspace` 表示任务目标目录，不决定 Claude Code 进程 cwd。
 
 启动 daemon：
 
@@ -71,16 +67,39 @@ python scripts\install_claude_hooks.py --root E:\Project\AgentCall
 python scripts\install_codex_hooks.py --root E:\Project\AgentCall
 ```
 
-Hooks 行为：
+Hook 行为：
 
-- `PreToolUse` / `PostToolUse` / `UserPromptSubmit` / `Notification` / `Stop` / `SubagentStop` 都会提交到 daemon。
-- `Stop` 是普通 turn end，不当作 checkpoint。
+- `PreToolUse` / `PostToolUse` / `UserPromptSubmit` / `Notification` / `Stop` / `SubagentStop` 都写入 daemon。
+- `Stop` 是普通 turn end，不作为 checkpoint。
 - permission notification 保留为 `needs_permission`。
-- 没有可靠 wrapper binding 的 hook 标记为 `unbound`，不靠 cwd、PID、窗口标题或启动顺序猜测归属。
+- 无可靠 wrapper binding 的 hook 标记为 `unbound`，不靠 cwd、PID、窗口标题或启动顺序猜归属。
 
-## MCP 工具
+## MCP / Plugin
 
-当前推荐工具面：
+v4.0 提供 repo 内插件：
+
+```text
+plugins/agentcall/
+  .codex-plugin/plugin.json
+  .mcp.json
+  skills/agentcall/SKILL.md
+```
+
+注册本地 marketplace：
+
+```powershell
+codex plugin marketplace add E:\Project\AgentCall
+```
+
+安装插件：
+
+```powershell
+codex plugin add agentcall@personal
+```
+
+安装后请完整重启 Codex Desktop，再新开 Codex thread。仅在运行中的 Desktop 里新建线程，可能不会刷新 plugin-provided MCP 工具面。
+
+重启后，AgentCall 插件应提供 MCP server 和 skill guidance。当前推荐工具面：
 
 ```text
 agentcall_daemon
@@ -93,12 +112,12 @@ agentcall_report
 
 典型流程：
 
-1. `agentcall_daemon(action=start)` 确保 daemon 正在运行。
+1. `agentcall_daemon(action=start)` 确认 daemon 正常。
 2. `agentcall_board(view=compact, filter=attention)` 查看需要介入的 worker。
-3. `agentcall_route(mode=start, runtime=auto, objective=..., allowed_paths=..., acceptance_criteria=...)` 启动 PTY utility worker。
-4. 等待 route 返回的 `suggested_wait_seconds`，再用 `agentcall_session(name=..., include=["summary"])` 查看紧凑状态。
+3. `agentcall_route(mode=start, runtime=auto|pty, objective=..., allowed_paths=..., acceptance_criteria=...)` 启动 PTY utility worker。
+4. `agentcall_session(name=..., include=["summary"])` 查看紧凑状态。
 5. `agentcall_session_send(action=continue|request_report|revise_plan|approve_plan|start_auto)` 控制 worker。
-6. `agentcall_report(action=request|accept)` 请求或接受报告。
+6. `agentcall_report(action=request|accept)` 请求或验收报告。
 
 ## 常用 API
 
@@ -125,11 +144,13 @@ POST /api/hooks/ingest
 cargo test --workspace
 python -m pytest -q
 python -m compileall scripts src
+python C:\Users\MUSHI\.codex\skills\.system\plugin-creator\scripts\validate_plugin.py E:\Project\AgentCall\plugins\agentcall
 ```
 
 ## 文档
 
 - [CHANGELOG](CHANGELOG.md)
-- [文档索引](docs/README.md)
+- [docs/README.md](docs/README.md)
+- [v4.0 Plugin Provided MCP](docs/v4.0-plugin-provided-mcp.md)
 - [v3.0 PTY Utility Workers](docs/v3.0-pty-utility-workers.md)
 - [MCP transport recovery](docs/mcp-transport-recovery.md)

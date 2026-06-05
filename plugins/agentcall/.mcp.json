@@ -1,0 +1,15 @@
+{
+  "mcpServers": {
+    "agentcall": {
+      "enabled": true,
+      "command": "E:\\Project\\AgentCall\\target\\debug\\agentcall-mcp.exe",
+      "args": [
+        "--workspace",
+        "E:\\Project\\AgentCall"
+      ],
+      "startup_timeout_sec": 120,
+      "tool_timeout_sec": 120,
+      "default_tools_approval_mode": "auto"
+    }
+  }
+}

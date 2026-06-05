@@ -1,0 +1,27 @@
+{
+  "name": "agentcall",
+  "version": "4.0.0",
+  "description": "AgentCall coordination tools for Codex-driven Claude Code PTY workers.",
+  "author": {
+    "name": "MUSHI"
+  },
+  "skills": "./skills/",
+  "interface": {
+    "displayName": "AgentCall",
+    "shortDescription": "Coordinate Claude Code PTY workers from Codex.",
+    "longDescription": "AgentCall provides MCP tools and guidance for supervising daemon-backed Claude Code worker sessions from Codex.",
+    "developerName": "MUSHI",
+    "category": "Productivity",
+    "capabilities": [
+      "MCP",
+      "Developer Tools",
+      "Automation"
+    ],
+    "defaultPrompt": [
+      "Inspect the AgentCall board.",
+      "Start a utility PTY worker.",
+      "Review AgentCall reports."
+    ]
+  },
+  "mcpServers": "./.mcp.json"
+}
