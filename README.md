@@ -110,6 +110,8 @@ agentcall_session_send
 agentcall_report
 ```
 
+注意：`tool_search agentcall` 可能返回 0，这是已观察到的假阴性。验收 AgentCall MCP 是否可用，应直接尝试 `agentcall_daemon(action="status")`。
+
 典型流程：
 
 1. `agentcall_daemon(action=start)` 确认 daemon 正常。
