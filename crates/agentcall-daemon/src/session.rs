@@ -343,6 +343,41 @@ pub(crate) fn write_input(state: &AppState, name: &str, req: InputRequest) -> Re
     Ok(())
 }
 
+pub(crate) fn interrupt_session(
+    state: &AppState,
+    name: &str,
+    redirect_text: Option<String>,
+) -> Result<(), String> {
+    let session = get_session(state, name).ok_or_else(|| "session not found".to_string())?;
+    {
+        let mut writer = session.writer.lock().unwrap();
+        writer.write_all(b"\x1b").map_err(|err| err.to_string())?;
+        writer.flush().map_err(|err| err.to_string())?;
+    }
+    append_agent_event(
+        state,
+        "pty.interrupt_sent",
+        "Interrupt sent to PTY session.",
+        serde_json::json!({
+            "name": name,
+            "control": "esc",
+            "warning": "Use interrupt only when the worker is drifting, doing the wrong thing, or must be reclaimed immediately."
+        }),
+    );
+    if let Some(text) = redirect_text.filter(|value| !value.trim().is_empty()) {
+        thread::sleep(Duration::from_millis(250));
+        write_input(
+            state,
+            name,
+            InputRequest {
+                text,
+                enter: Some(true),
+            },
+        )?;
+    }
+    Ok(())
+}
+
 pub(crate) fn resize_session(
     state: &AppState,
     name: &str,
@@ -421,7 +456,8 @@ mod tests {
             Some("missing claude_workspace".to_string()),
         );
         let requested = PathBuf::from("E:/GameProject/GGMYS");
-        let err = resolve_session_cwd(&state, &["claude".to_string()], Some(&requested)).unwrap_err();
+        let err =
+            resolve_session_cwd(&state, &["claude".to_string()], Some(&requested)).unwrap_err();
         assert!(err.contains("missing claude_workspace"));
     }
 

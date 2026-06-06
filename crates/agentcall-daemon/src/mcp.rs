@@ -1,9 +1,10 @@
+use crate::hooks::queue_supervisor_instruction;
 use crate::routes::{
     RouteRequest, checkpoint_session, handle_route, patch_route_record, route_for_wrapper_session,
 };
-use crate::session::{InputRequest, get_session, write_input};
+use crate::session::{InputRequest, get_session, interrupt_session, write_input};
 use crate::state::{AppState, append_agent_event};
-use crate::summary::{board_state, clean_session_output, session_summary};
+use crate::summary::{board_state, clean_session_output, session_plan_artifact, session_summary};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use std::sync::Arc;
@@ -70,7 +71,7 @@ pub(crate) fn mcp_tools() -> Vec<Value> {
                 "properties": {
                     "root": {"type": "string"},
                     "name": {"type": "string"},
-                    "include": {"type": "array", "items": {"type": "string", "enum": ["summary", "clean_tail"]}, "default": ["summary"]}
+                    "include": {"type": "array", "items": {"type": "string", "enum": ["summary", "clean_tail", "plan"]}, "default": ["summary"]}
                 },
                 "required": ["name"],
                 "additionalProperties": false
@@ -84,7 +85,7 @@ pub(crate) fn mcp_tools() -> Vec<Value> {
                 "properties": {
                     "root": {"type": "string"},
                     "name": {"type": "string"},
-                    "action": {"type": "string", "enum": ["send", "continue", "stop", "request_report", "revise_plan", "approve_plan", "start_auto"], "default": "send"},
+                    "action": {"type": "string", "enum": ["send", "continue", "stop", "request_report", "revise_plan", "approve_plan", "start_auto", "interrupt"], "default": "send"},
                     "text": {"type": "string"},
                     "enter": {"type": "boolean", "default": true}
                 },
@@ -161,15 +162,23 @@ fn mcp_session(state: &AppState, args: &Value) -> Result<Value, String> {
     let session = get_session(state, name).ok_or_else(|| "session not found".to_string())?;
     let summary = session_summary(state, &session);
     let include = string_array(args, "include");
-    if include.iter().any(|item| item == "clean_tail") {
-        Ok(json!({
+    let include_clean_tail = include.iter().any(|item| item == "clean_tail");
+    let include_plan = include.iter().any(|item| item == "plan");
+    if include_clean_tail || include_plan {
+        let mut response = json!({
             "summary": summary,
-            "clean_tail": {
-                "session": name,
-                "clean_output": clean_session_output(&session),
-                "decode_health": session.decode_health.lock().unwrap().clone()
-            }
-        }))
+        });
+        if include_clean_tail {
+            response["clean_tail"] = json!({
+                    "session": name,
+                    "clean_output": clean_session_output(&session),
+                    "decode_health": session.decode_health.lock().unwrap().clone()
+            });
+        }
+        if include_plan {
+            response["plan"] = session_plan_artifact(state, &session, true);
+        }
+        Ok(response)
     } else {
         Ok(summary)
     }
@@ -180,6 +189,16 @@ fn mcp_session_send(state: &AppState, args: &Value) -> Result<Value, String> {
     let action = args.get("action").and_then(Value::as_str).unwrap_or("send");
     if action == "stop" {
         return crate::session::stop_session(state, name).map(|_| json!({"ok": true}));
+    }
+    if action == "interrupt" {
+        let text = args.get("text").and_then(Value::as_str).map(str::to_string);
+        interrupt_session(state, name, text)?;
+        return Ok(json!({
+            "ok": true,
+            "action": "interrupt",
+            "status": "interrupt_sent",
+            "warning": "Use interrupt only when the worker is drifting, doing the wrong thing, or must be reclaimed immediately."
+        }));
     }
     if action == "approve_plan" || action == "start_auto" {
         if !is_plan_then_auto_session(state, name) {
@@ -214,6 +233,44 @@ fn mcp_session_send(state: &AppState, args: &Value) -> Result<Value, String> {
         });
     if text.is_empty() {
         return Err("missing text for send action".to_string());
+    }
+    let session = get_session(state, name).ok_or_else(|| "session not found".to_string())?;
+    let process_status = session.status.lock().unwrap().clone();
+    if process_status != "running" {
+        return Ok(json!({
+            "ok": false,
+            "status": "session_not_accepting_input",
+            "process_status": process_status,
+            "hint": "The PTY process is not running. Inspect session summary/report before sending more input."
+        }));
+    }
+    let summary = session_summary(state, &session);
+    let liveness_status = summary
+        .get("liveness_status")
+        .and_then(Value::as_str)
+        .unwrap_or("unknown");
+    let attention_status = summary
+        .get("attention_status")
+        .and_then(Value::as_str)
+        .unwrap_or("none");
+    if attention_status == "needs_permission" {
+        return Ok(json!({
+            "ok": false,
+            "status": "blocked_by_permission_prompt",
+            "liveness_status": liveness_status,
+            "attention_status": attention_status,
+            "hint": "Claude Code is showing a permission prompt. Do not send natural-language input into the menu; resolve the permission prompt or use action=interrupt only to reclaim a drifting worker."
+        }));
+    }
+    if liveness_status == "working" && attention_status == "none" {
+        let queued = queue_supervisor_instruction(state, name, action, &text)?;
+        return Ok(json!({
+            "ok": true,
+            "status": "queued_until_next_hook_injection",
+            "delivery": "PostToolBatch_or_next_context_hook",
+            "instruction": queued,
+            "hint": "Claude Code does not reliably accept new prompts mid-turn. AgentCall queued this instruction for hook additionalContext instead of blindly typing into the PTY."
+        }));
     }
     write_input(
         state,

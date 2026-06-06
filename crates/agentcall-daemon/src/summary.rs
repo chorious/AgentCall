@@ -1,9 +1,10 @@
-use crate::hooks::runtime_bindings_state;
+use crate::hooks::{pending_supervisor_instructions_state, runtime_bindings_state};
 use crate::routes::routes_state;
 use crate::session::{Session, list_sessions};
 use crate::state::{AppState, read_events, read_json_file};
 use crate::terminal::{clean_terminal_text, tail_lines};
 use crate::util::now_ms;
+use serde_json::Value;
 use std::fs;
 use std::path::Path;
 use std::sync::Arc;
@@ -294,6 +295,9 @@ pub(crate) fn session_summary(state: &AppState, session: &Arc<Session>) -> serde
         .and_then(|value| value.get("last_tool"))
         .cloned()
         .unwrap_or(serde_json::Value::Null);
+    let plan = lightweight_plan_from_route(route_result.as_ref());
+    let pending_supervisor_instructions =
+        pending_supervisor_instruction_count(state, &session.name);
     let mut payload = serde_json::json!({
         "session": session.name,
         "project": state.workspace.file_name().and_then(|name| name.to_str()).unwrap_or("workspace"),
@@ -351,9 +355,32 @@ pub(crate) fn session_summary(state: &AppState, session: &Arc<Session>) -> serde
         "report": null,
         "needs_user_input": needs_user_input,
         "warnings": [],
-        "conflicts": []
+        "conflicts": [],
+        "pending_supervisor_instructions": pending_supervisor_instructions
     });
     if let Some(object) = payload.as_object_mut() {
+        object.insert(
+            "plan_ready".to_string(),
+            plan.get("ready")
+                .cloned()
+                .unwrap_or(serde_json::Value::Bool(false)),
+        );
+        object.insert(
+            "plan_source".to_string(),
+            plan.get("source")
+                .cloned()
+                .unwrap_or(serde_json::Value::Null),
+        );
+        object.insert(
+            "plan_path".to_string(),
+            plan.get("path").cloned().unwrap_or(serde_json::Value::Null),
+        );
+        object.insert(
+            "plan_excerpt".to_string(),
+            plan.get("excerpt")
+                .cloned()
+                .unwrap_or(serde_json::Value::Null),
+        );
         object.insert("patience_hint".to_string(), patience["hint"].clone());
         object.insert("patience_status".to_string(), patience["status"].clone());
         object.insert(
@@ -374,6 +401,25 @@ pub(crate) fn session_summary(state: &AppState, session: &Arc<Session>) -> serde
         );
     }
     payload
+}
+
+fn pending_supervisor_instruction_count(state: &AppState, wrapper_session: &str) -> usize {
+    pending_supervisor_instructions_state(state)
+        .get(wrapper_session)
+        .and_then(serde_json::Value::as_array)
+        .map(|items| items.len())
+        .unwrap_or(0)
+}
+
+pub(crate) fn session_plan_artifact(
+    state: &AppState,
+    session: &Arc<Session>,
+    include_content: bool,
+) -> serde_json::Value {
+    let bindings = runtime_bindings_state(state);
+    let binding = binding_for_wrapper(&bindings, &session.name);
+    let clean_output = clean_session_output(session);
+    plan_artifact_from_binding(&binding, &clean_output, include_content)
 }
 
 pub(crate) fn clean_session_output(session: &Arc<Session>) -> String {
@@ -723,6 +769,228 @@ fn last_error(text: &str) -> Option<String> {
         .map(|line| line.chars().take(240).collect())
 }
 
+fn plan_artifact_from_binding(
+    binding: &Option<Value>,
+    clean_output: &str,
+    include_content: bool,
+) -> Value {
+    let transcript_path = binding
+        .as_ref()
+        .and_then(|value| value.get("transcript_path"))
+        .and_then(Value::as_str);
+    let mut plan_path: Option<String> = None;
+    let mut plan_exists = false;
+    let mut plan_mode_seen = false;
+    let mut exit_plan_mode_seen = false;
+    let mut allowed_prompts = Value::Null;
+    let mut transcript_plan_text: Option<String> = None;
+    let mut source = "none".to_string();
+    let mut content: Option<String> = None;
+
+    if let Some(path) = transcript_path {
+        let transcript = Path::new(path);
+        if let Ok(text) = fs::read_to_string(transcript) {
+            for line in text.lines() {
+                let Ok(value) = serde_json::from_str::<Value>(line) else {
+                    continue;
+                };
+                if let Some(attachment) = value.get("attachment") {
+                    if attachment.get("type").and_then(Value::as_str) == Some("plan_mode") {
+                        plan_mode_seen = true;
+                        if let Some(path) = attachment.get("planFilePath").and_then(Value::as_str) {
+                            plan_path = Some(path.to_string());
+                        }
+                    }
+                }
+                if value
+                    .get("type")
+                    .and_then(Value::as_str)
+                    .is_some_and(|kind| kind != "assistant")
+                {
+                    continue;
+                }
+                let Some(message) = value.get("message") else {
+                    continue;
+                };
+                if message.get("role").and_then(Value::as_str) != Some("assistant") {
+                    continue;
+                }
+                if let Some(items) = message.get("content").and_then(Value::as_array) {
+                    for item in items {
+                        if item.get("type").and_then(Value::as_str) == Some("tool_use")
+                            && item.get("name").and_then(Value::as_str) == Some("ExitPlanMode")
+                        {
+                            exit_plan_mode_seen = true;
+                            allowed_prompts = item
+                                .get("input")
+                                .and_then(|input| input.get("allowedPrompts"))
+                                .cloned()
+                                .unwrap_or(Value::Null);
+                            if let Some(text) = extract_plan_text_from_value(item.get("input")) {
+                                transcript_plan_text = Some(text);
+                                source = "exit_plan_mode".to_string();
+                            }
+                        }
+                        if let Some(text) = item.get("text").and_then(Value::as_str) {
+                            if (plan_mode_seen || exit_plan_mode_seen) && looks_like_plan_text(text)
+                            {
+                                transcript_plan_text = Some(text.to_string());
+                                if source == "none" {
+                                    source = "transcript_text".to_string();
+                                }
+                            }
+                        }
+                    }
+                } else if let Some(text) = message.get("content").and_then(Value::as_str) {
+                    if (plan_mode_seen || exit_plan_mode_seen) && looks_like_plan_text(text) {
+                        transcript_plan_text = Some(text.to_string());
+                        if source == "none" {
+                            source = "transcript_text".to_string();
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    if let Some(path) = plan_path.as_deref() {
+        let path_ref = Path::new(path);
+        if path_ref.exists() {
+            plan_exists = true;
+            if let Ok(text) = fs::read_to_string(path_ref) {
+                if !text.trim().is_empty() {
+                    source = "plan_file".to_string();
+                    content = Some(text);
+                }
+            }
+        }
+    }
+    if content.is_none() {
+        content = transcript_plan_text;
+    }
+    if content.is_none()
+        && (plan_mode_seen || exit_plan_mode_seen)
+        && looks_like_plan_text(clean_output)
+    {
+        source = "clean_tail".to_string();
+        content = Some(clean_output.to_string());
+    }
+
+    let excerpt = content
+        .as_deref()
+        .map(|text| clip_chars(text.trim(), 2400))
+        .unwrap_or_default();
+    let ready = exit_plan_mode_seen || content.is_some() || plan_exists;
+    let mut value = serde_json::json!({
+        "ready": ready,
+        "source": source,
+        "path": plan_path,
+        "path_exists": plan_exists,
+        "transcript_path": transcript_path,
+        "excerpt": excerpt,
+        "allowed_prompts": allowed_prompts
+    });
+    if include_content {
+        if let Some(object) = value.as_object_mut() {
+            object.insert(
+                "content".to_string(),
+                content
+                    .map(|text| Value::String(clip_chars(&text, 20000)))
+                    .unwrap_or(Value::Null),
+            );
+        }
+    }
+    value
+}
+
+fn lightweight_plan_from_route(route_result: Option<&Value>) -> Value {
+    let Some(result) = route_result else {
+        return empty_plan_artifact();
+    };
+    let is_plan_workflow = result.get("pty_workflow").and_then(Value::as_str)
+        == Some("plan_then_auto")
+        || result.get("permission_mode").and_then(Value::as_str) == Some("plan")
+        || result.get("plan_session_name").is_some();
+    if !is_plan_workflow {
+        return empty_plan_artifact();
+    }
+    let workflow_status = result.get("workflow_status").and_then(Value::as_str);
+    serde_json::json!({
+        "ready": workflow_status == Some("plan_ready"),
+        "source": if workflow_status == Some("plan_ready") { "route" } else { "none" },
+        "path": null,
+        "path_exists": false,
+        "transcript_path": null,
+        "excerpt": "",
+        "allowed_prompts": null
+    })
+}
+
+fn empty_plan_artifact() -> Value {
+    serde_json::json!({
+        "ready": false,
+        "source": "none",
+        "path": null,
+        "path_exists": false,
+        "transcript_path": null,
+        "excerpt": "",
+        "allowed_prompts": null
+    })
+}
+
+fn extract_plan_text_from_value(value: Option<&Value>) -> Option<String> {
+    let value = value?;
+    for key in ["plan", "plan_text", "content", "text", "summary"] {
+        if let Some(text) = value.get(key).and_then(Value::as_str) {
+            if looks_like_plan_text(text) {
+                return Some(text.to_string());
+            }
+        }
+    }
+    None
+}
+
+fn looks_like_plan_text(text: &str) -> bool {
+    let trimmed = text.trim();
+    if trimmed.chars().count() < 400 {
+        return false;
+    }
+    let lower = trimmed.to_ascii_lowercase();
+    let strong_markers = [
+        "# ",
+        "## ",
+        "verification criteria",
+        "completion criteria",
+        "planned files",
+        "awaiting supervisor",
+    ];
+    let weak_markers = ["goals", "steps", "risks", "acceptance criteria"];
+    let mut strong_score = 0;
+    let mut weak_score = 0;
+    for marker in strong_markers {
+        if lower.contains(marker) {
+            strong_score += 1;
+        }
+    }
+    for marker in weak_markers {
+        if lower.contains(marker) {
+            weak_score += 1;
+        }
+    }
+    if trimmed.contains("计划") {
+        strong_score += 1;
+    }
+    strong_score > 0 && strong_score + weak_score >= 2
+}
+
+fn clip_chars(text: &str, max_chars: usize) -> String {
+    let mut clipped: String = text.chars().take(max_chars).collect();
+    if text.chars().count() > max_chars {
+        clipped.push_str("\n...[truncated]");
+    }
+    clipped
+}
+
 pub(crate) fn stale_claim_count(path: &Path) -> usize {
     let claims = read_json_file(path, serde_json::json!({}));
     claims
@@ -771,6 +1039,126 @@ mod tests {
             vec!["report_v2.0.md", "report_v2.1.md"]
         );
         assert_eq!(last_error(text), None);
+    }
+
+    #[test]
+    fn plan_text_detection_rejects_prompt_but_accepts_presented_plan() {
+        let prompt = "Plan-only smoke test for AgentCall wrapper plan extraction. Do not modify files. Produce a short plan with goal, steps, risks, and acceptance criteria, then use ExitPlanMode and wait for supervisor approval. This is only to verify AgentCall can extract Claude Code plan output through agentcall_session include=plan.\n".repeat(5);
+        assert!(!looks_like_plan_text(&prompt));
+
+        let plan = "# GGMYS v0.4 Frontend Log / Feedback Plan\n\n## Goals\nSeparate player-facing gameplay log from technical diagnostics log.\n\n## Planned Files\n- client/scripts/LoginScene.cs\n\n## Risks\nExisting smoke tests may expect raw event tags. Existing UI update hooks may need coordination with runtime and equipment workers.\n\n## Verification Criteria\nC# build passes and manual playthrough confirms log layers. Battle, equip, refresh, and technical diagnostics remain readable.\n\nAwaiting supervisor approve_plan or start_auto signal before writing files.";
+        assert!(looks_like_plan_text(plan));
+    }
+
+    #[test]
+    fn plan_artifact_extracts_presented_plan_from_transcript_without_plan_file() {
+        let root = std::env::temp_dir().join(format!(
+            "agentcall-plan-transcript-test-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        let transcript = root.join("session.jsonl");
+        let plan_path = root.join("missing-plan.md");
+        let plan = "# GGMYS v0.4 Frontend Log / Feedback Plan\n\n## Goals\nSeparate player-facing gameplay log from technical diagnostics log.\n\n## Planned Files\n- client/scripts/LoginScene.cs\n\n## Risks\nExisting smoke tests may expect raw event tags. Existing UI update hooks may need coordination with runtime and equipment workers.\n\n## Verification Criteria\nC# build passes and manual playthrough confirms log layers. Battle, equip, refresh, and technical diagnostics remain readable.\n\nAwaiting supervisor approve_plan or start_auto signal before writing files.";
+        let lines = vec![
+            serde_json::json!({
+                "type": "attachment",
+                "attachment": {
+                    "type": "plan_mode",
+                    "planFilePath": plan_path
+                }
+            }),
+            serde_json::json!({
+                "type": "assistant",
+                "message": {
+                    "role": "assistant",
+                    "content": [{
+                        "type": "text",
+                        "text": plan
+                    }]
+                }
+            }),
+        ];
+        fs::write(
+            &transcript,
+            lines
+                .into_iter()
+                .map(|line| line.to_string())
+                .collect::<Vec<_>>()
+                .join("\n"),
+        )
+        .unwrap();
+        let binding = Some(serde_json::json!({
+            "transcript_path": transcript,
+        }));
+        let artifact = plan_artifact_from_binding(&binding, "", true);
+        assert_eq!(artifact["ready"], true);
+        assert_eq!(artifact["source"], "transcript_text");
+        assert_eq!(artifact["path_exists"], false);
+        assert!(
+            artifact["content"]
+                .as_str()
+                .unwrap()
+                .contains("Frontend Log / Feedback Plan")
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn plan_artifact_ignores_long_markdown_without_plan_signal() {
+        let root = std::env::temp_dir().join(format!(
+            "agentcall-non-plan-transcript-test-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        let transcript = root.join("session.jsonl");
+        let long_reply = "# Architecture Notes\n\n## Goals\nThis is a long ordinary assistant answer discussing goals, steps, risks, and acceptance criteria. It is not a Claude Code plan-mode artifact and should not be promoted to plan_ready. ".repeat(8);
+        fs::write(
+            &transcript,
+            serde_json::json!({
+                "type": "assistant",
+                "message": {
+                    "role": "assistant",
+                    "content": [{
+                        "type": "text",
+                        "text": long_reply
+                    }]
+                }
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let binding = Some(serde_json::json!({
+            "transcript_path": transcript,
+        }));
+        let artifact = plan_artifact_from_binding(&binding, "", true);
+        assert_eq!(artifact["ready"], false);
+        assert_eq!(artifact["source"], "none");
+        assert_eq!(artifact["content"], serde_json::Value::Null);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn lightweight_plan_summary_uses_route_without_transcript_scan() {
+        let plan_running = serde_json::json!({
+            "pty_workflow": "plan_then_auto",
+            "workflow_status": "plan_running",
+            "permission_mode": "plan"
+        });
+        let artifact = lightweight_plan_from_route(Some(&plan_running));
+        assert_eq!(artifact["ready"], false);
+        assert_eq!(artifact["source"], "none");
+
+        let plan_ready = serde_json::json!({
+            "pty_workflow": "plan_then_auto",
+            "workflow_status": "plan_ready",
+            "permission_mode": "plan"
+        });
+        let artifact = lightweight_plan_from_route(Some(&plan_ready));
+        assert_eq!(artifact["ready"], true);
+        assert_eq!(artifact["source"], "route");
     }
 
     #[test]

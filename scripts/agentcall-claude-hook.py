@@ -28,7 +28,7 @@ def main() -> int:
 
     result = ingest(root, event, payload)
     decision = result.get("decision") or {}
-    if event in {"SessionStart", "UserPromptSubmit"} and result.get("context_injection"):
+    if event in {"SessionStart", "UserPromptSubmit", "PostToolBatch"} and result.get("context_injection"):
         print(
             json.dumps(
                 {

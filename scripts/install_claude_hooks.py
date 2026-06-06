@@ -11,6 +11,7 @@ EVENTS = [
     ("UserPromptSubmit", None),
     ("PreToolUse", "*"),
     ("PostToolUse", "*"),
+    ("PostToolBatch", None),
     ("Notification", None),
     ("Stop", None),
     ("SubagentStop", None),

@@ -1,4 +1,4 @@
-﻿use crate::session::{InputRequest, StartRequest, start_session, write_input};
+use crate::session::{InputRequest, StartRequest, start_session, write_input};
 use crate::state::{AppState, append_agent_event_locked, read_json_file, write_json_file};
 use crate::util::{now_ms, safe_name};
 use serde::{Deserialize, Serialize};
@@ -929,5 +929,3 @@ mod tests {
         std::env::temp_dir().join(format!("agentcall-routes-{name}-{nonce}"))
     }
 }
-
-

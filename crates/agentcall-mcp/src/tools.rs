@@ -94,7 +94,7 @@ fn session_tool() -> Value {
             "properties": {
                 "root": {"type": "string"},
                 "name": {"type": "string"},
-                "include": {"type": "array", "items": {"type": "string", "enum": ["summary", "clean_tail"]}, "default": ["summary"]}
+                "include": {"type": "array", "items": {"type": "string", "enum": ["summary", "clean_tail", "plan"]}, "default": ["summary"]}
             },
             "required": ["name"],
             "additionalProperties": false
@@ -111,7 +111,7 @@ fn session_send_tool() -> Value {
             "properties": {
                 "root": {"type": "string"},
                 "name": {"type": "string"},
-                "action": {"type": "string", "enum": ["send", "continue", "stop", "request_report", "revise_plan", "approve_plan", "start_auto"], "default": "send"},
+                "action": {"type": "string", "enum": ["send", "continue", "stop", "request_report", "revise_plan", "approve_plan", "start_auto", "interrupt"], "default": "send"},
                 "text": {"type": "string"},
                 "enter": {"type": "boolean", "default": true}
             },

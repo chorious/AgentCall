@@ -18,7 +18,11 @@ pub(crate) struct AppState {
 }
 
 impl AppState {
-    pub(crate) fn new(workspace: PathBuf, config: LocalConfig, config_error: Option<String>) -> Self {
+    pub(crate) fn new(
+        workspace: PathBuf,
+        config: LocalConfig,
+        config_error: Option<String>,
+    ) -> Self {
         let next_event_seq = next_event_number_from_log(&workspace);
         let next_seq = next_runtime_seq_from_state(&workspace);
         Self {
@@ -179,10 +183,7 @@ fn truncate_tool_response_field(
     if original_bytes <= TOOL_OUTPUT_INLINE_LIMIT {
         return Ok(());
     }
-    let artifact_dir = agent_dir
-        .join("logs")
-        .join("artifacts")
-        .join("PostToolUse");
+    let artifact_dir = agent_dir.join("logs").join("artifacts").join("PostToolUse");
     fs::create_dir_all(&artifact_dir).map_err(|err| err.to_string())?;
     let artifact_path = artifact_dir.join(format!("{event_id}-{field}.txt"));
     fs::write(&artifact_path, &original).map_err(|err| err.to_string())?;
@@ -368,7 +369,8 @@ mod tests {
         .unwrap();
 
         let events_text = fs::read_to_string(agent_dir.join("events.ndjson")).unwrap();
-        let event: serde_json::Value = serde_json::from_str(events_text.lines().next().unwrap()).unwrap();
+        let event: serde_json::Value =
+            serde_json::from_str(events_text.lines().next().unwrap()).unwrap();
         let stdout = event["data"]["raw"]["tool_response"]["stdout"]
             .as_str()
             .unwrap();
@@ -378,7 +380,10 @@ mod tests {
             .unwrap();
         assert!(Path::new(artifact).exists());
 
-        let hook_index = agent_dir.join("logs").join("hooks").join("PostToolUse.ndjson");
+        let hook_index = agent_dir
+            .join("logs")
+            .join("hooks")
+            .join("PostToolUse.ndjson");
         assert!(hook_index.exists());
         let _ = fs::remove_dir_all(root);
     }

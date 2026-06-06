@@ -53,6 +53,43 @@ pub(crate) fn runtime_bindings_state(state: &AppState) -> serde_json::Value {
     )
 }
 
+pub(crate) fn pending_supervisor_instructions_state(state: &AppState) -> serde_json::Value {
+    read_json_file(
+        &state
+            .workspace
+            .join(".agentcall")
+            .join("state")
+            .join("pending_supervisor_instructions.json"),
+        serde_json::json!({}),
+    )
+}
+
+pub(crate) fn queue_supervisor_instruction(
+    state: &AppState,
+    wrapper_session: &str,
+    action: &str,
+    text: &str,
+) -> Result<serde_json::Value, String> {
+    let _guard = state.state_writer.lock().unwrap();
+    let agent_dir = state.workspace.join(".agentcall");
+    let state_dir = agent_dir.join("state");
+    fs::create_dir_all(&state_dir).map_err(|err| err.to_string())?;
+    let queued = queue_supervisor_instruction_locked(&state_dir, wrapper_session, action, text)?;
+    append_agent_event_locked(
+        state,
+        &agent_dir,
+        "supervisor_instruction.queued",
+        "Supervisor instruction queued for hook injection.",
+        serde_json::json!({
+            "wrapper_session": wrapper_session,
+            "action": action,
+            "delivery": "next_hook_context_injection",
+            "instruction_id": queued.get("id").cloned().unwrap_or(serde_json::Value::Null)
+        }),
+    )?;
+    Ok(queued)
+}
+
 pub(crate) fn ingest_hook(
     state: &AppState,
     req: HookIngestRequest,
@@ -74,11 +111,6 @@ pub(crate) fn ingest_hook(
         .runtime
         .clone()
         .unwrap_or_else(|| "claude-code-session".to_string());
-    let context_injection = if matches!(req.event.as_str(), "SessionStart" | "UserPromptSubmit") {
-        Some(context_injection(state, &runtime))
-    } else {
-        None
-    };
     let env_wrapper_session = string_field(&payload, &["wrapper_session", "wrapperSession"]);
     let (wrapper_session, binding_source) = upsert_runtime_binding_locked(
         &state_dir,
@@ -90,6 +122,16 @@ pub(crate) fn ingest_hook(
         &status,
         tool_name.as_deref(),
     )?;
+    let context_injection = if is_context_injection_event(&req.event) {
+        Some(context_injection(
+            state,
+            &runtime,
+            &state_dir,
+            wrapper_session.as_deref(),
+        )?)
+    } else {
+        None
+    };
     payload["session_id"] = serde_json::json!(session_id.clone());
     payload["binding_source"] = serde_json::json!(binding_source.clone());
     if let Some(wrapper_session) = &wrapper_session {
@@ -157,15 +199,26 @@ pub(crate) fn ingest_hook(
         "decision": decision,
         "unmatched": unmatched
     });
-    if let Some(context_injection) = context_injection {
+    if let Some(context_injection) = context_injection.filter(|value| !value.trim().is_empty()) {
         response["context_injection"] = serde_json::json!(context_injection);
     }
     Ok(response)
 }
 
-fn context_injection(state: &AppState, runtime: &str) -> String {
-    let state_dir = state.workspace.join(".agentcall").join("state");
-    let sessions = read_json_file(&state_dir.join("active_sessions.json"), serde_json::json!({}));
+fn is_context_injection_event(event: &str) -> bool {
+    matches!(event, "SessionStart" | "UserPromptSubmit" | "PostToolBatch")
+}
+
+fn context_injection(
+    state: &AppState,
+    runtime: &str,
+    state_dir: &Path,
+    wrapper_session: Option<&str>,
+) -> Result<String, String> {
+    let sessions = read_json_file(
+        &state_dir.join("active_sessions.json"),
+        serde_json::json!({}),
+    );
     let claims = read_json_file(&state_dir.join("file_claims.json"), serde_json::json!({}));
     let active_sessions = sessions.as_object().map(|items| items.len()).unwrap_or(0);
     let active_claims = claims
@@ -173,15 +226,52 @@ fn context_injection(state: &AppState, runtime: &str) -> String {
         .map(|items| {
             items
                 .values()
-                .filter(|claim| claim.get("status").and_then(|value| value.as_str()) == Some("active"))
+                .filter(|claim| {
+                    claim.get("status").and_then(|value| value.as_str()) == Some("active")
+                })
                 .count()
         })
         .unwrap_or(0);
     let structured_reports = count_reports(&state.workspace.join(".agentcall"));
-    format!(
+    let mut context = format!(
         "# AgentCall Context\n\n- runtime: {runtime}\n- workspace: {}\n- active_sessions: {active_sessions}\n- active_file_claims: {active_claims}\n- structured_reports: {structured_reports}\n\nAgentCall discipline:\n- Inspect the board before delegation or handoff.\n- Use AgentCall PTY utility workers for child work.\n- Respect allowed_paths and file claims; do not write outside assigned ownership.\n- Require a concise report or exact change summary at lifecycle end.\n- Write review only for drift, blockers, failed validation, or revision.\n",
         state.workspace.display()
-    )
+    );
+    if let Some(wrapper) = wrapper_session {
+        let pending = take_pending_supervisor_instructions_locked(state_dir, wrapper)?;
+        if !pending.is_empty() {
+            let agent_dir = state_dir
+                .parent()
+                .unwrap_or_else(|| Path::new(".agentcall"));
+            append_agent_event_locked(
+                state,
+                agent_dir,
+                "supervisor_instruction.injected",
+                "Queued supervisor instruction injected through hook context.",
+                serde_json::json!({
+                    "wrapper_session": wrapper,
+                    "count": pending.len(),
+                    "delivery": "hook.additionalContext"
+                }),
+            )?;
+            context.push_str("\n# AgentCall Supervisor Update\n\n");
+            context.push_str(
+                "The supervisor sent these instructions while you were busy. Apply them before continuing. If they conflict with current work, stop and report the conflict clearly.\n\n",
+            );
+            for (index, item) in pending.iter().enumerate() {
+                let action = item
+                    .get("action")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("send");
+                let text = item
+                    .get("text")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("");
+                context.push_str(&format!("{}. [{action}] {text}\n", index + 1));
+            }
+        }
+    }
+    Ok(context)
 }
 
 fn count_reports(agent_dir: &Path) -> usize {
@@ -211,6 +301,65 @@ fn count_report_files(path: &Path, count: &mut usize) {
             *count += 1;
         }
     }
+}
+
+fn queue_supervisor_instruction_locked(
+    state_dir: &Path,
+    wrapper_session: &str,
+    action: &str,
+    text: &str,
+) -> Result<serde_json::Value, String> {
+    let path = state_dir.join("pending_supervisor_instructions.json");
+    let mut pending = read_json_file(&path, serde_json::json!({}));
+    if !pending.is_object() {
+        pending = serde_json::json!({});
+    }
+    let id = format!(
+        "instr-{}",
+        chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
+    );
+    let item = serde_json::json!({
+        "id": id,
+        "wrapper_session": wrapper_session,
+        "action": action,
+        "text": text,
+        "status": "pending_hook_injection",
+        "created_at": chrono::Utc::now().to_rfc3339(),
+    });
+    if !pending
+        .get(wrapper_session)
+        .and_then(serde_json::Value::as_array)
+        .is_some()
+    {
+        pending[wrapper_session] = serde_json::json!([]);
+    }
+    pending[wrapper_session]
+        .as_array_mut()
+        .unwrap()
+        .push(item.clone());
+    write_json_file(&path, &pending)?;
+    Ok(item)
+}
+
+fn take_pending_supervisor_instructions_locked(
+    state_dir: &Path,
+    wrapper_session: &str,
+) -> Result<Vec<serde_json::Value>, String> {
+    let path = state_dir.join("pending_supervisor_instructions.json");
+    let mut pending = read_json_file(&path, serde_json::json!({}));
+    if !pending.is_object() {
+        return Ok(vec![]);
+    }
+    let items = pending
+        .get_mut(wrapper_session)
+        .and_then(serde_json::Value::as_array_mut)
+        .map(std::mem::take)
+        .unwrap_or_default();
+    if let Some(object) = pending.as_object_mut() {
+        object.remove(wrapper_session);
+    }
+    write_json_file(&path, &pending)?;
+    Ok(items)
 }
 
 pub(crate) fn append_event_request(state: &AppState, req: EventAppendRequest) -> serde_json::Value {
@@ -662,7 +811,9 @@ fn pty_path_policy_denial(
     if is_write_tool(tool_name) {
         let files = extract_tool_files(payload);
         if files.is_empty() {
-            return Some("PTY path policy denies write tool without explicit file path".to_string());
+            return Some(
+                "PTY path policy denies write tool without explicit file path".to_string(),
+            );
         }
         if files.iter().all(|file| {
             policy
@@ -834,7 +985,9 @@ pub(crate) fn infer_hook_status(event: &str, payload: &serde_json::Value) -> Str
         {
             "plan_ready".to_string()
         }
-        "SessionStart" | "UserPromptSubmit" | "PreToolUse" | "PostToolUse" => "working".to_string(),
+        "SessionStart" | "UserPromptSubmit" | "PreToolUse" | "PostToolUse" | "PostToolBatch" => {
+            "working".to_string()
+        }
         "Notification" => {
             let message = payload
                 .get("message")
@@ -950,10 +1103,12 @@ mod tests {
             },
         )
         .unwrap();
-        assert!(session_start["context_injection"]
-            .as_str()
-            .unwrap()
-            .contains("AgentCall Context"));
+        assert!(
+            session_start["context_injection"]
+                .as_str()
+                .unwrap()
+                .contains("AgentCall Context")
+        );
 
         let pre_tool = ingest_hook(
             &state,
@@ -965,6 +1120,53 @@ mod tests {
         )
         .unwrap();
         assert!(pre_tool.get("context_injection").is_none());
+    }
+
+    #[test]
+    fn post_tool_batch_injects_queued_supervisor_instruction_once() {
+        let state = test_state("pending-instruction");
+        queue_supervisor_instruction(
+            &state,
+            "pty-a",
+            "request_report",
+            "Stop new implementation and write the report.",
+        )
+        .unwrap();
+
+        let first = ingest_hook(
+            &state,
+            HookIngestRequest {
+                event: "PostToolBatch".to_string(),
+                payload: serde_json::json!({
+                    "session_id": "claude-a",
+                    "wrapper_session": "pty-a"
+                }),
+                runtime: Some("claude-code-session".to_string()),
+            },
+        )
+        .unwrap();
+        let context = first["context_injection"].as_str().unwrap();
+        assert!(context.contains("AgentCall Supervisor Update"));
+        assert!(context.contains("Stop new implementation"));
+
+        let second = ingest_hook(
+            &state,
+            HookIngestRequest {
+                event: "PostToolBatch".to_string(),
+                payload: serde_json::json!({
+                    "session_id": "claude-a",
+                    "wrapper_session": "pty-a"
+                }),
+                runtime: Some("claude-code-session".to_string()),
+            },
+        )
+        .unwrap();
+        assert!(
+            !second["context_injection"]
+                .as_str()
+                .unwrap()
+                .contains("AgentCall Supervisor Update")
+        );
     }
 
     #[test]
@@ -1026,7 +1228,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(result["decision"]["allowed"], false);
-        assert! (
+        assert!(
             result["decision"]["reason"]
                 .as_str()
                 .unwrap()

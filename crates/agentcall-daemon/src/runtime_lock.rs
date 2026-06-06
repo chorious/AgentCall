@@ -14,7 +14,10 @@ pub(crate) fn acquire_runtime_lock(
     let key = format!("{kind}:{identity}");
     let mut locks = read_json(&path);
     if let Some(existing) = locks.get(&key) {
-        let pid = existing.get("pid").and_then(|value| value.as_u64()).unwrap_or(0);
+        let pid = existing
+            .get("pid")
+            .and_then(|value| value.as_u64())
+            .unwrap_or(0);
         if pid != 0 && pid_is_live(pid) {
             return Err(format!(
                 "AgentCall {kind} already running for {identity} (pid {pid}); close it before starting another instance"

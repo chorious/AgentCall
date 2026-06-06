@@ -1,4 +1,4 @@
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::env;
 use std::fs::{self, OpenOptions};
 use std::io::{self, Read, Write};
@@ -60,7 +60,11 @@ impl Args {
                 other => return Err(format!("unknown argument: {other}")),
             }
         }
-        Ok(Self { root, event, runtime })
+        Ok(Self {
+            root,
+            event,
+            runtime,
+        })
     }
 }
 
@@ -94,7 +98,10 @@ impl Store {
             fs::write(&self.events_path, "").map_err(|err| err.to_string())?;
         }
         for (name, value) in [
-            ("project.json", json!({"version": 1, "decisions": [], "risks": [], "memory": []})),
+            (
+                "project.json",
+                json!({"version": 1, "decisions": [], "risks": [], "memory": []}),
+            ),
             ("file_claims.json", json!({})),
             ("active_sessions.json", json!({})),
             ("context_index.json", json!({"calls": []})),
@@ -161,7 +168,12 @@ struct IngestResult {
     decision: Option<Value>,
 }
 
-fn ingest(store: &mut Store, runtime: &str, event: &str, payload: &Value) -> Result<IngestResult, String> {
+fn ingest(
+    store: &mut Store,
+    runtime: &str,
+    event: &str,
+    payload: &Value,
+) -> Result<IngestResult, String> {
     store.init()?;
     let session_id = session_id_from_payload(payload);
     let status = infer_status(event, payload);
@@ -195,11 +207,12 @@ fn ingest(store: &mut Store, runtime: &str, event: &str, payload: &Value) -> Res
         }),
     )?;
 
-    let context_injection = if matches!(event, "SessionStart" | "UserPromptSubmit") {
-        context_injection(store, runtime)?
-    } else {
-        String::new()
-    };
+    let context_injection =
+        if matches!(event, "SessionStart" | "UserPromptSubmit" | "PostToolBatch") {
+            context_injection(store, runtime)?
+        } else {
+            String::new()
+        };
 
     Ok(IngestResult {
         session_id,
@@ -213,7 +226,10 @@ fn apply_policy(store: &Store, event: &str, payload: &Value) -> Result<Option<Va
     match event {
         "PreToolUse" => Ok(Some(evaluate_pre_tool_use(store, payload)?)),
         "PostToolUse" => Ok(Some(observe_post_tool_use(store, payload)?)),
-        "Stop" | "SubagentStop" | "SessionEnd" => Ok(Some(release_session(store, &session_id_from_payload(payload))?)),
+        "Stop" | "SubagentStop" | "SessionEnd" => Ok(Some(release_session(
+            store,
+            &session_id_from_payload(payload),
+        )?)),
         _ => Ok(None),
     }
 }
@@ -221,11 +237,15 @@ fn apply_policy(store: &Store, event: &str, payload: &Value) -> Result<Option<Va
 fn evaluate_pre_tool_use(store: &Store, payload: &Value) -> Result<Value, String> {
     let tool_name = payload_string(payload, &["tool_name", "toolName"]).unwrap_or_default();
     if !WRITE_TOOLS.contains(&tool_name.as_str()) {
-        return Ok(json!({"allowed": true, "reason": "tool does not claim files", "files": [], "conflicts": []}));
+        return Ok(
+            json!({"allowed": true, "reason": "tool does not claim files", "files": [], "conflicts": []}),
+        );
     }
     let files = extract_tool_files(payload);
     if files.is_empty() {
-        return Ok(json!({"allowed": true, "reason": "write tool did not expose file path", "files": [], "conflicts": []}));
+        return Ok(
+            json!({"allowed": true, "reason": "write tool did not expose file path", "files": [], "conflicts": []}),
+        );
     }
     let session_id = session_id_from_payload(payload);
     let mut claims = store.read_json("file_claims.json", json!({}))?;
@@ -240,7 +260,9 @@ fn evaluate_pre_tool_use(store: &Store, payload: &Value) -> Result<Value, String
         }
     }
     if !conflicts.is_empty() {
-        return Ok(json!({"allowed": false, "reason": "file claim conflict", "files": files, "conflicts": conflicts}));
+        return Ok(
+            json!({"allowed": false, "reason": "file claim conflict", "files": files, "conflicts": conflicts}),
+        );
     }
     for file in &files {
         let claimed_at = claims
@@ -270,7 +292,9 @@ fn observe_post_tool_use(store: &Store, payload: &Value) -> Result<Value, String
     let tool_name = payload_string(payload, &["tool_name", "toolName"]).unwrap_or_default();
     let files = extract_tool_files(payload);
     if files.is_empty() {
-        return Ok(json!({"allowed": true, "reason": "no file paths observed", "files": [], "conflicts": []}));
+        return Ok(
+            json!({"allowed": true, "reason": "no file paths observed", "files": [], "conflicts": []}),
+        );
     }
     let session_id = session_id_from_payload(payload);
     let mut claims = store.read_json("file_claims.json", json!({}))?;
@@ -316,7 +340,9 @@ fn release_session(store: &Store, session_id: &str) -> Result<Value, String> {
             json!({"session_id": session_id, "files": released}),
         )?;
     }
-    Ok(json!({"allowed": true, "reason": "session claims released", "files": released, "conflicts": []}))
+    Ok(
+        json!({"allowed": true, "reason": "session claims released", "files": released, "conflicts": []}),
+    )
 }
 
 fn context_injection(store: &Store, runtime: &str) -> Result<String, String> {
@@ -340,7 +366,7 @@ fn context_injection(store: &Store, runtime: &str) -> Result<String, String> {
 }
 
 fn hook_output(event: &str, result: &IngestResult) -> Option<Value> {
-    if matches!(event, "SessionStart" | "UserPromptSubmit") {
+    if matches!(event, "SessionStart" | "UserPromptSubmit" | "PostToolBatch") {
         return Some(json!({
             "systemMessage": format!("AgentCall {}: status={}", result.session_id, result.status),
             "hookSpecificOutput": {
@@ -391,7 +417,13 @@ fn payload_string(payload: &Value, keys: &[&str]) -> Option<String> {
 fn session_id_from_payload(payload: &Value) -> String {
     payload_string(
         payload,
-        &["session_id", "sessionId", "agent_id", "conversation_id", "transcript_path"],
+        &[
+            "session_id",
+            "sessionId",
+            "agent_id",
+            "conversation_id",
+            "transcript_path",
+        ],
     )
     .unwrap_or_else(|| "unknown-session".to_string())
 }
@@ -403,7 +435,11 @@ fn infer_status(event: &str, payload: &Value) -> String {
     match event {
         "SessionStart" | "UserPromptSubmit" | "PreToolUse" => "running",
         "Notification" => {
-            let message = payload.get("message").and_then(Value::as_str).unwrap_or("").to_lowercase();
+            let message = payload
+                .get("message")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_lowercase();
             if message.contains("permission") {
                 "needs_permission"
             } else if message.contains("idle") {
