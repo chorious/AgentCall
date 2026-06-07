@@ -1,5 +1,12 @@
 # CHANGELOG
 
+## v4.1.0 - Bilingual Release And Board Refresh
+
+- README 改为中英文双语，明确 AgentCall 的产品定位、MCP/plugin 安装方式、hooks 与 `claude_workspace` / cwd 的关系。
+- 插件 release 版本更新到 `4.1.0`。
+- Board UI 切到 compact daemon board 数据，优先展示 live sessions、attention、routes 和 reports，减少读取大事件日志的成本。
+- 根目录 review/report 文档归档到 `docs/arch/review`，保持项目根目录干净。
+
 ## v4.0.1 - AgentCall MCP Smoke Clarification
 
 - 插件 skill 明确：不要用 `tool_search agentcall` 判断 AgentCall 是否可用。

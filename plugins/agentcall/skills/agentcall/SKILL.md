@@ -13,7 +13,7 @@ Use AgentCall as the coordination layer for Codex-directed Claude Code utility w
 2. Inspect `agentcall_board(view="compact", filter="attention")` before delegating or declaring a worker stuck.
 3. Use `agentcall_route` to start bounded PTY utility work.
 4. Use `agentcall_session` for compact session summaries.
-5. Use `agentcall_session_send` for nudge, continue, stop, report-request, or plan/auto mode actions.
+5. Use `agentcall_session_send` for nudge, continue, stop, report-request, permission-menu selection, or plan/auto mode actions.
 6. Use `agentcall_report` to inspect or accept reports.
 
 ## Operating Rules
@@ -25,3 +25,5 @@ Use AgentCall as the coordination layer for Codex-directed Claude Code utility w
 - Do not let two workers write the same files.
 - Require a concise report or exact change summary at lifecycle end.
 - Write a review only for drift, blockers, failed validation, or revision.
+- When a session summary shows `needs_permission` or a numeric menu, use `agentcall_session_send(action="select_option", text="1")` or the intended option number. Do not send natural-language prompts into permission menus.
+- Use `agentcall_session_send(action="interrupt")` only when a worker is clearly on the wrong path or must be reclaimed immediately.

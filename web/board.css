@@ -61,6 +61,10 @@ button {
   cursor: pointer;
 }
 
+button:hover {
+  border-color: #87909a;
+}
+
 .metrics {
   display: grid;
   grid-template-columns: repeat(5, minmax(120px, 1fr));
@@ -144,21 +148,41 @@ article,
 
 .badge.running,
 .badge.active,
-.badge.done {
+.badge.done,
+.badge.ok,
+.badge.enabled,
+.badge.found,
+.badge.started,
+.badge.started_and_prompt_submitted,
+.badge.completed {
   border-color: #4a8f70;
   color: #8fe0b4;
 }
 
 .badge.needs_permission,
 .badge.checkpoint_requested,
-.badge.checkpoint_due {
+.badge.checkpoint_due,
+.badge.waiting_input,
+.badge.unbound,
+.badge.missing {
   border-color: #b08c47;
   color: #ffd27a;
 }
 
+.badge.failed,
+.badge.error,
+.badge.config_missing,
+.badge.denied,
+.badge.missing_required_config {
+  border-color: #a65454;
+  color: #ff9f9f;
+}
+
 .badge.ended,
 .badge.released,
-.badge.stopped {
+.badge.stopped,
+.badge.idle,
+.badge.none {
   color: #9fa6aa;
 }
 
