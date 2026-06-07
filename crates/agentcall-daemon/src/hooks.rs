@@ -64,6 +64,17 @@ pub(crate) fn pending_supervisor_instructions_state(state: &AppState) -> serde_j
     )
 }
 
+pub(crate) fn policy_denials_state(state: &AppState) -> serde_json::Value {
+    read_json_file(
+        &state
+            .workspace
+            .join(".agentcall")
+            .join("state")
+            .join("policy_denials.json"),
+        serde_json::json!({}),
+    )
+}
+
 pub(crate) fn cleanup_wrapper_session(
     state: &AppState,
     wrapper_session: &str,
@@ -309,6 +320,7 @@ fn context_injection(
         state.workspace.display()
     );
     if let Some(wrapper) = wrapper_session {
+        inject_policy_guidance_locked(state, state_dir, &mut context, wrapper)?;
         let pending = take_pending_supervisor_instructions_locked(state_dir, wrapper)?;
         if !pending.is_empty() {
             let agent_dir = state_dir
@@ -588,17 +600,26 @@ pub(crate) fn pre_tool_use_claim_locked(
         }
         if let Some(policy) = pty_path_policy_for_wrapper(state, wrapper) {
             if let Some(denial) = pty_path_policy_denial(tool_name, payload, &policy) {
+                let policy_block = record_policy_denial_locked(
+                    state, state_dir, wrapper, tool_name, payload, &denial, &policy,
+                )?;
                 return Ok(serde_json::json!({
                     "allowed": false,
                     "reason": denial,
                     "policy": {
                         "runtime": "pty",
-                        "allowed_paths": policy.allowed_paths
+                        "mode": policy.mode.clone(),
+                        "allowed_paths": policy.allowed_paths.clone(),
+                        "writable_paths": policy.writable_paths.clone(),
+                        "scratch_path": policy.scratch_path.clone(),
+                        "bash_write_policy": policy.bash_write_policy.clone()
                     },
+                    "policy_block": policy_block,
                     "files": extract_tool_files(payload),
                     "conflicts": []
                 }));
             }
+            reset_policy_denials_for_wrapper_locked(state_dir, wrapper)?;
         }
     }
     if !is_write_tool(tool_name) {
@@ -880,6 +901,10 @@ fn pty_plan_policy_decision(
 #[derive(Clone)]
 struct PtyPathPolicy {
     allowed_paths: Vec<String>,
+    writable_paths: Vec<String>,
+    mode: String,
+    scratch_path: Option<String>,
+    bash_write_policy: String,
 }
 
 fn pty_path_policy_for_wrapper(state: &AppState, wrapper_session: &str) -> Option<PtyPathPolicy> {
@@ -892,11 +917,13 @@ fn pty_path_policy_for_wrapper(state: &AppState, wrapper_session: &str) -> Optio
         return None;
     }
     let result = route.get("result")?;
+    let containment = result.get("containment")?;
     let mut allowed_paths = string_array(
         result
             .get("containment")
             .and_then(|containment| containment.get("allowed_paths")),
     );
+    let mut writable_paths = string_array(containment.get("writable_paths"));
     if allowed_paths.is_empty() {
         allowed_paths = string_array(
             result
@@ -904,10 +931,30 @@ fn pty_path_policy_for_wrapper(state: &AppState, wrapper_session: &str) -> Optio
                 .and_then(|packet| packet.get("allowed_paths")),
         );
     }
-    if allowed_paths.is_empty() {
+    if writable_paths.is_empty() {
+        writable_paths = allowed_paths.clone();
+    }
+    if allowed_paths.is_empty() && writable_paths.is_empty() {
         return None;
     }
-    Some(PtyPathPolicy { allowed_paths })
+    Some(PtyPathPolicy {
+        allowed_paths,
+        writable_paths,
+        mode: containment
+            .get("mode")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("enforced")
+            .to_string(),
+        scratch_path: containment
+            .get("scratch_path")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string),
+        bash_write_policy: containment
+            .get("bash_write_policy")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("readonly_only")
+            .to_string(),
+    })
 }
 
 fn pty_path_policy_denial(
@@ -924,13 +971,15 @@ fn pty_path_policy_denial(
         }
         if files.iter().all(|file| {
             policy
-                .allowed_paths
+                .writable_paths
                 .iter()
                 .any(|allowed| path_within_or_equal(file, allowed))
         }) {
             return None;
         }
-        return Some("PTY path policy denies write outside allowed_paths".to_string());
+        return Some(
+            "PTY path policy denies write outside allowed_paths or writable_paths".to_string(),
+        );
     }
     if tool_name == "Bash" && !bash_readonly_allowed(payload) {
         return Some(
@@ -938,6 +987,213 @@ fn pty_path_policy_denial(
         );
     }
     None
+}
+
+const POLICY_DENIAL_THRESHOLD: u64 = 2;
+
+fn record_policy_denial_locked(
+    state: &AppState,
+    state_dir: &Path,
+    wrapper_session: &str,
+    tool_name: &str,
+    payload: &serde_json::Value,
+    reason: &str,
+    policy: &PtyPathPolicy,
+) -> Result<serde_json::Value, String> {
+    let path = state_dir.join("policy_denials.json");
+    let mut denials = read_json_file(&path, serde_json::json!({}));
+    if !denials.is_object() {
+        denials = serde_json::json!({});
+    }
+    let now = chrono::Utc::now().to_rfc3339();
+    let normalized = normalized_policy_target(tool_name, payload);
+    let key = format!(
+        "{}:{}:{}",
+        tool_name,
+        stable_hash_hex(normalized.as_bytes()),
+        stable_hash_hex(reason.as_bytes())
+    );
+    let previous = denials
+        .get(wrapper_session)
+        .cloned()
+        .unwrap_or_else(|| serde_json::json!({}));
+    let previous_key = previous.get("key").and_then(serde_json::Value::as_str);
+    let repeat_count = if previous_key == Some(key.as_str()) {
+        previous
+            .get("repeat_count")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0)
+            + 1
+    } else {
+        1
+    };
+    let active = repeat_count >= POLICY_DENIAL_THRESHOLD;
+    let category = policy_denial_category(tool_name, reason);
+    let recommended_action = match category.as_str() {
+        "missing_scratch_or_report_path" => "extend_allowed_paths_or_use_write_tool",
+        _ => "interrupt_or_send_blocker_instruction",
+    };
+    let mut suggested_allowed_paths = vec![];
+    if category == "missing_scratch_or_report_path" {
+        if let Some(scratch) = &policy.scratch_path {
+            suggested_allowed_paths.push(serde_json::json!(scratch));
+        }
+    }
+    let block = serde_json::json!({
+        "active": active,
+        "key": key,
+        "wrapper_session": wrapper_session,
+        "tool": tool_name,
+        "target": normalized,
+        "reason": reason,
+        "repeat_count": repeat_count,
+        "threshold": POLICY_DENIAL_THRESHOLD,
+        "category": category,
+        "recommended_action": recommended_action,
+        "suggested_allowed_paths": suggested_allowed_paths,
+        "guidance_injected": previous
+            .get("guidance_injected")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false)
+            && previous_key == Some(key.as_str()),
+        "last_seen": now,
+        "policy": {
+            "mode": policy.mode.clone(),
+            "allowed_paths": policy.allowed_paths.clone(),
+            "writable_paths": policy.writable_paths.clone(),
+            "scratch_path": policy.scratch_path.clone(),
+            "bash_write_policy": policy.bash_write_policy.clone()
+        }
+    });
+    denials[wrapper_session] = block.clone();
+    write_json_file(&path, &denials)?;
+    if active && previous.get("active").and_then(serde_json::Value::as_bool) != Some(true) {
+        append_agent_event_locked(
+            state,
+            state_dir
+                .parent()
+                .unwrap_or_else(|| Path::new(".agentcall")),
+            "policy_denial.blocked",
+            "PTY worker is blocked by repeated policy denials.",
+            serde_json::json!({
+                "wrapper_session": wrapper_session,
+                "policy_block": block
+            }),
+        )?;
+    }
+    Ok(block)
+}
+
+fn reset_policy_denials_for_wrapper_locked(
+    state_dir: &Path,
+    wrapper_session: &str,
+) -> Result<(), String> {
+    let path = state_dir.join("policy_denials.json");
+    let mut denials = read_json_file(&path, serde_json::json!({}));
+    if let Some(object) = denials.as_object_mut() {
+        object.remove(wrapper_session);
+    }
+    write_json_file(&path, &denials)
+}
+
+fn inject_policy_guidance_locked(
+    state: &AppState,
+    state_dir: &Path,
+    context: &mut String,
+    wrapper_session: &str,
+) -> Result<(), String> {
+    let path = state_dir.join("policy_denials.json");
+    let mut denials = read_json_file(&path, serde_json::json!({}));
+    let Some(block) = denials.get_mut(wrapper_session) else {
+        return Ok(());
+    };
+    if block.get("active").and_then(serde_json::Value::as_bool) != Some(true)
+        || block
+            .get("guidance_injected")
+            .and_then(serde_json::Value::as_bool)
+            == Some(true)
+    {
+        return Ok(());
+    }
+    let reason = block
+        .get("reason")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("policy denied the last tool call");
+    let target = block
+        .get("target")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("");
+    let category = block
+        .get("category")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("needs_supervisor_decision");
+    context.push_str("\n# AgentCall Policy Block\n\n");
+    context.push_str(
+        "AgentCall denied the same tool action repeatedly. Do not retry the same action.\n",
+    );
+    context.push_str(&format!("- category: {category}\n"));
+    context.push_str(&format!("- denied target: {target}\n"));
+    context.push_str(&format!("- reason: {reason}\n"));
+    context.push_str(
+        "- next step: use existing references, use Write/Edit inside allowed scratch/report paths, or report this as a blocker for supervisor action.\n",
+    );
+    block["guidance_injected"] = serde_json::json!(true);
+    block["guidance_injected_at"] = serde_json::json!(chrono::Utc::now().to_rfc3339());
+    let event_block = block.clone();
+    write_json_file(&path, &denials)?;
+    append_agent_event_locked(
+        state,
+        state_dir
+            .parent()
+            .unwrap_or_else(|| Path::new(".agentcall")),
+        "policy_denial.guidance_injected",
+        "Policy denial guidance injected through hook context.",
+        serde_json::json!({
+            "wrapper_session": wrapper_session,
+            "policy_block": event_block
+        }),
+    )
+}
+
+fn normalized_policy_target(tool_name: &str, payload: &serde_json::Value) -> String {
+    if tool_name == "Bash" {
+        let command = payload
+            .get("tool_input")
+            .or_else(|| payload.get("toolInput"))
+            .and_then(|value| value.get("command"))
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("");
+        return command.split_whitespace().collect::<Vec<_>>().join(" ");
+    }
+    let files = extract_tool_files(payload);
+    if files.is_empty() {
+        tool_name.to_string()
+    } else {
+        files
+            .iter()
+            .map(|file| normalize_workspace_path(file))
+            .collect::<Vec<_>>()
+            .join("|")
+    }
+}
+
+fn policy_denial_category(tool_name: &str, reason: &str) -> String {
+    if reason.contains("without explicit file path") {
+        "missing_scratch_or_report_path".to_string()
+    } else if tool_name == "Bash" || reason.contains("outside") {
+        "dangerous_or_out_of_scope".to_string()
+    } else {
+        "needs_supervisor_decision".to_string()
+    }
+}
+
+fn stable_hash_hex(bytes: &[u8]) -> String {
+    let mut hash = 0xcbf29ce484222325u64;
+    for byte in bytes {
+        hash ^= *byte as u64;
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    format!("{hash:016x}")
 }
 
 fn is_claude_plan_file(path: &str) -> bool {
@@ -1139,6 +1395,15 @@ mod tests {
             "session_id": session_id,
             "tool_name": "Write",
             "tool_input": {"file_path": file},
+            "cwd": "E:\\Project\\AgentCall"
+        })
+    }
+
+    fn bash_payload(session_id: &str, command: &str) -> serde_json::Value {
+        serde_json::json!({
+            "session_id": session_id,
+            "tool_name": "Bash",
+            "tool_input": {"command": command},
             "cwd": "E:\\Project\\AgentCall"
         })
     }
@@ -1359,6 +1624,116 @@ mod tests {
         )
         .unwrap();
         assert_eq!(result["decision"]["allowed"], true);
+    }
+
+    #[test]
+    fn pty_auto_route_allows_write_inside_writable_scratch() {
+        let state = test_state("pty-auto-allow-scratch");
+        let path = state
+            .workspace
+            .join(".agentcall")
+            .join("state")
+            .join("routes.json");
+        write_json_file(
+            &path,
+            &serde_json::json!({
+                "route-pty": {
+                    "route_id": "route-pty",
+                    "recommended_runtime": "pty",
+                    "session_name": "pty-a",
+                    "result": {
+                        "pty_workflow": "normal",
+                        "workflow_status": "running",
+                        "phase": "execute",
+                        "permission_mode": "auto",
+                        "containment": {
+                            "mode": "enforced_readonly_bash",
+                            "allowed_paths": ["src"],
+                            "writable_paths": [".agentcall/workspaces/pty-a", "docs/report.md"],
+                            "scratch_path": ".agentcall/workspaces/pty-a",
+                            "bash_write_policy": "readonly_only"
+                        }
+                    }
+                }
+            }),
+        )
+        .unwrap();
+        let mut payload = write_payload("claude-a", ".agentcall/workspaces/pty-a/tmp.md");
+        payload["wrapper_session"] = serde_json::json!("pty-a");
+        let result = ingest_hook(
+            &state,
+            HookIngestRequest {
+                event: "PreToolUse".to_string(),
+                payload,
+                runtime: Some("claude-code-session".to_string()),
+            },
+        )
+        .unwrap();
+        assert_eq!(result["decision"]["allowed"], true);
+    }
+
+    #[test]
+    fn repeated_policy_denial_creates_block_and_injects_guidance_once() {
+        let state = test_state("pty-policy-loop");
+        install_pty_auto_route(&state, "pty-a", &["src"]);
+        for _ in 0..2 {
+            let mut payload = bash_payload(
+                "claude-a",
+                "git clone https://github.com/Holic75/KingmakerRebalance.git --depth 1",
+            );
+            payload["wrapper_session"] = serde_json::json!("pty-a");
+            let result = ingest_hook(
+                &state,
+                HookIngestRequest {
+                    event: "PreToolUse".to_string(),
+                    payload,
+                    runtime: Some("claude-code-session".to_string()),
+                },
+            )
+            .unwrap();
+            assert_eq!(result["decision"]["allowed"], false);
+        }
+        let denials = policy_denials_state(&state);
+        assert_eq!(denials["pty-a"]["active"], true);
+        assert_eq!(denials["pty-a"]["repeat_count"], 2);
+        assert_eq!(denials["pty-a"]["category"], "dangerous_or_out_of_scope");
+
+        let first = ingest_hook(
+            &state,
+            HookIngestRequest {
+                event: "PostToolBatch".to_string(),
+                payload: serde_json::json!({
+                    "session_id": "claude-a",
+                    "wrapper_session": "pty-a"
+                }),
+                runtime: Some("claude-code-session".to_string()),
+            },
+        )
+        .unwrap();
+        assert!(
+            first["context_injection"]
+                .as_str()
+                .unwrap()
+                .contains("AgentCall Policy Block")
+        );
+        let second = ingest_hook(
+            &state,
+            HookIngestRequest {
+                event: "PostToolBatch".to_string(),
+                payload: serde_json::json!({
+                    "session_id": "claude-a",
+                    "wrapper_session": "pty-a"
+                }),
+                runtime: Some("claude-code-session".to_string()),
+            },
+        )
+        .unwrap();
+        assert!(
+            !second["context_injection"]
+                .as_str()
+                .unwrap()
+                .contains("AgentCall Policy Block")
+        );
     }
 
     #[test]

@@ -55,6 +55,7 @@ pub(crate) fn mcp_tools() -> Vec<Value> {
                     "allowed_paths": {"type": "array", "items": {"type": "string"}},
                     "acceptance_criteria": {"type": "array", "items": {"type": "string"}},
                     "report_path": {"type": "string"},
+                    "read_only": {"type": "boolean", "default": false},
                     "pty_workflow": {"type": "string", "enum": ["normal", "plan_then_auto"], "default": "normal"},
                     "initial_permission_mode": {"type": "string", "enum": ["plan", "auto", "default"]},
                     "persist_context": {"type": "boolean", "default": true}
@@ -313,6 +314,16 @@ fn mcp_session_send(state: &AppState, args: &Value) -> Result<Value, String> {
             "liveness_status": liveness_status,
             "attention_status": attention_status,
             "hint": "Claude Code is showing a permission prompt. Do not send natural-language input into the menu; resolve the permission prompt or use action=interrupt only to reclaim a drifting worker."
+        }));
+    }
+    if attention_status == "blocked_by_policy" {
+        return Ok(json!({
+            "ok": false,
+            "status": "blocked_by_policy",
+            "liveness_status": liveness_status,
+            "attention_status": attention_status,
+            "policy_block": summary.get("policy_block").cloned().unwrap_or(Value::Null),
+            "hint": "The worker is repeating a denied action. Do not wait or resend the same prompt; update allowed_paths/task, request a blocker report after interrupt, or stop the worker."
         }));
     }
     if liveness_status == "working" && attention_status == "none" {

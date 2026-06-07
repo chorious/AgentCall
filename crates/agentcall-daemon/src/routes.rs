@@ -28,6 +28,7 @@ pub(crate) struct RouteRequest {
     acceptance_criteria: Option<Vec<String>>,
     persist_context: Option<bool>,
     report_path: Option<String>,
+    read_only: Option<bool>,
     pty_workflow: Option<String>,
     initial_permission_mode: Option<String>,
 }
@@ -396,6 +397,7 @@ fn start_pty_route(
         None
     };
     let command = pty_command(req, &workflow, claude_session_id.as_deref())?;
+    let containment = pty_containment(state, req, &session_name);
     let info = start_session(
         state,
         StartRequest {
@@ -406,7 +408,8 @@ fn start_pty_route(
             rows: Some(40),
         },
     )?;
-    let prompt_gate = submit_pty_prompt_with_ack(state, &session_name, pty_prompt(req));
+    let prompt_gate =
+        submit_pty_prompt_with_ack(state, &session_name, pty_prompt(req, &containment));
     let prompt_status = prompt_gate
         .get("status")
         .and_then(Value::as_str)
@@ -439,12 +442,47 @@ fn start_pty_route(
             "stall_threshold_seconds": 180,
             "hint": "Claude Code PTY may spend time reading files, thinking, or preparing tool calls. Inspect session summary/attention before retrying or restarting."
         },
-        "containment": {
-            "mode": if req.allowed_paths.as_ref().map(|items| items.is_empty()).unwrap_or(true) { "prompt_only" } else { "enforced" },
-            "allowed_paths": req.allowed_paths.clone().unwrap_or_default()
-        }
+        "containment": containment
     });
     Ok(())
+}
+
+fn pty_containment(state: &AppState, req: &RouteRequest, session_name: &str) -> Value {
+    let read_only = req.read_only.unwrap_or(false);
+    let explicit_allowed = req.allowed_paths.clone().unwrap_or_default();
+    let scratch_path = format!(".agentcall/workspaces/{session_name}");
+    let mut writable_paths = vec![];
+    if !read_only {
+        writable_paths.push(scratch_path.clone());
+        if let Some(report_path) = req
+            .report_path
+            .as_ref()
+            .filter(|value| !value.trim().is_empty())
+        {
+            writable_paths.push(report_path.clone());
+        }
+        for path in &explicit_allowed {
+            if !path.trim().is_empty() && !writable_paths.iter().any(|item| item == path) {
+                writable_paths.push(path.clone());
+            }
+        }
+        let scratch_abs = state.workspace.join(&scratch_path);
+        let _ = std::fs::create_dir_all(&scratch_abs);
+        let _ = std::fs::write(
+            scratch_abs.join("README.md"),
+            format!(
+                "# AgentCall Session Scratch\n\nSession: `{session_name}`\n\nThis directory is writable for bounded helper artifacts, temporary scripts, and report material. Do not write outside route containment.\n"
+            ),
+        );
+    }
+    json!({
+        "mode": if read_only { "read_only" } else { "enforced_readonly_bash" },
+        "read_only": read_only,
+        "allowed_paths": explicit_allowed,
+        "writable_paths": writable_paths,
+        "scratch_path": if read_only { Value::Null } else { json!(scratch_path) },
+        "bash_write_policy": "readonly_only"
+    })
 }
 
 pub(crate) fn route_for_wrapper_session(
@@ -575,6 +613,7 @@ fn route_has_context_fields(req: &RouteRequest) -> bool {
         || req.acceptance_criteria.is_some()
         || req.persist_context.is_some()
         || req.report_path.is_some()
+        || req.read_only.is_some()
 }
 
 fn merge_result_field(result: &mut Value, key: &str, value: Value) {
@@ -699,19 +738,14 @@ fn new_claude_session_id(state: &AppState) -> String {
     )
 }
 
-fn pty_prompt(req: &RouteRequest) -> String {
+fn pty_prompt(req: &RouteRequest, containment: &Value) -> String {
     let criteria = req
         .acceptance_criteria
         .as_ref()
         .map(|items| items.join("\n- "))
         .filter(|value| !value.is_empty())
         .unwrap_or_else(|| "Complete the requested task and write a report.".to_string());
-    let allowed = req
-        .allowed_paths
-        .as_ref()
-        .map(|items| items.join("\n- "))
-        .filter(|value| !value.is_empty())
-        .unwrap_or_else(|| "Use the task workspace carefully.".to_string());
+    let allowed = pty_prompt_containment(containment);
     let workflow =
         PtyWorkflow::from_request(req.pty_workflow.as_deref()).unwrap_or(PtyWorkflow::Normal);
     match workflow {
@@ -723,6 +757,36 @@ fn pty_prompt(req: &RouteRequest) -> String {
             "AgentCall utility PTY worker.\n\nObjective:\n{}\n\nAllowed paths / ownership:\n- {}\n\nAcceptance criteria:\n- {}\n\nRules:\n- Work in auto mode.\n- If key context is unclear, ask a concise question in this PTY.\n- Respect allowed_paths. Do not write outside them.\n- When finished, write the requested report or summarize exact changes, tests, risks, and remaining questions.\n- Stop at the prompt for supervisor review.\n",
             req.objective, allowed, criteria
         ),
+    }
+}
+
+fn pty_prompt_containment(containment: &Value) -> String {
+    let mut lines = vec![];
+    if let Some(mode) = containment.get("mode").and_then(Value::as_str) {
+        lines.push(format!("containment mode: {mode}"));
+    }
+    if let Some(paths) = containment.get("writable_paths").and_then(Value::as_array) {
+        for path in paths.iter().filter_map(Value::as_str) {
+            lines.push(format!("writable: {path}"));
+        }
+    }
+    if let Some(paths) = containment.get("allowed_paths").and_then(Value::as_array) {
+        for path in paths.iter().filter_map(Value::as_str) {
+            lines.push(format!("owned path: {path}"));
+        }
+    }
+    if let Some(scratch) = containment.get("scratch_path").and_then(Value::as_str) {
+        lines.push(format!("session scratch: {scratch}"));
+    }
+    if let Some(policy) = containment.get("bash_write_policy").and_then(Value::as_str) {
+        lines.push(format!(
+            "Bash write policy: {policy}; use Write/Edit for scratch/report artifacts"
+        ));
+    }
+    if lines.is_empty() {
+        "Use the task workspace carefully.".to_string()
+    } else {
+        lines.join("\n- ")
     }
 }
 
@@ -778,6 +842,7 @@ mod tests {
                 acceptance_criteria: None,
                 persist_context: None,
                 report_path: None,
+                read_only: None,
                 pty_workflow: None,
                 initial_permission_mode: None,
             },
@@ -814,6 +879,7 @@ mod tests {
                 acceptance_criteria: Some(vec!["report risks".to_string()]),
                 persist_context: Some(true),
                 report_path: Some("src/report.md".to_string()),
+                read_only: None,
                 pty_workflow: None,
                 initial_permission_mode: None,
             },
@@ -853,6 +919,7 @@ mod tests {
             acceptance_criteria: None,
             persist_context: None,
             report_path: None,
+            read_only: None,
             pty_workflow: None,
             initial_permission_mode: Some("auto".to_string()),
         };
@@ -891,6 +958,90 @@ mod tests {
                 .iter()
                 .all(|part| part.chars().all(|ch| ch.is_ascii_hexdigit()))
         );
+    }
+
+    #[test]
+    fn pty_containment_defaults_to_writable_scratch_and_report() {
+        let workspace = test_workspace("containment");
+        let state = AppState::test(workspace.clone());
+        let req = RouteRequest {
+            objective: "write report".to_string(),
+            workspace: None,
+            mode: Some("start".to_string()),
+            runtime: Some("pty".to_string()),
+            estimated_minutes: None,
+            estimated_files: None,
+            estimated_loc: None,
+            needs_continuity: None,
+            risk: None,
+            session_name: Some("containment-a".to_string()),
+            command: None,
+            task_id: None,
+            call_id: None,
+            phase: None,
+            role: None,
+            allowed_paths: Some(vec!["src".to_string()]),
+            acceptance_criteria: None,
+            persist_context: None,
+            report_path: Some("docs/report.md".to_string()),
+            read_only: None,
+            pty_workflow: None,
+            initial_permission_mode: None,
+        };
+        let containment = pty_containment(&state, &req, "containment-a");
+        assert_eq!(containment["mode"], "enforced_readonly_bash");
+        assert_eq!(containment["bash_write_policy"], "readonly_only");
+        assert_eq!(
+            containment["scratch_path"],
+            ".agentcall/workspaces/containment-a"
+        );
+        let writable = containment["writable_paths"].as_array().unwrap();
+        assert!(
+            writable
+                .iter()
+                .any(|value| value == ".agentcall/workspaces/containment-a")
+        );
+        assert!(writable.iter().any(|value| value == "docs/report.md"));
+        assert!(writable.iter().any(|value| value == "src"));
+        assert!(
+            workspace
+                .join(".agentcall/workspaces/containment-a/README.md")
+                .exists()
+        );
+    }
+
+    #[test]
+    fn pty_containment_read_only_has_no_writable_scratch() {
+        let workspace = test_workspace("containment-readonly");
+        let state = AppState::test(workspace);
+        let req = RouteRequest {
+            objective: "read only audit".to_string(),
+            workspace: None,
+            mode: Some("start".to_string()),
+            runtime: Some("pty".to_string()),
+            estimated_minutes: None,
+            estimated_files: None,
+            estimated_loc: None,
+            needs_continuity: None,
+            risk: None,
+            session_name: Some("containment-ro".to_string()),
+            command: None,
+            task_id: None,
+            call_id: None,
+            phase: None,
+            role: None,
+            allowed_paths: Some(vec!["src".to_string()]),
+            acceptance_criteria: None,
+            persist_context: None,
+            report_path: Some("docs/report.md".to_string()),
+            read_only: Some(true),
+            pty_workflow: None,
+            initial_permission_mode: None,
+        };
+        let containment = pty_containment(&state, &req, "containment-ro");
+        assert_eq!(containment["mode"], "read_only");
+        assert!(containment["writable_paths"].as_array().unwrap().is_empty());
+        assert!(containment["scratch_path"].is_null());
     }
 
     #[test]

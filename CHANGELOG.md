@@ -1,5 +1,15 @@
 # CHANGELOG
 
+## v4.2.0 - Bounded Write And Policy Block Attention
+
+- PTY route 默认生成 session scratch，并在 containment 中暴露 `writable_paths`、`scratch_path`、`bash_write_policy`。
+- 写工具可写 `report_path`、session scratch 和显式 `allowed_paths`；Bash 首版仍保持 readonly-only。
+- 重复 policy deny 聚合到 `policy_denials.json`，summary/board 显示 `blocked_by_policy`，不再提示 Codex继续耐心等待。
+- policy deny loop 会通过 hook context 注入一次纠偏提示，要求 Claude 不要机械重试同一被拒动作。
+- `agentcall_route` 增加 `read_only` 参数；显式 read-only route 不会自动授予 writable scratch。
+- Board attention 展示 policy block 类别、次数和 deny reason；`doctor` 增加 scratch 目录提示。
+- `.gitignore` 增加本地 Anthropic/router 启动文件忽略规则，避免把本机路由 fork/脚本提交到 main。
+
 ## v4.1.1 - Scripted Diagnostics And Release Checks
 
 - 新增 `python agentcall.py ...` 总入口，覆盖 `doctor`、`install-hooks`、`release-check`、`daemon-health`、`paths`。

@@ -1,6 +1,6 @@
 # AgentCall
 
-当前版本 / Current version: `v4.1.1`
+当前版本 / Current version: `v4.2.0`
 
 AgentCall is a local coordination plane that lets **Codex supervise a cluster of Claude Code PTY utility workers**. Codex remains the parent agent: it splits work, starts workers, watches board/session state, asks for reports, and accepts or revises results. Claude Code workers execute bounded tasks inside visible PTY sessions.
 
@@ -12,6 +12,8 @@ AgentCall 是一个本地多 Agent 协作控制面，目标是让 **Codex 指挥
 - **PTY-first**：默认使用 Claude Code PTY utility worker，保留人类可视化和 handoff 能力。
 - **Daemon single-writer**：live events、claims、sessions、bindings、routes、summary 由 Rust daemon 统一写入。
 - **Hook-aware 状态**：Claude/Codex hooks 写入 daemon，summary 优先使用结构化 hook/report 状态，TUI 只做辅助摘要。
+- **Bounded-write workers**：默认给 Claude Code session scratch / report path / allowed paths 的写工具权限；Bash 首版保持 readonly-only。
+- **Policy block attention**：重复 policy deny 会升格为 `blocked_by_policy`，不再被误报为健康 working。
 - **Readable wrapper**：daemon 维护 raw output、clean output、LLM summary，Codex 默认读取紧凑状态。
 - **Patience contract**：summary 提供 wait/retry 提示，减少 Codex 误判 worker 过慢。
 - **Plugin-provided MCP**：repo 内 Codex plugin 让 MCP server 和使用说明一起随插件加载，降低不同 Codex session / CODEX_HOME 下工具不注入的问题。
@@ -22,6 +24,8 @@ AgentCall 是一个本地多 Agent 协作控制面，目标是让 **Codex 指挥
 - **PTY-first workers**: Claude Code runs in daemon-owned PTY sessions, so humans can still watch and hand off.
 - **Rust daemon authority**: runtime events, file claims, sessions, bindings, routes, and summaries are written by the daemon.
 - **Hook-aware summaries**: Claude/Codex hooks provide structured status; TUI text is treated as a weak readability hint.
+- **Bounded-write workers**: write tools can use session scratch, report paths, and allowed paths; Bash remains readonly-only in the first v4.2 release.
+- **Policy block attention**: repeated policy denials become `blocked_by_policy` instead of healthy `working`.
 - **Low-friction control**: compact board/session summaries reduce context cost for Codex.
 - **Plugin-provided MCP**: the repo ships a Codex plugin so AgentCall tools can be loaded by the app without hand-copying user-level MCP config.
 

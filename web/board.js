@@ -52,11 +52,14 @@ function renderSession(session) {
 }
 
 function renderAttention(item) {
+  const policy = item.policy_block || {};
   return card([
     row("session", item.session || item.session_name || item.name),
     row("attention", badge(item.attention_status || item.status)),
     row("liveness", badge(item.liveness_status)),
     row("source", item.status_source || item.kind),
+    policy.active ? row("policy", `${escapeHtml(policy.category || "-")} x${policy.repeat_count || 0}`) : "",
+    policy.reason ? `<p>${escapeHtml(policy.reason)}</p>` : "",
     item.headline ? `<p>${escapeHtml(item.headline)}</p>` : "",
   ]);
 }

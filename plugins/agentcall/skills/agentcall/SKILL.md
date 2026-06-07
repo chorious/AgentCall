@@ -22,6 +22,8 @@ Use AgentCall as the coordination layer for Codex-directed Claude Code utility w
 - `tool_search` may return zero AgentCall tools even when AgentCall MCP is callable; treat direct MCP calls as the source of truth.
 - Treat workers as slower utility collaborators; wait for board/report evidence before calling them failed.
 - Prefer small, clearly owned handoff tasks with allowed paths.
+- Treat default PTY workers as bounded-write workers: write tools may use route `allowed_paths`, `report_path`, and the session scratch, while Bash remains readonly-only unless a future policy says otherwise.
+- If `attention_status` is `blocked_by_policy`, do not wait inside the patience window or resend the same prompt. Inspect `policy_block`, then adjust allowed paths/task, interrupt for a blocker report, or stop the worker.
 - Do not let two workers write the same files.
 - Require a concise report or exact change summary at lifecycle end.
 - Write a review only for drift, blockers, failed validation, or revision.

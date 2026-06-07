@@ -1,4 +1,6 @@
-use crate::hooks::{pending_supervisor_instructions_state, runtime_bindings_state};
+use crate::hooks::{
+    pending_supervisor_instructions_state, policy_denials_state, runtime_bindings_state,
+};
 use crate::routes::routes_state;
 use crate::session::{Session, list_sessions};
 use crate::state::{AppState, read_events, read_json_file};
@@ -412,6 +414,17 @@ pub(crate) fn session_summary(state: &AppState, session: &Arc<Session>) -> serde
         attention_status = "checkpoint_due".to_string();
         status_source = "route".to_string();
     }
+    let policy_block = policy_block_for_wrapper(state, &session.name);
+    if policy_block
+        .as_ref()
+        .and_then(|block| block.get("active"))
+        .and_then(serde_json::Value::as_bool)
+        == Some(true)
+    {
+        liveness_status = "blocked".to_string();
+        attention_status = "blocked_by_policy".to_string();
+        status_source = "policy".to_string();
+    }
     let claims = read_json_file(
         &agent_dir.join("state").join("file_claims.json"),
         serde_json::json!({}),
@@ -521,9 +534,9 @@ pub(crate) fn session_summary(state: &AppState, session: &Arc<Session>) -> serde
         "containment": route_result
             .as_ref()
             .and_then(|result| result.get("containment"))
-            .and_then(|containment| containment.get("mode"))
-            .and_then(|value| value.as_str())
-            .unwrap_or("prompt_only"),
+            .cloned()
+            .unwrap_or_else(|| serde_json::json!({"mode": "prompt_only"})),
+        "policy_block": policy_block,
         "last_error": last_error(&clean_output),
         "needs_attention": needs_attention,
         "confidence": confidence,
@@ -548,6 +561,19 @@ pub(crate) fn session_summary(state: &AppState, session: &Arc<Session>) -> serde
             .and_then(|value| value.as_array_mut())
         {
             warnings.push(serde_json::json!("queued supervisor instructions may not be delivered until this Claude session emits PostToolBatch; restart the worker after hook install if this remains false"));
+        }
+    }
+    if payload
+        .get("policy_block")
+        .and_then(|block| block.get("active"))
+        .and_then(serde_json::Value::as_bool)
+        == Some(true)
+    {
+        if let Some(warnings) = payload
+            .get_mut("warnings")
+            .and_then(|value| value.as_array_mut())
+        {
+            warnings.push(serde_json::json!("policy deny loop detected; do not wait inside the patience window. Change allowed_paths/task, request a blocker report, or interrupt/stop the worker."));
         }
     }
     if let Some(object) = payload.as_object_mut() {
@@ -601,6 +627,10 @@ fn pending_supervisor_instruction_count(state: &AppState, wrapper_session: &str)
         .and_then(serde_json::Value::as_array)
         .map(|items| items.len())
         .unwrap_or(0)
+}
+
+fn policy_block_for_wrapper(state: &AppState, wrapper_session: &str) -> Option<serde_json::Value> {
+    policy_denials_state(state).get(wrapper_session).cloned()
 }
 
 fn last_supervisor_instruction_injected_at(
@@ -769,7 +799,12 @@ fn attention_items(state: &AppState) -> serde_json::Value {
             .unwrap_or("none");
         if matches!(
             attention_status,
-            "needs_permission" | "checkpoint_due" | "waiting_input" | "unbound" | "failed"
+            "needs_permission"
+                | "checkpoint_due"
+                | "waiting_input"
+                | "unbound"
+                | "failed"
+                | "blocked_by_policy"
         ) {
             items.push(serde_json::json!({
                 "kind": "daemon_session_attention",
@@ -781,6 +816,7 @@ fn attention_items(state: &AppState) -> serde_json::Value {
                 "patience_status": summary.get("patience_status").cloned().unwrap_or(serde_json::Value::Null),
                 "patience_hint": summary.get("patience_hint").cloned().unwrap_or(serde_json::Value::Null),
                 "last_progress_age_seconds": summary.get("last_progress_age_seconds").cloned().unwrap_or(serde_json::Value::Null),
+                "policy_block": summary.get("policy_block").cloned().unwrap_or(serde_json::Value::Null),
                 "needs_attention": true,
             }));
         }

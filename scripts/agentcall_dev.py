@@ -6,6 +6,7 @@ import os
 import shutil
 import subprocess
 import sys
+import time
 import urllib.error
 import urllib.request
 from dataclasses import dataclass
@@ -91,6 +92,7 @@ def cmd_doctor(root: Path, args: argparse.Namespace) -> int:
     checks.append(check_node())
     checks.append(check_plugin(root))
     checks.extend(check_claude_hooks(root, config))
+    checks.append(check_scratch_workspaces(root))
     checks.append(check_daemon(args.daemon_url, timeout=5.0))
     checks.append(check_git(root))
     print_checks(checks)
@@ -250,6 +252,30 @@ def check_plugin(root: Path) -> Check:
     if not mcp_servers:
         return Check("plugin", "FAIL", f"version={version}; mcpServers missing")
     return Check("plugin", "OK", f"version={version}; mcpServers={mcp_servers}")
+
+
+def check_scratch_workspaces(root: Path) -> Check:
+    scratch_root = root / ".agentcall" / "workspaces"
+    if not scratch_root.exists():
+        return Check("scratch", "OK", "no session scratch directories")
+    items = [path for path in scratch_root.iterdir() if path.is_dir()]
+    stale = []
+    now = time.time()
+    for path in items:
+        try:
+            age_seconds = now - path.stat().st_mtime
+        except OSError:
+            continue
+        if age_seconds > 24 * 60 * 60:
+            stale.append(path.name)
+    if stale:
+        return Check(
+            "scratch",
+            "WARN",
+            f"{len(items)} scratch dirs, {len(stale)} older than 24h",
+            "Review .agentcall/workspaces before manual cleanup; v4.2 does not auto-delete scratch.",
+        )
+    return Check("scratch", "OK", f"{len(items)} scratch dirs")
 
 
 def check_claude_hooks(root: Path, config: dict) -> list[Check]:

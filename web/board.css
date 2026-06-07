@@ -164,7 +164,8 @@ article,
 .badge.checkpoint_due,
 .badge.waiting_input,
 .badge.unbound,
-.badge.missing {
+.badge.missing,
+.badge.blocked_by_policy {
   border-color: #b08c47;
   color: #ffd27a;
 }

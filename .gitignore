@@ -5,6 +5,11 @@
 .claude/
 .codex/
 config/agentcall.local.json
+config/agentcall.route*.json
+scripts/agentcall-anthropic-router.py
+scripts/start-agentcall-router.ps1
+scripts/*local-router*.ps1
+scripts/*local-router*.py
 .pytest_cache/
 .pytest_tmp/
 .pytest_tmp*/
