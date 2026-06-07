@@ -1,5 +1,12 @@
 # CHANGELOG
 
+## v4.1.1 - Scripted Diagnostics And Release Checks
+
+- 新增 `python agentcall.py ...` 总入口，覆盖 `doctor`、`install-hooks`、`release-check`、`daemon-health`、`paths`。
+- `doctor` 检查 repo/config/cargo/python/node/plugin/Claude hooks/daemon/git，并在缺 hook event、缺 cargo、daemon timeout 时给出定位提示。
+- `release-check` 固化提交前常用校验：Python compile、Board JS syntax、plugin validation、Cargo workspace tests、pytest、`git diff --check`。
+- README 增加脚本入口说明，降低 Codex/Claude/human 重复记命令的上下文成本。
+
 ## v4.1.0 - Bilingual Release And Board Refresh
 
 - README 改为中英文双语，明确 AgentCall 的产品定位、MCP/plugin 安装方式、hooks 与 `claude_workspace` / cwd 的关系。

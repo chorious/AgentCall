@@ -1,6 +1,6 @@
 # AgentCall Docs
 
-这是 AgentCall 的文档索引。当前主线版本是 `v4.1.0`：AgentCall 是 **Codex 协调、Claude Code PTY utility workers 执行** 的本地控制面，并通过 repo-local Codex plugin 暴露 MCP 工具与使用说明。
+这是 AgentCall 的文档索引。当前主线版本是 `v4.1.1`：AgentCall 是 **Codex 协调、Claude Code PTY utility workers 执行** 的本地控制面，并通过 repo-local Codex plugin 暴露 MCP 工具与使用说明。
 
 ## 当前入口
 

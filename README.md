@@ -1,6 +1,6 @@
 # AgentCall
 
-当前版本 / Current version: `v4.1.0`
+当前版本 / Current version: `v4.1.1`
 
 AgentCall is a local coordination plane that lets **Codex supervise a cluster of Claude Code PTY utility workers**. Codex remains the parent agent: it splits work, starts workers, watches board/session state, asks for reports, and accepts or revises results. Claude Code workers execute bounded tasks inside visible PTY sessions.
 
@@ -84,6 +84,39 @@ Open:
 ```text
 http://127.0.0.1:3293/board
 ```
+
+## 脚本入口
+
+推荐从这个入口做日常检查、安装和发布前校验：
+
+```powershell
+python agentcall.py doctor
+python agentcall.py install-hooks
+python agentcall.py release-check
+python agentcall.py daemon-health
+python agentcall.py paths
+```
+
+这些脚本会尽量给出可定位的报错，例如：
+
+- `cargo` 不在 PATH 时，会自动尝试 `C:\Users\<you>\.cargo\bin\cargo.exe`，找不到才失败。
+- Claude hooks 会检查 `claude_workspace\.claude\settings.local.json`，并列出缺失的 hook event。
+- daemon health 会短超时请求 `/api/runtime/health`，用于区分 daemon 未启动、旧 daemon 卡住、JSON 返回异常。
+- `release-check` 会跑 Python compile、Board JS 语法检查、plugin validation、Cargo tests、pytest 和 `git diff --check`。
+
+## Script Entry
+
+Use the repo entrypoint for routine diagnostics, hook installation, and release checks:
+
+```powershell
+python agentcall.py doctor
+python agentcall.py install-hooks
+python agentcall.py release-check
+python agentcall.py daemon-health
+python agentcall.py paths
+```
+
+The scripts are designed to fail loudly with actionable hints: missing Cargo, stale hook settings, daemon health timeout, plugin validation failure, pytest failure, or whitespace diff errors.
 
 ## Hooks 与 cwd 配置
 
