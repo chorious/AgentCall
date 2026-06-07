@@ -3,7 +3,7 @@ use crate::routes::{
     RouteRequest, checkpoint_session, handle_route, patch_route_record, route_for_wrapper_session,
 };
 use crate::session::{InputRequest, get_session, interrupt_session, write_input};
-use crate::state::{AppState, append_agent_event};
+use crate::state::{AppState, append_agent_event, read_events};
 use crate::summary::{board_state, clean_session_output, session_plan_artifact, session_summary};
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -85,7 +85,7 @@ pub(crate) fn mcp_tools() -> Vec<Value> {
                 "properties": {
                     "root": {"type": "string"},
                     "name": {"type": "string"},
-                    "action": {"type": "string", "enum": ["send", "continue", "stop", "request_report", "revise_plan", "approve_plan", "start_auto", "interrupt"], "default": "send"},
+                    "action": {"type": "string", "enum": ["send", "continue", "stop", "request_report", "revise_plan", "approve_plan", "start_auto", "select_option", "interrupt"], "default": "send"},
                     "text": {"type": "string"},
                     "enter": {"type": "boolean", "default": true}
                 },
@@ -221,6 +221,59 @@ fn mcp_session_send(state: &AppState, args: &Value) -> Result<Value, String> {
         )?;
         return Ok(json!({"ok": true, "action": action, "workflow_status": "auto_running"}));
     }
+    if action == "select_option" {
+        let choice = menu_choice(args)?;
+        let session = get_session(state, name).ok_or_else(|| "session not found".to_string())?;
+        let process_status = session.status.lock().unwrap().clone();
+        if process_status != "running" {
+            return Ok(json!({
+                "ok": false,
+                "status": "session_not_accepting_input",
+                "process_status": process_status,
+                "hint": "The PTY process is not running. Inspect session summary/report before selecting a menu option."
+            }));
+        }
+        let summary = session_summary(state, &session);
+        let attention_status = summary
+            .get("attention_status")
+            .and_then(Value::as_str)
+            .unwrap_or("none");
+        let clean_output = clean_session_output(&session);
+        if attention_status != "needs_permission" && !looks_like_menu_prompt(&clean_output) {
+            return Ok(json!({
+                "ok": false,
+                "status": "not_in_menu_prompt",
+                "attention_status": attention_status,
+                "hint": "select_option is only for visible PTY menus or permission prompts. Use send for normal natural-language input."
+            }));
+        }
+        write_input(
+            state,
+            name,
+            InputRequest {
+                text: choice.clone(),
+                enter: Some(true),
+            },
+        )?;
+        append_agent_event(
+            state,
+            "pty.menu_option_selected",
+            "PTY menu option selected by supervisor.",
+            json!({
+                "name": name,
+                "choice": choice,
+                "attention_status": attention_status,
+                "runtime": "pty"
+            }),
+        );
+        return Ok(json!({
+            "ok": true,
+            "action": action,
+            "status": "menu_option_selected",
+            "choice": choice,
+            "hint": "Supervisor selected a visible PTY menu option; inspect session summary before sending further input."
+        }));
+    }
     let text = args
         .get("text")
         .and_then(Value::as_str)
@@ -264,11 +317,21 @@ fn mcp_session_send(state: &AppState, args: &Value) -> Result<Value, String> {
     }
     if liveness_status == "working" && attention_status == "none" {
         let queued = queue_supervisor_instruction(state, name, action, &text)?;
+        let post_tool_batch_seen = session_has_seen_hook_event(state, name, "PostToolBatch");
+        let warning = if post_tool_batch_seen {
+            Value::Null
+        } else {
+            json!(
+                "This session has not emitted PostToolBatch in recent events. Queued instructions may remain pending until the worker is restarted with updated D:\\guKimi hooks."
+            )
+        };
         return Ok(json!({
             "ok": true,
             "status": "queued_until_next_hook_injection",
             "delivery": "PostToolBatch_or_next_context_hook",
             "instruction": queued,
+            "post_tool_batch_seen": post_tool_batch_seen,
+            "warning": warning,
             "hint": "Claude Code does not reliably accept new prompts mid-turn. AgentCall queued this instruction for hook additionalContext instead of blindly typing into the PTY."
         }));
     }
@@ -290,6 +353,54 @@ fn mcp_session_send(state: &AppState, args: &Value) -> Result<Value, String> {
         );
     }
     Ok(json!({"ok": true}))
+}
+
+fn menu_choice(args: &Value) -> Result<String, String> {
+    let choice = args
+        .get("text")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .ok_or_else(|| {
+            "select_option requires text to be one digit, such as \"1\", \"2\", or \"3\""
+                .to_string()
+        })?;
+    if choice.len() == 1 && matches!(choice.as_bytes()[0], b'1'..=b'9') {
+        Ok(choice.to_string())
+    } else {
+        Err("select_option text must be exactly one digit from 1 to 9".to_string())
+    }
+}
+
+fn looks_like_menu_prompt(clean_output: &str) -> bool {
+    let tail = clean_output
+        .chars()
+        .rev()
+        .take(4000)
+        .collect::<String>()
+        .chars()
+        .rev()
+        .collect::<String>()
+        .to_ascii_lowercase();
+    tail.contains("run a dynamic workflow?")
+        || tail.contains("yes, run it")
+        || tail.contains("view raw script")
+        || tail.contains("esc to cancel")
+        || tail.contains("tab to amend")
+}
+
+fn session_has_seen_hook_event(state: &AppState, wrapper_session: &str, hook_event: &str) -> bool {
+    let expected_type = format!("hook.{hook_event}");
+    read_events(&state.workspace.join(".agentcall").join("events.ndjson"))
+        .iter()
+        .rev()
+        .any(|event| {
+            event.get("type").and_then(Value::as_str) == Some(expected_type.as_str())
+                && event
+                    .get("data")
+                    .and_then(|data| data.get("wrapper_session"))
+                    .and_then(Value::as_str)
+                    == Some(wrapper_session)
+        })
 }
 
 fn is_plan_then_auto_session(state: &AppState, session_name: &str) -> bool {
@@ -410,5 +521,25 @@ mod tests {
                 "agentcall_report",
             ]
         );
+    }
+
+    #[test]
+    fn menu_choice_accepts_single_digit_only() {
+        assert_eq!(menu_choice(&json!({"text": "1"})).unwrap(), "1");
+        assert_eq!(menu_choice(&json!({"text": " 3 "})).unwrap(), "3");
+        assert!(menu_choice(&json!({"text": "10"})).is_err());
+        assert!(menu_choice(&json!({"text": "yes"})).is_err());
+        assert!(menu_choice(&json!({})).is_err());
+    }
+
+    #[test]
+    fn menu_prompt_detector_recognizes_dynamic_workflow_menu() {
+        assert!(looks_like_menu_prompt(
+            "Run a dynamic workflow?\n > 1. Yes, run it\n2. View raw script\n3. No"
+        ));
+        assert!(looks_like_menu_prompt("Esc to cancel · Tab to amend"));
+        assert!(!looks_like_menu_prompt(
+            "Claude is working normally and has no visible menu."
+        ));
     }
 }

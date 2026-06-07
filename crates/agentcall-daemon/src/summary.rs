@@ -39,9 +39,11 @@ pub(crate) fn board_state(
     let live_daemon_sessions = list_sessions(state);
     let legacy_sessions = legacy_detached_sessions(&agent_dir.join("sessions"));
     let attention = attention_items(state);
+    let runtime_health_value = runtime_health(state);
 
     let full = serde_json::json!({
         "workspace": state.workspace,
+        "runtime_health": runtime_health_value,
         "pty_sessions": live_daemon_sessions,
         "live_daemon_sessions": list_sessions(state),
         "legacy_detached_sessions": legacy_sessions,
@@ -87,6 +89,7 @@ pub(crate) fn board_state(
         return serde_json::json!({
             "workspace": state.workspace,
             "view": "compact",
+            "runtime_health": selected.get("runtime_health").cloned().unwrap_or_else(|| runtime_health(state)),
             "live_daemon_sessions": selected.get("live_daemon_sessions").cloned().unwrap_or(serde_json::json!([])),
             "legacy_detached_sessions": selected.get("legacy_detached_sessions").cloned().unwrap_or(serde_json::json!([])),
             "attention": selected.get("attention").cloned().unwrap_or(serde_json::json!([])),
@@ -111,6 +114,11 @@ pub(crate) fn runtime_health(state: &AppState) -> serde_json::Value {
         .map(|items| items.len())
         .unwrap_or(0);
     let unbound_live_sessions = unbound_live_session_names(&sessions, &runtime_bindings);
+    let claude_hook_config_status = claude_hook_config_status(state);
+    let hook_warnings = claude_hook_config_status
+        .get("warnings")
+        .cloned()
+        .unwrap_or_else(|| serde_json::json!([]));
     serde_json::json!({
         "runtime": "agentcall-daemon",
         "workspace": state.workspace,
@@ -129,6 +137,8 @@ pub(crate) fn runtime_health(state: &AppState) -> serde_json::Value {
         "unbound_live_sessions": unbound_live_sessions,
         "restart_required_after_update": true,
         "stale_claims": stale_claims,
+        "claude_hook_config_status": claude_hook_config_status,
+        "warnings": hook_warnings,
         "status": if state.config.claude_workspace.is_some() { "ok" } else { "config_missing" }
     })
 }
@@ -140,6 +150,175 @@ pub(crate) fn projects_state(state: &AppState) -> serde_json::Value {
             "workspace": state.workspace,
             "sessions": list_sessions(state),
         }]
+    })
+}
+
+const CLAUDE_HOOK_EVENTS: &[&str] = &[
+    "SessionStart",
+    "UserPromptSubmit",
+    "PreToolUse",
+    "PostToolUse",
+    "PostToolBatch",
+    "Notification",
+    "Stop",
+    "SubagentStop",
+    "PreCompact",
+    "SessionEnd",
+];
+
+fn claude_hook_config_status(state: &AppState) -> serde_json::Value {
+    let hook_script_path = state
+        .workspace
+        .join("scripts")
+        .join("agentcall-claude-hook.py");
+    let Some(claude_workspace) = state.config.claude_workspace.as_ref() else {
+        return serde_json::json!({
+            "settings_path": null,
+            "has_agentcall_hooks": false,
+            "missing_events": CLAUDE_HOOK_EVENTS,
+            "post_tool_batch_enabled": false,
+            "hook_script_path": hook_script_path,
+            "hook_script_exists": hook_script_path.exists(),
+            "python_command": null,
+            "python_command_exists": false,
+            "settings_mtime": null,
+            "warnings": ["missing claude_workspace; cannot locate Claude hook settings"]
+        });
+    };
+    let settings_path = claude_workspace.join(".claude").join("settings.local.json");
+    let settings = read_json_file(&settings_path, serde_json::json!({}));
+    let mut missing_events = vec![];
+    let mut python_command: Option<String> = None;
+    for event in CLAUDE_HOOK_EVENTS {
+        if !event_has_agentcall_hook(&settings, event, &mut python_command) {
+            missing_events.push((*event).to_string());
+        }
+    }
+    let post_tool_batch_enabled = !missing_events.iter().any(|event| event == "PostToolBatch");
+    let settings_mtime = fs::metadata(&settings_path)
+        .ok()
+        .and_then(|metadata| metadata.modified().ok())
+        .map(|time| chrono::DateTime::<chrono::Utc>::from(time).to_rfc3339());
+    let python_command_exists = python_command
+        .as_deref()
+        .map(command_exists)
+        .unwrap_or(false);
+    let mut warnings = vec![];
+    if !settings_path.exists() {
+        warnings.push("Claude hook settings file is missing".to_string());
+    }
+    if !missing_events.is_empty() {
+        warnings.push(format!(
+            "Claude hook config is missing AgentCall events: {}",
+            missing_events.join(", ")
+        ));
+    }
+    if !post_tool_batch_enabled {
+        warnings.push(
+            "queued supervisor instructions may not be delivered because PostToolBatch is not installed".to_string(),
+        );
+    }
+    if !hook_script_path.exists() {
+        warnings.push("AgentCall Claude hook script is missing".to_string());
+    }
+    if python_command.is_some() && !python_command_exists {
+        warnings.push("Configured Python command for Claude hook was not found".to_string());
+    }
+    serde_json::json!({
+        "settings_path": settings_path,
+        "has_agentcall_hooks": missing_events.is_empty(),
+        "missing_events": missing_events,
+        "post_tool_batch_enabled": post_tool_batch_enabled,
+        "hook_script_path": hook_script_path,
+        "hook_script_exists": hook_script_path.exists(),
+        "python_command": python_command,
+        "python_command_exists": python_command_exists,
+        "settings_mtime": settings_mtime,
+        "warnings": warnings
+    })
+}
+
+fn event_has_agentcall_hook(
+    settings: &serde_json::Value,
+    event: &str,
+    python_command: &mut Option<String>,
+) -> bool {
+    settings
+        .get("hooks")
+        .and_then(|hooks| hooks.get(event))
+        .and_then(serde_json::Value::as_array)
+        .map(|entries| {
+            entries
+                .iter()
+                .any(|entry| entry_contains_agentcall_hook(entry, python_command))
+        })
+        .unwrap_or(false)
+}
+
+fn entry_contains_agentcall_hook(
+    entry: &serde_json::Value,
+    python_command: &mut Option<String>,
+) -> bool {
+    entry
+        .get("hooks")
+        .and_then(serde_json::Value::as_array)
+        .map(|hooks| {
+            hooks.iter().any(|hook| {
+                let command = hook
+                    .get("command")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("");
+                let args = hook
+                    .get("args")
+                    .and_then(serde_json::Value::as_array)
+                    .map(|items| {
+                        items
+                            .iter()
+                            .filter_map(serde_json::Value::as_str)
+                            .collect::<Vec<_>>()
+                            .join(" ")
+                    })
+                    .unwrap_or_default();
+                let haystack = format!("{command} {args}");
+                let is_agentcall = haystack.contains("agentcall-claude-hook.py");
+                if is_agentcall && python_command.is_none() && !command.trim().is_empty() {
+                    *python_command = Some(command.to_string());
+                }
+                is_agentcall
+            })
+        })
+        .unwrap_or(false)
+}
+
+fn command_exists(command: &str) -> bool {
+    let path = Path::new(command);
+    if path.is_absolute() || command.contains('\\') || command.contains('/') {
+        return path.exists();
+    }
+    let Some(paths) = std::env::var_os("PATH") else {
+        return false;
+    };
+    let extensions = if cfg!(windows) {
+        std::env::var("PATHEXT")
+            .unwrap_or_else(|_| ".COM;.EXE;.BAT;.CMD".to_string())
+            .split(';')
+            .map(str::to_string)
+            .collect::<Vec<_>>()
+    } else {
+        vec!["".to_string()]
+    };
+    std::env::split_paths(&paths).any(|dir| {
+        extensions.iter().any(|extension| {
+            let candidate = if command
+                .to_ascii_lowercase()
+                .ends_with(&extension.to_ascii_lowercase())
+            {
+                dir.join(command)
+            } else {
+                dir.join(format!("{command}{extension}"))
+            };
+            candidate.exists()
+        })
     })
 }
 
@@ -298,6 +477,9 @@ pub(crate) fn session_summary(state: &AppState, session: &Arc<Session>) -> serde
     let plan = lightweight_plan_from_route(route_result.as_ref());
     let pending_supervisor_instructions =
         pending_supervisor_instruction_count(state, &session.name);
+    let last_supervisor_instruction_injected_at =
+        last_supervisor_instruction_injected_at(state, &session.name);
+    let has_post_tool_batch = session_has_seen_hook_event(state, &session.name, "PostToolBatch");
     let mut payload = serde_json::json!({
         "session": session.name,
         "project": state.workspace.file_name().and_then(|name| name.to_str()).unwrap_or("workspace"),
@@ -356,8 +538,18 @@ pub(crate) fn session_summary(state: &AppState, session: &Arc<Session>) -> serde
         "needs_user_input": needs_user_input,
         "warnings": [],
         "conflicts": [],
-        "pending_supervisor_instructions": pending_supervisor_instructions
+        "pending_supervisor_instructions": pending_supervisor_instructions,
+        "last_supervisor_instruction_injected_at": last_supervisor_instruction_injected_at,
+        "post_tool_batch_seen": has_post_tool_batch
     });
+    if pending_supervisor_instructions > 0 && !has_post_tool_batch {
+        if let Some(warnings) = payload
+            .get_mut("warnings")
+            .and_then(|value| value.as_array_mut())
+        {
+            warnings.push(serde_json::json!("queued supervisor instructions may not be delivered until this Claude session emits PostToolBatch; restart the worker after hook install if this remains false"));
+        }
+    }
     if let Some(object) = payload.as_object_mut() {
         object.insert(
             "plan_ready".to_string(),
@@ -409,6 +601,48 @@ fn pending_supervisor_instruction_count(state: &AppState, wrapper_session: &str)
         .and_then(serde_json::Value::as_array)
         .map(|items| items.len())
         .unwrap_or(0)
+}
+
+fn last_supervisor_instruction_injected_at(
+    state: &AppState,
+    wrapper_session: &str,
+) -> Option<String> {
+    let events = read_events(&state.workspace.join(".agentcall").join("events.ndjson"));
+    events.iter().rev().find_map(|event| {
+        if event.get("type").and_then(serde_json::Value::as_str)
+            != Some("supervisor_instruction.injected")
+        {
+            return None;
+        }
+        let same_wrapper = event
+            .get("data")
+            .and_then(|data| data.get("wrapper_session"))
+            .and_then(serde_json::Value::as_str)
+            == Some(wrapper_session);
+        if same_wrapper {
+            event
+                .get("ts")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string)
+        } else {
+            None
+        }
+    })
+}
+
+fn session_has_seen_hook_event(state: &AppState, wrapper_session: &str, hook_event: &str) -> bool {
+    let expected_type = format!("hook.{hook_event}");
+    read_events(&state.workspace.join(".agentcall").join("events.ndjson"))
+        .iter()
+        .rev()
+        .any(|event| {
+            event.get("type").and_then(serde_json::Value::as_str) == Some(expected_type.as_str())
+                && event
+                    .get("data")
+                    .and_then(|data| data.get("wrapper_session"))
+                    .and_then(serde_json::Value::as_str)
+                    == Some(wrapper_session)
+        })
 }
 
 pub(crate) fn session_plan_artifact(

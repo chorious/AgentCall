@@ -64,6 +64,77 @@ pub(crate) fn pending_supervisor_instructions_state(state: &AppState) -> serde_j
     )
 }
 
+pub(crate) fn cleanup_wrapper_session(
+    state: &AppState,
+    wrapper_session: &str,
+    reason: &str,
+) -> Result<serde_json::Value, String> {
+    let _guard = state.state_writer.lock().unwrap();
+    let agent_dir = state.workspace.join(".agentcall");
+    let state_dir = agent_dir.join("state");
+    fs::create_dir_all(&state_dir).map_err(|err| err.to_string())?;
+
+    let bindings = read_json_file(
+        &state_dir.join("runtime_binding.json"),
+        serde_json::json!({}),
+    );
+    let hook_session_id = bindings
+        .get(wrapper_session)
+        .and_then(|binding| binding.get("claude_session_id"))
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_string);
+    let mut session_ids = vec![wrapper_session.to_string()];
+    if let Some(hook_session_id) = hook_session_id {
+        session_ids.push(hook_session_id);
+    }
+
+    let released_claims = release_claims_for_session_ids_locked(&state_dir, &session_ids)?;
+    let cancelled_instructions =
+        cancel_pending_supervisor_instructions_locked(&state_dir, wrapper_session, reason)?;
+
+    if let Some((route_id, _route)) = route_for_wrapper_session(state, wrapper_session) {
+        patch_route_record_locked(
+            state,
+            &agent_dir,
+            &route_id,
+            serde_json::json!({
+                "status": reason,
+                "updated_at": crate::util::now_ms(),
+                "required_next_step": "inspect_report_or_restart_worker",
+                "result": {
+                    "workflow_status": reason,
+                    "session_end_cleanup": {
+                        "reason": reason,
+                        "released_claims": released_claims,
+                        "cancelled_pending_instructions": cancelled_instructions
+                    }
+                }
+            }),
+        )?;
+    }
+
+    append_agent_event_locked(
+        state,
+        &agent_dir,
+        "session.cleanup",
+        "Session runtime state cleaned up.",
+        serde_json::json!({
+            "wrapper_session": wrapper_session,
+            "reason": reason,
+            "session_ids": session_ids,
+            "released_claims": released_claims,
+            "cancelled_pending_instructions": cancelled_instructions,
+        }),
+    )?;
+
+    Ok(serde_json::json!({
+        "wrapper_session": wrapper_session,
+        "reason": reason,
+        "released_claims": released_claims,
+        "cancelled_pending_instructions": cancelled_instructions
+    }))
+}
+
 pub(crate) fn queue_supervisor_instruction(
     state: &AppState,
     wrapper_session: &str,
@@ -636,6 +707,16 @@ pub(crate) fn release_claims_locked(
     state_dir: &Path,
     session_id: &str,
 ) -> Result<serde_json::Value, String> {
+    let released = release_claims_for_session_ids_locked(state_dir, &[session_id.to_string()])?;
+    Ok(
+        serde_json::json!({"allowed": true, "reason": "session claims released", "files": released, "conflicts": []}),
+    )
+}
+
+fn release_claims_for_session_ids_locked(
+    state_dir: &Path,
+    session_ids: &[String],
+) -> Result<Vec<String>, String> {
     let path = state_dir.join("file_claims.json");
     let mut claims = read_json_file(&path, serde_json::json!({}));
     if !claims.is_object() {
@@ -645,7 +726,8 @@ pub(crate) fn release_claims_locked(
     let now = chrono::Utc::now().to_rfc3339();
     if let Some(items) = claims.as_object_mut() {
         for (file, claim) in items.iter_mut() {
-            if claim.get("session_id").and_then(|value| value.as_str()) == Some(session_id)
+            let claim_session = claim.get("session_id").and_then(|value| value.as_str());
+            if claim_session.is_some_and(|value| session_ids.iter().any(|id| id == value))
                 && claim.get("status").and_then(|value| value.as_str()) == Some("active")
             {
                 claim["status"] = serde_json::json!("released");
@@ -655,9 +737,34 @@ pub(crate) fn release_claims_locked(
         }
     }
     write_json_file(&path, &claims)?;
-    Ok(
-        serde_json::json!({"allowed": true, "reason": "session claims released", "files": released, "conflicts": []}),
-    )
+    Ok(released)
+}
+
+fn cancel_pending_supervisor_instructions_locked(
+    state_dir: &Path,
+    wrapper_session: &str,
+    reason: &str,
+) -> Result<Vec<serde_json::Value>, String> {
+    let path = state_dir.join("pending_supervisor_instructions.json");
+    let mut pending = read_json_file(&path, serde_json::json!({}));
+    if !pending.is_object() {
+        return Ok(vec![]);
+    }
+    let mut items = pending
+        .get_mut(wrapper_session)
+        .and_then(serde_json::Value::as_array_mut)
+        .map(std::mem::take)
+        .unwrap_or_default();
+    for item in &mut items {
+        item["status"] = serde_json::json!("cancelled_session_ended");
+        item["cancelled_at"] = serde_json::json!(chrono::Utc::now().to_rfc3339());
+        item["cancel_reason"] = serde_json::json!(reason);
+    }
+    if let Some(object) = pending.as_object_mut() {
+        object.remove(wrapper_session);
+    }
+    write_json_file(&path, &pending)?;
+    Ok(items)
 }
 
 pub(crate) fn mark_expired_claims_stale(claims: &mut serde_json::Value) {

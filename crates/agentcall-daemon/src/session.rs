@@ -1,3 +1,4 @@
+use crate::hooks::cleanup_wrapper_session;
 use crate::state::{AppState, append_agent_event};
 use crate::terminal::{DecodeHealth, append_limited_text, decode_utf8_stream};
 use crate::util::{now_ms, safe_name};
@@ -252,6 +253,14 @@ pub(crate) fn spawn_waiter(state: Arc<AppState>, session: Arc<Session>) {
             "PTY session ended.",
             serde_json::json!({"name": session.name, "status": session.status.lock().unwrap().clone(), "cwd": session.cwd}),
         );
+        if let Err(err) = cleanup_wrapper_session(&state, &session.name, "session_exited") {
+            append_agent_event(
+                &state,
+                "session.cleanup_failed",
+                "Session runtime cleanup failed.",
+                serde_json::json!({"name": session.name, "reason": "session_exited", "error": err}),
+            );
+        }
     });
 }
 
@@ -420,6 +429,14 @@ pub(crate) fn stop_session(state: &AppState, name: &str) -> Result<(), String> {
         "PTY stop requested.",
         serde_json::json!({"name": name}),
     );
+    if let Err(err) = cleanup_wrapper_session(state, name, "stop_requested") {
+        append_agent_event(
+            state,
+            "session.cleanup_failed",
+            "Session runtime cleanup failed.",
+            serde_json::json!({"name": name, "reason": "stop_requested", "error": err}),
+        );
+    }
     Ok(())
 }
 

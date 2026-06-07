@@ -111,7 +111,7 @@ fn session_send_tool() -> Value {
             "properties": {
                 "root": {"type": "string"},
                 "name": {"type": "string"},
-                "action": {"type": "string", "enum": ["send", "continue", "stop", "request_report", "revise_plan", "approve_plan", "start_auto", "interrupt"], "default": "send"},
+                "action": {"type": "string", "enum": ["send", "continue", "stop", "request_report", "revise_plan", "approve_plan", "start_auto", "select_option", "interrupt"], "default": "send"},
                 "text": {"type": "string"},
                 "enter": {"type": "boolean", "default": true}
             },

@@ -61,6 +61,26 @@ http://127.0.0.1:3293/board
 python scripts\install_claude_hooks.py --root E:\Project\AgentCall
 ```
 
+该命令会读取 `config\agentcall.local.json` 中的 `claude_workspace`，并写入：
+
+```text
+<claude_workspace>\.claude\settings.local.json
+```
+
+本机通常是：
+
+```text
+D:\guKimi\.claude\settings.local.json
+```
+
+`--root` 只表示 AgentCall 项目根，用来定位 `scripts\agentcall-claude-hook.py`；它不是 Claude Code worker 的 hook 配置目录。若需要手动指定 Claude 配置目录，可以使用：
+
+```powershell
+python scripts\install_claude_hooks.py --root E:\Project\AgentCall --settings-root D:\guKimi
+```
+
+修改 hooks 后，已经启动的 Claude PTY worker 不会热加载新配置；需要重启 worker。
+
 安装或刷新 Codex hooks：
 
 ```powershell
