@@ -1,12 +1,13 @@
 # AgentCall Docs
 
-这是 AgentCall 的文档索引。当前主线版本是 `v4.2.0`：AgentCall 是 **Codex 协调、Claude Code PTY utility workers 执行** 的本地控制面，并通过 repo-local Codex plugin 暴露 MCP 工具与使用说明。
+这是 AgentCall 的文档索引。当前主线版本是 `v4.3.0`：AgentCall 是 **Codex 协调、Claude Code PTY utility workers 执行** 的本地控制面，并通过 repo-local Codex plugin 暴露 MCP 工具与使用说明。
 
 ## 当前入口
 
 - [项目 README](../README.md)
 - [CHANGELOG](../CHANGELOG.md)
 - [About AgentCall](about.md)
+- [v4.3 Recent-first Logs](v4.3-observability-hygiene.md)
 - [v4.2 Readable TUI Control](v4.2-readable-tui-control.md)
 - [v4.0 Plugin Provided MCP](v4.0-plugin-provided-mcp.md)
 - [v3.0 PTY Utility Workers](v3.0-pty-utility-workers.md)

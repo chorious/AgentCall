@@ -2,15 +2,20 @@ use crate::hooks::{
     pending_supervisor_instructions_state, policy_denials_state, runtime_bindings_state,
 };
 use crate::routes::routes_state;
-use crate::session::{Session, list_sessions};
-use crate::state::{AppState, read_events, read_json_file};
+use crate::session::{Session, SessionInfo, list_sessions};
+use crate::state::{AppState, read_events, read_json_file, write_json_file};
 use crate::terminal::{clean_terminal_text, tail_lines};
 use crate::util::now_ms;
 use serde_json::Value;
+use std::collections::HashSet;
 use std::fs;
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
+
+const STALE_SESSION_MS: u64 = 5 * 60 * 1000;
+const PATIENCE_SECONDS: u64 = 60;
+const STALL_THRESHOLD_SECONDS: u64 = 300;
 
 pub(crate) fn board_state(
     state: &AppState,
@@ -19,6 +24,18 @@ pub(crate) fn board_state(
     section: Option<&str>,
 ) -> serde_json::Value {
     let agent_dir = state.workspace.join(".agentcall");
+    let live_daemon_sessions = list_sessions(state);
+    cleanup_stale_runtime_state(state, &live_daemon_sessions);
+    let attention = attention_items(state);
+    if filter == Some("attention") {
+        return serde_json::json!({
+            "workspace": state.workspace,
+            "view": view.unwrap_or("full"),
+            "filter": "attention",
+            "attention": attention,
+        });
+    }
+
     let events = read_events(&agent_dir.join("events.ndjson"));
     let project_state = read_json_file(
         &agent_dir.join("state").join("project.json"),
@@ -38,9 +55,7 @@ pub(crate) fn board_state(
     );
     let reports = read_reports(&agent_dir.join("tasks"));
     let routes = routes_state(state);
-    let live_daemon_sessions = list_sessions(state);
     let legacy_sessions = legacy_detached_sessions(&agent_dir.join("sessions"));
-    let attention = attention_items(state);
     let runtime_health_value = runtime_health(state);
 
     let full = serde_json::json!({
@@ -79,14 +94,6 @@ pub(crate) fn board_state(
         _ => full.clone(),
     };
 
-    if filter == Some("attention") {
-        return serde_json::json!({
-            "workspace": state.workspace,
-            "view": view.unwrap_or("full"),
-            "filter": "attention",
-            "attention": selected.get("attention").cloned().unwrap_or_else(|| attention_items(state)),
-        });
-    }
     if view == Some("compact") {
         return serde_json::json!({
             "workspace": state.workspace,
@@ -104,6 +111,7 @@ pub(crate) fn board_state(
 
 pub(crate) fn runtime_health(state: &AppState) -> serde_json::Value {
     let sessions = list_sessions(state);
+    cleanup_stale_runtime_state(state, &sessions);
     let running_sessions = sessions
         .iter()
         .filter(|session| session.status == "running")
@@ -139,6 +147,9 @@ pub(crate) fn runtime_health(state: &AppState) -> serde_json::Value {
         "unbound_live_sessions": unbound_live_sessions,
         "restart_required_after_update": true,
         "stale_claims": stale_claims,
+        "stale_session_ttl_seconds": STALE_SESSION_MS / 1000,
+        "default_sleep_seconds": PATIENCE_SECONDS,
+        "recent_first_logs": true,
         "claude_hook_config_status": claude_hook_config_status,
         "warnings": hook_warnings,
         "status": if state.config.claude_workspace.is_some() { "ok" } else { "config_missing" }
@@ -322,6 +333,104 @@ fn command_exists(command: &str) -> bool {
             candidate.exists()
         })
     })
+}
+
+fn cleanup_stale_runtime_state(state: &AppState, live_sessions: &[SessionInfo]) {
+    let live_names: HashSet<String> = live_sessions
+        .iter()
+        .filter(|session| session.status == "running")
+        .map(|session| session.name.clone())
+        .collect();
+    let agent_dir = state.workspace.join(".agentcall");
+    let state_dir = agent_dir.join("state");
+    let now = now_ms();
+    let _guard = state.state_writer.lock().unwrap();
+
+    let active_path = state_dir.join("active_sessions.json");
+    let mut active_sessions = read_json_file(&active_path, serde_json::json!({}));
+    let mut active_changed = false;
+    if let Some(object) = active_sessions.as_object_mut() {
+        let stale_keys: Vec<String> = object
+            .iter()
+            .filter_map(|(key, value)| {
+                let wrapper = value
+                    .get("wrapper_session")
+                    .and_then(Value::as_str)
+                    .unwrap_or("");
+                let binding_source = value
+                    .get("binding_source")
+                    .and_then(Value::as_str)
+                    .unwrap_or("unbound");
+                let runtime = value.get("runtime").and_then(Value::as_str).unwrap_or("");
+                let owned_by_live_daemon = !wrapper.is_empty() && live_names.contains(wrapper);
+                let old_enough = value
+                    .get("updated_at")
+                    .and_then(Value::as_str)
+                    .and_then(timestamp_age_ms)
+                    .is_some_and(|age| age >= STALE_SESSION_MS);
+                let stale_projection =
+                    binding_source == "unbound" || runtime == "codex" || !owned_by_live_daemon;
+                if old_enough && stale_projection {
+                    Some(key.clone())
+                } else {
+                    None
+                }
+            })
+            .collect();
+        if !stale_keys.is_empty() {
+            active_changed = true;
+            for key in stale_keys {
+                object.remove(&key);
+            }
+        }
+    }
+    if active_changed {
+        let _ = write_json_file(&active_path, &active_sessions);
+    }
+
+    let pending_path = state_dir.join("pending_supervisor_instructions.json");
+    let mut pending = read_json_file(&pending_path, serde_json::json!({}));
+    let mut pending_changed = false;
+    if let Some(object) = pending.as_object_mut() {
+        let stale_wrappers: Vec<String> = object
+            .iter()
+            .filter_map(|(wrapper, value)| {
+                if live_names.contains(wrapper) {
+                    return None;
+                }
+                let stale = value
+                    .as_array()
+                    .map(|items| {
+                        items.iter().all(|item| {
+                            item.get("created_at")
+                                .and_then(Value::as_str)
+                                .and_then(timestamp_age_ms)
+                                .is_some_and(|age| age >= STALE_SESSION_MS)
+                        })
+                    })
+                    .unwrap_or(true);
+                if stale { Some(wrapper.clone()) } else { None }
+            })
+            .collect();
+        if !stale_wrappers.is_empty() {
+            pending_changed = true;
+            for wrapper in stale_wrappers {
+                object.remove(&wrapper);
+            }
+        }
+    }
+    if pending_changed {
+        let _ = write_json_file(&pending_path, &pending);
+    }
+
+    let _ = now;
+}
+
+fn timestamp_age_ms(timestamp: &str) -> Option<u64> {
+    let parsed = chrono::DateTime::parse_from_rfc3339(timestamp).ok()?;
+    let then = parsed.timestamp_millis();
+    let now = now_ms() as i64;
+    Some(now.saturating_sub(then).max(0) as u64)
 }
 
 pub(crate) fn session_summary(state: &AppState, session: &Arc<Session>) -> serde_json::Value {
@@ -696,9 +805,9 @@ fn patience_contract(
     attention_status: &str,
     last_progress_age_seconds: u64,
 ) -> serde_json::Value {
-    let suggested_wait_seconds = 45u64;
-    let do_not_retry_before_seconds = 60u64;
-    let stall_threshold_seconds = 180u64;
+    let suggested_wait_seconds = PATIENCE_SECONDS;
+    let do_not_retry_before_seconds = PATIENCE_SECONDS;
+    let stall_threshold_seconds = STALL_THRESHOLD_SECONDS;
     if attention_status != "none" {
         return serde_json::json!({
             "status": "attention_required",

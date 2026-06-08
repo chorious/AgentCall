@@ -1,5 +1,14 @@
 # CHANGELOG
 
+## v4.3.0 - Recent-first Logs And Stale Session Cleanup
+
+- 事件写入切到 `.agentcall/events/recent.ndjson`，并按大小轮转到 archive；board/session 默认只读 recent hot log。
+- Hook 分类日志切到 `.agentcall/logs/hooks/<HookEvent>/recent.ndjson`，单文件超过上限自动归档。
+- `PostToolUse` / `PostToolBatch` 大 payload 外置到 `.agentcall/artifacts/hooks/...`，event 内只保留摘要和 artifact 元数据。
+- `active_sessions.json` 中 5 分钟无更新且不再由 live daemon 拥有的历史/unbound session 会被清理；孤儿 pending supervisor instructions 同步清理。
+- Codex-facing patience 统一到 60 秒，stall 阈值调整为 300 秒，减少急躁轮询。
+- `python agentcall.py logs doctor` 和 `python agentcall.py sessions cleanup` 提供日志体积与 stale session 快速诊断入口。
+
 ## v4.2.0 - Bounded Write And Policy Block Attention
 
 - PTY route 默认生成 session scratch，并在 containment 中暴露 `writable_paths`、`scratch_path`、`bash_write_policy`。

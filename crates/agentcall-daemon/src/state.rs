@@ -2,10 +2,16 @@ use crate::config::LocalConfig;
 use crate::session::Session;
 use std::collections::HashMap;
 use std::fs;
-use std::io::Write;
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+
+const RECENT_EVENT_MAX_BYTES: u64 = 2 * 1024 * 1024;
+const ROTATING_LOG_MAX_BYTES: u64 = 4 * 1024 * 1024;
+const READ_TAIL_BYTES: u64 = 2 * 1024 * 1024;
+const RECENT_EVENT_LIMIT: usize = 80;
+const TOOL_OUTPUT_INLINE_LIMIT: usize = 4096;
 
 pub(crate) struct AppState {
     pub(crate) workspace: PathBuf,
@@ -82,15 +88,16 @@ pub(crate) fn write_json_file(path: &Path, value: &serde_json::Value) -> Result<
 }
 
 pub(crate) fn read_events(path: &Path) -> Vec<serde_json::Value> {
-    let Ok(text) = fs::read_to_string(path) else {
+    let event_path = recent_events_path_for(path).unwrap_or_else(|| path.to_path_buf());
+    let Some(text) = read_tail_text(&event_path, READ_TAIL_BYTES) else {
         return vec![];
     };
     let mut events: Vec<serde_json::Value> = text
         .lines()
         .filter_map(|line| serde_json::from_str(line).ok())
         .collect();
-    if events.len() > 80 {
-        events = events.split_off(events.len() - 80);
+    if events.len() > RECENT_EVENT_LIMIT {
+        events = events.split_off(events.len() - RECENT_EVENT_LIMIT);
     }
     events
 }
@@ -121,7 +128,6 @@ pub(crate) fn append_agent_event_locked(
     data: serde_json::Value,
 ) -> Result<(), String> {
     fs::create_dir_all(&agent_dir).map_err(|err| err.to_string())?;
-    let path = agent_dir.join("events.ndjson");
     let event_id = state.next_event_id();
     let data = sanitize_event_data(agent_dir, event_type, &event_id, data)?;
     let event = serde_json::json!({
@@ -133,17 +139,15 @@ pub(crate) fn append_agent_event_locked(
         "message": message,
         "data": data,
     });
-    let mut file = fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(path)
-        .map_err(|err| err.to_string())?;
     let text = serde_json::to_string(&event).unwrap_or_else(|_| "{}".to_string());
-    writeln!(file, "{text}").map_err(|err| err.to_string())?;
+    append_rotating_ndjson(
+        &agent_dir.join("events"),
+        "events",
+        &text,
+        RECENT_EVENT_MAX_BYTES,
+    )?;
     append_hook_index(agent_dir, event_type, &event)
 }
-
-const TOOL_OUTPUT_INLINE_LIMIT: usize = 4096;
 
 fn sanitize_event_data(
     agent_dir: &Path,
@@ -151,59 +155,191 @@ fn sanitize_event_data(
     event_id: &str,
     mut data: serde_json::Value,
 ) -> Result<serde_json::Value, String> {
-    if event_type != "hook.PostToolUse" {
+    let Some(hook_name) = event_type.strip_prefix("hook.") else {
         return Ok(data);
+    };
+    match event_type {
+        "hook.PostToolUse" => sanitize_post_tool_use(agent_dir, hook_name, event_id, &mut data)?,
+        "hook.PostToolBatch" => {
+            sanitize_post_tool_batch(agent_dir, hook_name, event_id, &mut data)?
+        }
+        _ => {}
     }
-    truncate_tool_response_field(agent_dir, event_id, &mut data, "stdout")?;
-    truncate_tool_response_field(agent_dir, event_id, &mut data, "stderr")?;
     Ok(data)
 }
 
-fn truncate_tool_response_field(
+fn sanitize_post_tool_use(
     agent_dir: &Path,
+    hook_name: &str,
     event_id: &str,
     data: &mut serde_json::Value,
-    field: &str,
 ) -> Result<(), String> {
-    let Some(tool_response) = data
+    let Some(raw) = data.get_mut("raw").and_then(|raw| raw.as_object_mut()) else {
+        return Ok(());
+    };
+    sanitize_tool_response(agent_dir, hook_name, event_id, "tool-response", raw)
+}
+
+fn sanitize_post_tool_batch(
+    agent_dir: &Path,
+    hook_name: &str,
+    event_id: &str,
+    data: &mut serde_json::Value,
+) -> Result<(), String> {
+    let Some(tool_calls) = data
         .get_mut("raw")
-        .and_then(|raw| raw.get_mut("tool_response"))
+        .and_then(|raw| raw.get_mut("tool_calls"))
+        .and_then(|value| value.as_array_mut())
+    else {
+        return Ok(());
+    };
+    for (index, call) in tool_calls.iter_mut().enumerate() {
+        if let Some(call_object) = call.as_object_mut() {
+            let label = format!("batch-{index}");
+            sanitize_tool_response(agent_dir, hook_name, event_id, &label, call_object)?;
+        }
+    }
+    Ok(())
+}
+
+fn sanitize_tool_response(
+    agent_dir: &Path,
+    hook_name: &str,
+    event_id: &str,
+    label: &str,
+    object: &mut serde_json::Map<String, serde_json::Value>,
+) -> Result<(), String> {
+    let Some(response) = object.get_mut("tool_response") else {
+        return Ok(());
+    };
+    if response.as_str().is_some() {
+        let original = response.as_str().unwrap().to_string();
+        if original.as_bytes().len() > TOOL_OUTPUT_INLINE_LIMIT {
+            let artifact = write_text_artifact(agent_dir, hook_name, event_id, label, &original)?;
+            *response = serde_json::json!(artifact_marker(&artifact));
+            object.insert("tool_response_artifact".to_string(), artifact);
+        }
+        return Ok(());
+    }
+    let Some(response_object) = response.as_object_mut() else {
+        return Ok(());
+    };
+    truncate_object_string_field(
+        agent_dir,
+        hook_name,
+        event_id,
+        label,
+        response_object,
+        "stdout",
+    )?;
+    truncate_object_string_field(
+        agent_dir,
+        hook_name,
+        event_id,
+        label,
+        response_object,
+        "stderr",
+    )?;
+    truncate_nested_file_content(agent_dir, hook_name, event_id, label, response_object)?;
+    Ok(())
+}
+
+fn truncate_nested_file_content(
+    agent_dir: &Path,
+    hook_name: &str,
+    event_id: &str,
+    label: &str,
+    object: &mut serde_json::Map<String, serde_json::Value>,
+) -> Result<(), String> {
+    let Some(file) = object
+        .get_mut("file")
         .and_then(|value| value.as_object_mut())
     else {
         return Ok(());
     };
-    let Some(original) = tool_response
-        .get(field)
-        .and_then(|value| value.as_str())
-        .map(str::to_string)
-    else {
+    truncate_object_string_field(agent_dir, hook_name, event_id, label, file, "content")
+}
+
+fn truncate_object_string_field(
+    agent_dir: &Path,
+    hook_name: &str,
+    event_id: &str,
+    label: &str,
+    object: &mut serde_json::Map<String, serde_json::Value>,
+    field: &str,
+) -> Result<(), String> {
+    let Some(original) = object.get(field).and_then(|value| value.as_str()) else {
         return Ok(());
     };
+    let original = original.to_string();
     let original_bytes = original.as_bytes().len();
     if original_bytes <= TOOL_OUTPUT_INLINE_LIMIT {
         return Ok(());
     }
-    let artifact_dir = agent_dir.join("logs").join("artifacts").join("PostToolUse");
-    fs::create_dir_all(&artifact_dir).map_err(|err| err.to_string())?;
-    let artifact_path = artifact_dir.join(format!("{event_id}-{field}.txt"));
-    fs::write(&artifact_path, &original).map_err(|err| err.to_string())?;
+    let artifact = write_text_artifact(
+        agent_dir,
+        hook_name,
+        event_id,
+        &format!("{label}-{field}"),
+        &original,
+    )?;
     let truncated = format!(
         "{}\n...[AgentCall truncated {} bytes; full output: {}]",
         safe_prefix(&original, TOOL_OUTPUT_INLINE_LIMIT),
         original_bytes,
-        artifact_path.display()
+        artifact
+            .get("path")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("")
     );
-    tool_response.insert(field.to_string(), serde_json::json!(truncated));
-    tool_response.insert(
-        format!("{field}_artifact"),
-        serde_json::json!({
-            "path": artifact_path,
-            "original_bytes": original_bytes,
-            "hash": fnv1a_hex(original.as_bytes()),
-            "truncated": true
-        }),
-    );
+    object.insert(field.to_string(), serde_json::json!(truncated));
+    object.insert(format!("{field}_artifact"), artifact);
     Ok(())
+}
+
+fn write_text_artifact(
+    agent_dir: &Path,
+    hook_name: &str,
+    event_id: &str,
+    label: &str,
+    text: &str,
+) -> Result<serde_json::Value, String> {
+    let artifact_dir = agent_dir
+        .join("artifacts")
+        .join("hooks")
+        .join(safe_path_component(hook_name));
+    fs::create_dir_all(&artifact_dir).map_err(|err| err.to_string())?;
+    let artifact_path = artifact_dir.join(format!(
+        "{}-{}.txt",
+        safe_path_component(event_id),
+        safe_path_component(label)
+    ));
+    fs::write(&artifact_path, text).map_err(|err| err.to_string())?;
+    Ok(serde_json::json!({
+        "path": artifact_path,
+        "original_bytes": text.as_bytes().len(),
+        "line_count": text.lines().count(),
+        "hash": fnv1a_hex(text.as_bytes()),
+        "truncated": true
+    }))
+}
+
+fn artifact_marker(artifact: &serde_json::Value) -> String {
+    format!(
+        "[AgentCall artifact: {} bytes, {} lines, path={}]",
+        artifact
+            .get("original_bytes")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0),
+        artifact
+            .get("line_count")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0),
+        artifact
+            .get("path")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("")
+    )
 }
 
 fn safe_prefix(text: &str, max_bytes: usize) -> String {
@@ -234,38 +370,102 @@ fn append_hook_index(
     let Some(hook_name) = event_type.strip_prefix("hook.") else {
         return Ok(());
     };
-    let log_dir = agent_dir.join("logs").join("hooks");
-    fs::create_dir_all(&log_dir).map_err(|err| err.to_string())?;
-    let path = log_dir.join(format!("{hook_name}.ndjson"));
+    let log_dir = agent_dir.join("logs").join("hooks").join(hook_name);
+    let text = serde_json::to_string(event).unwrap_or_else(|_| "{}".to_string());
+    append_rotating_ndjson(&log_dir, hook_name, &text, ROTATING_LOG_MAX_BYTES).map(|_| ())
+}
+
+fn append_rotating_ndjson(
+    dir: &Path,
+    stem: &str,
+    line: &str,
+    max_bytes: u64,
+) -> Result<PathBuf, String> {
+    fs::create_dir_all(dir).map_err(|err| err.to_string())?;
+    let path = dir.join("recent.ndjson");
+    let line_bytes = line.as_bytes().len() as u64 + 1;
+    if let Ok(metadata) = fs::metadata(&path) {
+        if metadata.len() > 0 && metadata.len().saturating_add(line_bytes) > max_bytes {
+            let date = chrono::Utc::now().format("%Y-%m-%d").to_string();
+            let archive_dir = dir.join("archive").join(date);
+            fs::create_dir_all(&archive_dir).map_err(|err| err.to_string())?;
+            let stamp = chrono::Utc::now().format("%H%M%S%.3f").to_string();
+            let archive_path =
+                archive_dir.join(format!("{}-{}.ndjson", safe_path_component(stem), stamp));
+            fs::rename(&path, archive_path).map_err(|err| err.to_string())?;
+        }
+    }
     let mut file = fs::OpenOptions::new()
         .create(true)
         .append(true)
-        .open(path)
+        .open(&path)
         .map_err(|err| err.to_string())?;
-    let text = serde_json::to_string(event).unwrap_or_else(|_| "{}".to_string());
-    writeln!(file, "{text}").map_err(|err| err.to_string())
+    writeln!(file, "{line}").map_err(|err| err.to_string())?;
+    Ok(path)
+}
+
+fn safe_path_component(text: &str) -> String {
+    text.chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.') {
+                ch
+            } else {
+                '-'
+            }
+        })
+        .collect()
+}
+
+fn recent_events_path_for(path: &Path) -> Option<PathBuf> {
+    if path.file_name().and_then(|name| name.to_str()) != Some("events.ndjson") {
+        return None;
+    }
+    let agent_dir = path.parent()?;
+    let recent = agent_dir.join("events").join("recent.ndjson");
+    if recent.exists() {
+        Some(recent)
+    } else if path.exists() {
+        Some(path.to_path_buf())
+    } else {
+        None
+    }
+}
+
+fn read_tail_text(path: &Path, max_bytes: u64) -> Option<String> {
+    let mut file = fs::File::open(path).ok()?;
+    let len = file.metadata().ok()?.len();
+    let start = len.saturating_sub(max_bytes);
+    file.seek(SeekFrom::Start(start)).ok()?;
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes).ok()?;
+    if start > 0 {
+        if let Some(index) = bytes.iter().position(|byte| *byte == b'\n') {
+            bytes.drain(..=index);
+        }
+    }
+    Some(String::from_utf8_lossy(&bytes).to_string())
 }
 
 pub(crate) fn next_event_number_from_log(workspace: &Path) -> u64 {
-    let path = workspace.join(".agentcall").join("events.ndjson");
-    let Ok(text) = fs::read_to_string(path) else {
-        return 1;
-    };
     let mut max_seen = 0u64;
-    for line in text.lines() {
-        let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
-            continue;
-        };
-        let Some(id) = value.get("id").and_then(|value| value.as_str()) else {
-            continue;
-        };
-        let Some(number) = id
-            .strip_prefix("evt-")
-            .and_then(|value| value.parse::<u64>().ok())
-        else {
-            continue;
-        };
-        max_seen = max_seen.max(number);
+    for path in event_log_candidates(workspace) {
+        if let Some(text) = read_tail_text(&path, READ_TAIL_BYTES) {
+            for line in text.lines() {
+                let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
+                    continue;
+                };
+                let Some(id) = value.get("id").and_then(|value| value.as_str()) else {
+                    continue;
+                };
+                let Some(number) = id
+                    .strip_prefix("evt-")
+                    .and_then(|value| value.parse::<u64>().ok())
+                else {
+                    continue;
+                };
+                max_seen = max_seen.max(number);
+            }
+        }
     }
     max_seen + 1
 }
@@ -281,8 +481,10 @@ pub(crate) fn next_runtime_seq_from_state(workspace: &Path) -> u64 {
             collect_route_numbers(&value, &mut max_seen);
         }
     }
-    let events_path = workspace.join(".agentcall").join("events.ndjson");
-    if let Ok(text) = fs::read_to_string(events_path) {
+    for events_path in event_log_candidates(workspace) {
+        let Some(text) = read_tail_text(&events_path, READ_TAIL_BYTES) else {
+            continue;
+        };
         for line in text.lines() {
             if let Ok(value) = serde_json::from_str::<serde_json::Value>(line) {
                 collect_route_numbers(&value, &mut max_seen);
@@ -290,6 +492,17 @@ pub(crate) fn next_runtime_seq_from_state(workspace: &Path) -> u64 {
         }
     }
     max_seen + 1
+}
+
+fn event_log_candidates(workspace: &Path) -> Vec<PathBuf> {
+    let agent_dir = workspace.join(".agentcall");
+    [
+        agent_dir.join("events").join("recent.ndjson"),
+        agent_dir.join("events.ndjson"),
+    ]
+    .into_iter()
+    .filter(|path| path.exists())
+    .collect()
 }
 
 fn collect_route_numbers(value: &serde_json::Value, max_seen: &mut u64) {
@@ -368,7 +581,8 @@ mod tests {
         )
         .unwrap();
 
-        let events_text = fs::read_to_string(agent_dir.join("events.ndjson")).unwrap();
+        let events_text =
+            fs::read_to_string(agent_dir.join("events").join("recent.ndjson")).unwrap();
         let event: serde_json::Value =
             serde_json::from_str(events_text.lines().next().unwrap()).unwrap();
         let stdout = event["data"]["raw"]["tool_response"]["stdout"]
@@ -383,7 +597,8 @@ mod tests {
         let hook_index = agent_dir
             .join("logs")
             .join("hooks")
-            .join("PostToolUse.ndjson");
+            .join("PostToolUse")
+            .join("recent.ndjson");
         assert!(hook_index.exists());
         let _ = fs::remove_dir_all(root);
     }

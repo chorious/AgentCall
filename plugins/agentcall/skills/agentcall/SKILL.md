@@ -21,6 +21,8 @@ Use AgentCall as the coordination layer for Codex-directed Claude Code utility w
 - Do not use HTTP fallback unless the user explicitly asks.
 - `tool_search` may return zero AgentCall tools even when AgentCall MCP is callable; treat direct MCP calls as the source of truth.
 - Treat workers as slower utility collaborators; wait for board/report evidence before calling them failed.
+- Respect the 60s patience contract: while `patience_status` is `inside_patience_window`, avoid repeated continue/status nudges unless attention is active.
+- Prefer board/session summaries over raw logs. AgentCall uses recent-first logs and artifact files; open raw artifacts only for debugging.
 - Prefer small, clearly owned handoff tasks with allowed paths.
 - Treat default PTY workers as bounded-write workers: write tools may use route `allowed_paths`, `report_path`, and the session scratch, while Bash remains readonly-only unless a future policy says otherwise.
 - If `attention_status` is `blocked_by_policy`, do not wait inside the patience window or resend the same prompt. Inspect `policy_block`, then adjust allowed paths/task, interrupt for a blocker report, or stop the worker.

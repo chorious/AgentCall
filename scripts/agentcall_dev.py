@@ -73,6 +73,18 @@ def main() -> int:
     paths = sub.add_parser("paths", help="Print resolved important local paths.")
     paths.set_defaults(func=cmd_paths)
 
+    logs = sub.add_parser("logs", help="Inspect AgentCall log layout and size budgets.")
+    logs_sub = logs.add_subparsers(dest="logs_command", required=True)
+    logs_doctor = logs_sub.add_parser("doctor", help="Report recent/archive/artifact log sizes.")
+    logs_doctor.set_defaults(func=cmd_logs_doctor)
+
+    sessions = sub.add_parser("sessions", help="Inspect or clean stale session projections.")
+    sessions_sub = sessions.add_subparsers(dest="sessions_command", required=True)
+    sessions_cleanup = sessions_sub.add_parser("cleanup", help="Remove stale active session projections and orphan queued instructions.")
+    sessions_cleanup.add_argument("--stale-after", default="5m", help="TTL such as 5m, 300s, or 1h.")
+    sessions_cleanup.add_argument("--apply", action="store_true", help="Write cleanup changes. Without this, only prints a dry run.")
+    sessions_cleanup.set_defaults(func=cmd_sessions_cleanup)
+
     args = parser.parse_args()
     root = Path(args.root).resolve()
     try:
@@ -193,6 +205,78 @@ def cmd_paths(root: Path, args: argparse.Namespace) -> int:
         "plugin_validator": str(plugin_validator_path()),
     }
     print(json.dumps(paths, ensure_ascii=False, indent=2))
+    return 0
+
+
+def cmd_logs_doctor(root: Path, args: argparse.Namespace) -> int:
+    _ = args
+    agent_dir = root / ".agentcall"
+    checks = [
+        size_check("legacy events", agent_dir / "events.ndjson", warn_bytes=8 * 1024 * 1024),
+        size_check("recent events", agent_dir / "events" / "recent.ndjson", warn_bytes=2 * 1024 * 1024),
+        size_check("routes state", agent_dir / "state" / "routes.json", warn_bytes=4 * 1024 * 1024),
+        dir_size_check("hook logs", agent_dir / "logs" / "hooks", warn_bytes=32 * 1024 * 1024),
+        dir_size_check("artifacts", agent_dir / "artifacts", warn_bytes=128 * 1024 * 1024),
+    ]
+    print_checks(checks)
+    recent = agent_dir / "events" / "recent.ndjson"
+    if recent.exists():
+        print(f"[INFO] board should read recent-first events: {recent}")
+    else:
+        print("[WARN] recent events file is missing; daemon has not written v4.3 events yet")
+    return 0 if all(check.status != "FAIL" for check in checks) else 1
+
+
+def cmd_sessions_cleanup(root: Path, args: argparse.Namespace) -> int:
+    ttl_seconds = parse_duration_seconds(args.stale_after)
+    state_dir = root / ".agentcall" / "state"
+    active_path = state_dir / "active_sessions.json"
+    pending_path = state_dir / "pending_supervisor_instructions.json"
+    active = read_json_object(active_path)
+    pending = read_json_object(pending_path)
+    now = time.time()
+
+    stale_active = []
+    for key, value in active.items():
+        updated_at = value.get("updated_at") if isinstance(value, dict) else None
+        age = timestamp_age_seconds(updated_at, now) if isinstance(updated_at, str) else None
+        binding_source = value.get("binding_source", "unbound") if isinstance(value, dict) else "unbound"
+        runtime = value.get("runtime", "") if isinstance(value, dict) else ""
+        wrapper = value.get("wrapper_session") if isinstance(value, dict) else None
+        if age is not None and age >= ttl_seconds and (binding_source == "unbound" or runtime == "codex" or not wrapper):
+            stale_active.append(key)
+
+    stale_pending = []
+    for wrapper, items in pending.items():
+        if not isinstance(items, list):
+            stale_pending.append(wrapper)
+            continue
+        if all(timestamp_age_seconds(item.get("created_at"), now) >= ttl_seconds for item in items if isinstance(item, dict)):
+            stale_pending.append(wrapper)
+
+    print(f"[INFO] stale-after={ttl_seconds}s")
+    print(f"[INFO] active_sessions stale candidates={len(stale_active)}")
+    for key in stale_active[:30]:
+        print(f"  active: {key}")
+    if len(stale_active) > 30:
+        print(f"  ... {len(stale_active) - 30} more")
+    print(f"[INFO] pending instruction stale candidates={len(stale_pending)}")
+    for wrapper in stale_pending[:30]:
+        print(f"  pending: {wrapper}")
+    if len(stale_pending) > 30:
+        print(f"  ... {len(stale_pending) - 30} more")
+
+    if not args.apply:
+        print("[DRY-RUN] no files changed; pass --apply to write cleanup")
+        return 0
+
+    for key in stale_active:
+        active.pop(key, None)
+    for wrapper in stale_pending:
+        pending.pop(wrapper, None)
+    write_json_object(active_path, active)
+    write_json_object(pending_path, pending)
+    print("[OK] stale session cleanup applied")
     return 0
 
 
@@ -353,6 +437,76 @@ def check_git(root: Path) -> Check:
     if dirty:
         return Check("git", "WARN", f"{len(dirty)} changed paths", "Commit, stash, or review changes before release.")
     return Check("git", "OK", lines[0] if lines else "clean")
+
+
+def size_check(name: str, path: Path, warn_bytes: int) -> Check:
+    if not path.exists():
+        return Check(name, "WARN", f"missing: {path}")
+    size = path.stat().st_size
+    status = "WARN" if size > warn_bytes else "OK"
+    hint = "Large log should be rotated or queried through recent-first paths." if status == "WARN" else None
+    return Check(name, status, f"{format_bytes(size)} at {path}", hint)
+
+
+def dir_size_check(name: str, path: Path, warn_bytes: int) -> Check:
+    if not path.exists():
+        return Check(name, "OK", f"missing/empty: {path}")
+    size = sum(item.stat().st_size for item in path.rglob("*") if item.is_file())
+    status = "WARN" if size > warn_bytes else "OK"
+    hint = "Large hook/artifact directory is expected over time; board should not scan it by default." if status == "WARN" else None
+    return Check(name, status, f"{format_bytes(size)} at {path}", hint)
+
+
+def format_bytes(size: int) -> str:
+    value = float(size)
+    for unit in ["B", "KB", "MB", "GB"]:
+        if value < 1024 or unit == "GB":
+            return f"{value:.1f}{unit}"
+        value /= 1024
+    return f"{size}B"
+
+
+def parse_duration_seconds(text: str) -> int:
+    text = text.strip().lower()
+    if text.endswith("ms"):
+        return max(1, int(float(text[:-2]) / 1000))
+    if text.endswith("s"):
+        return int(float(text[:-1]))
+    if text.endswith("m"):
+        return int(float(text[:-1]) * 60)
+    if text.endswith("h"):
+        return int(float(text[:-1]) * 60 * 60)
+    return int(float(text))
+
+
+def timestamp_age_seconds(timestamp: object, now: float) -> float:
+    if not isinstance(timestamp, str):
+        return float("inf")
+    normalized = timestamp.replace("Z", "+00:00")
+    try:
+        from datetime import datetime
+
+        parsed = datetime.fromisoformat(normalized)
+        return max(0.0, now - parsed.timestamp())
+    except ValueError:
+        return float("inf")
+
+
+def read_json_object(path: Path) -> dict:
+    if not path.exists():
+        return {}
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError:
+        return {}
+    return value if isinstance(value, dict) else {}
+
+
+def write_json_object(path: Path, value: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    tmp.write_text(json.dumps(value, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    tmp.replace(path)
 
 
 def event_has_agentcall_hook(settings: dict, event: str) -> bool:

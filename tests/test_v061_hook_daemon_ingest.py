@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import socket
 import subprocess
 import sys
@@ -25,7 +26,8 @@ def build_daemon() -> Path:
     target_dir = REPO_ROOT / "target-v061-hook"
     env = os.environ.copy()
     env["CARGO_TARGET_DIR"] = str(target_dir)
-    subprocess.run(["cargo", "build", "-p", "agentcall-daemon"], cwd=REPO_ROOT, env=env, check=True)
+    cargo = shutil.which("cargo") or str(Path.home() / ".cargo" / "bin" / "cargo.exe")
+    subprocess.run([cargo, "build", "-p", "agentcall-daemon"], cwd=REPO_ROOT, env=env, check=True)
     suffix = ".exe" if sys.platform.startswith("win") else ""
     binary = target_dir / "debug" / f"agentcall-daemon{suffix}"
     assert binary.exists(), f"missing daemon binary: {binary}"
@@ -156,7 +158,7 @@ def test_hook_script_daemon_first_concurrent_same_file(tmp_path, daemon_binary_p
         assert len(active_claims) == 1
         assert active_claims[0]["file"] == "src/app.py"
 
-        events_path = tmp_path / ".agentcall" / "events.ndjson"
+        events_path = tmp_path / ".agentcall" / "events" / "recent.ndjson"
         ids = []
         for line in events_path.read_text(encoding="utf-8").splitlines():
             event = json.loads(line)

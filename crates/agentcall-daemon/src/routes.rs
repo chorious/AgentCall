@@ -437,9 +437,9 @@ fn start_pty_route(
             "status": "pending_hook"
         },
         "patience_policy": {
-            "suggested_wait_seconds": 45,
+            "suggested_wait_seconds": 60,
             "do_not_retry_before_seconds": 60,
-            "stall_threshold_seconds": 180,
+            "stall_threshold_seconds": 300,
             "hint": "Claude Code PTY may spend time reading files, thinking, or preparing tool calls. Inspect session summary/attention before retrying or restarting."
         },
         "containment": containment
