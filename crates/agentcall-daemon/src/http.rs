@@ -1,4 +1,5 @@
-use crate::actor::{submit_raw_write, submit_session_command};
+use crate::actor::submit_session_command;
+use crate::commands::{CommandEnvelopeV1, CommandType};
 use crate::commands::{PreparedCommand, prepare_session_send_command};
 use crate::hooks::{
     EventAppendRequest, HookIngestRequest, append_event_request, file_claims_state, ingest_hook,
@@ -395,13 +396,15 @@ pub(crate) fn handle_ws_message(state: &AppState, session: &Arc<Session>, text: 
     match value.get("type").and_then(|v| v.as_str()) {
         Some("input") => {
             if let Some(data) = value.get("data").and_then(|v| v.as_str()) {
-                submit_raw_write(state, &session.name, data.as_bytes().to_vec());
-                append_agent_event(
-                    state,
-                    "pty.input_sent",
-                    "Input sent to PTY session.",
-                    serde_json::json!({"name": session.name, "chars": data.len(), "transport": "websocket"}),
-                );
+                let command = websocket_input_command(state, session, data);
+                if let Err(err) = submit_session_command(state, &session.name, command) {
+                    append_agent_event(
+                        state,
+                        "pty.input_rejected",
+                        "WebSocket input was rejected by actor command path.",
+                        serde_json::json!({"name": session.name, "chars": data.len(), "transport": "websocket", "error": err}),
+                    );
+                }
             }
         }
         Some("resize") => {
@@ -421,6 +424,32 @@ pub(crate) fn handle_ws_message(state: &AppState, session: &Arc<Session>, text: 
             );
         }
         _ => {}
+    }
+}
+
+fn websocket_input_command(
+    state: &AppState,
+    session: &Arc<Session>,
+    data: &str,
+) -> CommandEnvelopeV1 {
+    let seq = state.next_seq();
+    CommandEnvelopeV1 {
+        schema_version: 1,
+        command_id: format!("cmd-ws-{}-{seq}", session.name),
+        session_id: session.name.clone(),
+        run_id: None,
+        owner_id: "websocket".to_string(),
+        owner_lease_id: format!("websocket-{}", session.name),
+        lease_generation: 0,
+        idempotency_key: format!("ws-{}-{seq}", session.name),
+        command_type: CommandType::SendInput,
+        payload: serde_json::json!({
+            "text": data,
+            "enter": false,
+            "transport": "websocket",
+        }),
+        precondition: None,
+        created_at: chrono::Utc::now().to_rfc3339(),
     }
 }
 
