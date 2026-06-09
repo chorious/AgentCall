@@ -111,7 +111,7 @@ impl RuntimeStore for JsonRuntimeStore {
     }
 
     fn get_idempotency(&self, owner: &str, key: &str) -> Result<Option<CommandRecord>, String> {
-        let value = read_json_file(&commands_index_path(&self.workspace), json!({}));
+        let value = read_commands_index(&self.workspace)?;
         let scope = format!("{owner}:{key}");
         Ok(value.get(&scope).and_then(command_record_from_value))
     }
@@ -249,7 +249,7 @@ impl RuntimeStore for JsonRuntimeStore {
         let scope = format!("{}:{}", command.owner_id, command.idempotency_key);
         let fingerprint = command_fingerprint(command);
         let index_path = commands_index_path(&self.workspace);
-        let mut index = read_json_file(&index_path, json!({}));
+        let mut index = read_commands_index(&self.workspace)?;
         if let Some(existing) = index.get(&scope).and_then(command_record_from_value) {
             if existing.fingerprint == fingerprint {
                 return Ok(IdempotencyDecisionV1::Deduped(existing));
@@ -431,6 +431,81 @@ fn commands_index_path(workspace: &Path) -> PathBuf {
         .join("commands.index.json")
 }
 
+fn commands_log_path(workspace: &Path) -> PathBuf {
+    workspace
+        .join(".agentcall")
+        .join("state")
+        .join("commands.ndjson")
+}
+
+fn command_status_log_path(workspace: &Path) -> PathBuf {
+    workspace
+        .join(".agentcall")
+        .join("state")
+        .join("command-status.ndjson")
+}
+
+fn read_commands_index(workspace: &Path) -> Result<Value, String> {
+    let path = commands_index_path(workspace);
+    let parsed = fs::read_to_string(&path)
+        .ok()
+        .and_then(|text| serde_json::from_str::<Value>(&text).ok())
+        .filter(Value::is_object);
+    if let Some(index) = parsed {
+        return Ok(index);
+    }
+    let index = rebuild_commands_index(workspace)?;
+    write_json_file(&path, &index)?;
+    Ok(index)
+}
+
+fn rebuild_commands_index(workspace: &Path) -> Result<Value, String> {
+    let mut index = json!({});
+    if let Ok(text) = fs::read_to_string(commands_log_path(workspace)) {
+        for line in text.lines() {
+            let Ok(value) = serde_json::from_str::<Value>(line) else {
+                continue;
+            };
+            let Some(scope) = value
+                .get("scope")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+            else {
+                continue;
+            };
+            if command_record_from_value(&value).is_some() {
+                index[&scope] = value;
+            }
+        }
+    }
+    if let Ok(text) = fs::read_to_string(command_status_log_path(workspace)) {
+        for line in text.lines() {
+            let Ok(value) = serde_json::from_str::<Value>(line) else {
+                continue;
+            };
+            let Some(command_id) = value.get("command_id").and_then(Value::as_str) else {
+                continue;
+            };
+            let Some(status) = value.get("status").and_then(Value::as_str) else {
+                continue;
+            };
+            if let Some(records) = index.as_object_mut() {
+                for record in records.values_mut() {
+                    if record.get("command_id").and_then(Value::as_str) == Some(command_id) {
+                        if let Some(object) = record.as_object_mut() {
+                            object.insert("status".to_string(), json!(status));
+                            if let Some(updated_at) = value.get("updated_at") {
+                                object.insert("updated_at".to_string(), updated_at.clone());
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    Ok(index)
+}
+
 fn command_record_to_value(scope: &str, record: &CommandRecord) -> Value {
     json!({
         "scope": scope,
@@ -537,26 +612,82 @@ mod tests {
     fn json_store_registers_command_idempotently() {
         let root = test_workspace("command-idempotency");
         let store = JsonRuntimeStore::new(root.clone());
-        let command = CommandEnvelopeV1 {
-            schema_version: 1,
-            command_id: "cmd-1".to_string(),
-            session_id: "worker-a".to_string(),
-            run_id: None,
-            owner_id: "codex".to_string(),
-            owner_lease_id: "lease-worker-a-1".to_string(),
-            lease_generation: 1,
-            idempotency_key: "idem-1".to_string(),
-            command_type: CommandType::SendInput,
-            payload: json!({"text": "go"}),
-            precondition: None,
-            created_at: chrono::Utc::now().to_rfc3339(),
-        };
+        let command = command_for("cmd-1", "idem-1", "go");
         let first = store.register_command_idempotently(&command).unwrap();
         assert!(matches!(first, IdempotencyDecisionV1::Recorded(_)));
         let second = store.register_command_idempotently(&command).unwrap();
         assert!(matches!(second, IdempotencyDecisionV1::Deduped(_)));
         assert!(root.join(".agentcall/state/commands.ndjson").exists());
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn json_store_rebuilds_corrupt_command_index_from_logs() {
+        let root = test_workspace("command-index-rebuild");
+        let store = JsonRuntimeStore::new(root.clone());
+        let command = command_for("cmd-2", "idem-2", "go");
+        store.register_command_idempotently(&command).unwrap();
+        let event = crate::events::build_event_envelope(
+            "evt-000002".to_string(),
+            2,
+            Some(1),
+            "command.completed",
+            "done",
+            json!({"wrapper_session": "worker-a", "command_id": "cmd-2"}),
+        );
+        let update = apply_event_to_projection(None, &event);
+        store
+            .complete_command_with_event("cmd-2", CommandStatus::Completed, &event, update)
+            .unwrap();
+
+        fs::write(commands_index_path(&root), "{not-json").unwrap();
+
+        let rebuilt = store.get_idempotency("codex", "idem-2").unwrap().unwrap();
+        assert_eq!(rebuilt.status, "completed");
+        let deduped = store.register_command_idempotently(&command).unwrap();
+        assert!(matches!(deduped, IdempotencyDecisionV1::Deduped(_)));
+        let repaired_text = fs::read_to_string(commands_index_path(&root)).unwrap();
+        assert!(repaired_text.contains("\"status\": \"completed\""));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn json_store_corrupt_projection_snapshot_is_not_returned_as_healthy() {
+        let root = test_workspace("projection-corrupt");
+        let store = JsonRuntimeStore::new(root.clone());
+        let event = crate::events::build_event_envelope(
+            "evt-000003".to_string(),
+            3,
+            Some(1),
+            "pty.session_started",
+            "started",
+            json!({"session_id": "worker-a", "cwd": root.display().to_string()}),
+        );
+        let update = apply_event_to_projection(None, &event);
+        store
+            .append_event_and_update_projection(&event, update)
+            .unwrap();
+        fs::write(projection_path(&root, "worker-a"), "{not-json").unwrap();
+
+        assert!(store.get_session_projection("worker-a").unwrap().is_none());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    fn command_for(command_id: &str, idempotency_key: &str, text: &str) -> CommandEnvelopeV1 {
+        CommandEnvelopeV1 {
+            schema_version: 1,
+            command_id: command_id.to_string(),
+            session_id: "worker-a".to_string(),
+            run_id: None,
+            owner_id: "codex".to_string(),
+            owner_lease_id: "lease-worker-a-1".to_string(),
+            lease_generation: 1,
+            idempotency_key: idempotency_key.to_string(),
+            command_type: CommandType::SendInput,
+            payload: json!({"text": text}),
+            precondition: None,
+            created_at: chrono::Utc::now().to_rfc3339(),
+        }
     }
 
     fn test_workspace(name: &str) -> PathBuf {
