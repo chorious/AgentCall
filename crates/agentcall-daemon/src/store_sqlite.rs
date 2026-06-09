@@ -349,15 +349,19 @@ impl RuntimeStore for SqliteRuntimeStore {
     ) -> Result<(), String> {
         let mut conn = self.connect()?;
         let tx = conn.transaction().map_err(|err| err.to_string())?;
-        tx.execute(
-            "UPDATE commands SET status = ?1, updated_at = ?2 WHERE command_id = ?3",
-            params![
-                command_status_text(status),
-                chrono::Utc::now().to_rfc3339(),
-                command_id
-            ],
-        )
-        .map_err(|err| err.to_string())?;
+        let updated = tx
+            .execute(
+                "UPDATE commands SET status = ?1, updated_at = ?2 WHERE command_id = ?3",
+                params![
+                    command_status_text(status),
+                    chrono::Utc::now().to_rfc3339(),
+                    command_id
+                ],
+            )
+            .map_err(|err| err.to_string())?;
+        if updated == 0 {
+            return Err(format!("unknown_command_id: {command_id}"));
+        }
         insert_event(&tx, event)?;
         if projection_update.changed {
             upsert_projection(&tx, &projection_update.projection)?;
@@ -523,7 +527,7 @@ fn open_connection(path: &Path) -> Result<Connection, String> {
 
 fn insert_event(conn: &Connection, event: &EventEnvelopeV1) -> Result<(), String> {
     conn.execute(
-        "INSERT OR REPLACE INTO events(global_seq, event_id, session_id, session_seq, run_id, owner_id, schema_version, ts, source, event_type, severity, command_id, idempotency_key, trace_id, payload_json) \
+        "INSERT INTO events(global_seq, event_id, session_id, session_seq, run_id, owner_id, schema_version, ts, source, event_type, severity, command_id, idempotency_key, trace_id, payload_json) \
          VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
         params![
             event.global_seq as i64,
@@ -770,6 +774,86 @@ mod tests {
                 .len(),
             1
         );
+    }
+
+    #[test]
+    fn sqlite_command_completion_rejects_unknown_command_without_event() {
+        let store = test_store("complete-unknown-command");
+        let event = crate::events::build_event_envelope(
+            "evt-000003".to_string(),
+            3,
+            Some(1),
+            "command.completed",
+            "done",
+            json!({"wrapper_session": "worker-a", "command_id": "missing-cmd"}),
+        );
+        let update = apply_event_to_projection(None, &event);
+        let err = store
+            .complete_command_with_event("missing-cmd", CommandStatus::Completed, &event, update)
+            .unwrap_err();
+        assert!(err.contains("unknown_command_id"));
+        assert!(
+            store
+                .get_events(EventQuery {
+                    session_id: Some("worker-a".to_string()),
+                    after_global_seq: Some(0),
+                    event_types: vec![],
+                    limit: 10,
+                })
+                .unwrap()
+                .is_empty()
+        );
+        assert!(store.get_session_projection("worker-a").unwrap().is_none());
+    }
+
+    #[test]
+    fn sqlite_command_completion_rolls_back_when_event_insert_fails() {
+        let store = test_store("complete-rollback");
+        let command = command_for("cmd-3", "idem-3", "go");
+        store.register_command_idempotently(&command).unwrap();
+        let existing_event = crate::events::build_event_envelope(
+            "evt-000004".to_string(),
+            4,
+            Some(1),
+            "pty.session_started",
+            "started",
+            json!({"wrapper_session": "worker-a"}),
+        );
+        let existing_update = apply_event_to_projection(None, &existing_event);
+        store
+            .append_event_and_update_projection(&existing_event, existing_update)
+            .unwrap();
+
+        let conflicting_event = crate::events::build_event_envelope(
+            "evt-000005".to_string(),
+            4,
+            Some(2),
+            "command.completed",
+            "done",
+            json!({"wrapper_session": "worker-a", "command_id": "cmd-3"}),
+        );
+        let update = apply_event_to_projection(None, &conflicting_event);
+        let err = store
+            .complete_command_with_event(
+                "cmd-3",
+                CommandStatus::Completed,
+                &conflicting_event,
+                update,
+            )
+            .unwrap_err();
+        assert!(err.contains("UNIQUE") || err.contains("constraint"));
+        let fetched = store.get_idempotency("codex", "idem-3").unwrap().unwrap();
+        assert_eq!(fetched.status, "accepted");
+        let events = store
+            .get_events(EventQuery {
+                session_id: Some("worker-a".to_string()),
+                after_global_seq: Some(0),
+                event_types: vec![],
+                limit: 10,
+            })
+            .unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].event_type, "pty.session_started");
     }
 
     fn command_for(command_id: &str, idempotency_key: &str, text: &str) -> CommandEnvelopeV1 {

@@ -170,6 +170,9 @@ python scripts\agentcall_dev.py smoke real-worker --store-backend sqlite
 - Add corruption/rebuild tests for command index and projection snapshot.
   - command index corruption rebuild **covered for JSON store** from `commands.ndjson` plus `command-status.ndjson`.
   - projection snapshot corruption **covered for JSON store** as stale/missing rather than false-healthy; replay rebuild remains a future explicit recovery mode.
+- Add SQLite transaction failure tests for command completion.
+  - unknown command completion rejects without writing event/projection.
+  - event uniqueness failure rolls back command status to `accepted`.
 
 ### P1: Scheduler and Lease Validation
 
