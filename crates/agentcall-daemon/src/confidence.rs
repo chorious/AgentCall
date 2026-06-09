@@ -329,6 +329,28 @@ mod tests {
     }
 
     #[test]
+    fn failed_validation_contradicts_success_claim() {
+        let report = json!({
+            "status": "success",
+            "report_path": "docs/report.md",
+            "session_id": "worker-a"
+        });
+        let events = vec![event(
+            "evt-3",
+            "validation.completed",
+            json!({"wrapper_session": "worker-a", "status": "failed"}),
+        )];
+        let ledger = confidence_for_report(&report, &events);
+        assert_eq!(ledger.band, "low");
+        assert!(
+            ledger
+                .contradictions
+                .iter()
+                .any(|item| item.contains("failed test"))
+        );
+    }
+
+    #[test]
     fn unbacked_report_claim_stays_low_confidence() {
         let report = json!({
             "summary": "Looks good",

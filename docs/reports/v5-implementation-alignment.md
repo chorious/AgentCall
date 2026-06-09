@@ -70,6 +70,7 @@ Current confidence: implemented enough for first integration, but needs deeper r
   - sends input through MCP `agentcall_session_send` and the actor command path,
   - verifies MCP `agentcall_session` default projection,
   - verifies stop returns `awaiting_observation`,
+  - verifies stop releases owner/workspace leases and restart sees released lease state,
   - verifies compact attention board is projection-only.
 
 ### v5.2 Durable Runtime + Scheduler + Adapter Trait
@@ -90,7 +91,7 @@ Implemented:
 - Deterministic `ConfidenceLedger` in `crates/agentcall-daemon/src/confidence.rs`.
 - Skill/context generator in `scripts/generate_agentcall_skill.py`, covered by `tests/test_agentcall_skill_generator.py`.
 
-Current confidence: broad first pass is implemented. The main remaining risk is not missing modules, but ensuring all live write paths have actually converged on the transaction-shaped store/actor boundaries.
+Current confidence: broad first pass is implemented, with live route/session/command/lease paths now covered by transaction-shaped store smoke and failure tests. The remaining risk is the long tail of hook/report validator write paths and process cleanup evidence, not missing core modules.
 
 2026-06-09 update:
 
@@ -103,8 +104,11 @@ Current confidence: broad first pass is implemented. The main remaining risk is 
   - compact attention board projection,
   - session event query,
   - command idempotency record.
-  - command completed status after actor dispatch.
+  - command completed status after actor dispatch,
   - owner/workspace lease active and released state.
+- Confidence ledger now covers unbacked success claims, policy-block contradictions, daemon-observed file-write evidence, and failed validation after a success report.
+- Scheduler/lease unit coverage now includes same-workspace conflict across differently spelled Windows paths and capacity rejection without hidden queue.
+- The generated Codex skill already contains the operator note to inspect compact board/session projection before sending, interrupting, or accepting reports.
 
 ## Verification Already Run
 
@@ -128,13 +132,13 @@ python -m pytest -q
 17 passed
 
 cargo test -p agentcall-daemon -p agentcall-mcp
-agentcall-daemon: 89 passed
+agentcall-daemon: 97 passed
 agentcall-mcp: 7 passed
 
 python scripts\agentcall_arch_audit.py
 [OK] AgentCall architecture audit passed
 
-python scripts\agentcall_dev.py smoke real-worker
+python scripts\agentcall_dev.py smoke real-worker --store-backend json
 [OK] real worker PTY smoke
 
 python scripts\agentcall_dev.py smoke real-worker --store-backend sqlite
@@ -156,7 +160,7 @@ python scripts\agentcall_dev.py smoke real-worker --store-backend sqlite
 - Send a normal prompt through the actor command path with explicit `idempotency_key`. **Done via MCP `agentcall_session_send` real-worker smoke.**
 - Verify board projection updates without reading raw terminal output. **Done for compact attention board and MCP default session projection.**
 - Verify `interrupt` returns an interrupting/awaiting-observation state before final completion.
-- Verify `stop` releases workspace lease and does not leave a healthy running projection. **Partially done: stop returns `awaiting_observation` and projection moves to stopping/completed; explicit lease-state assertion still open.**
+- Verify `stop` releases workspace lease and does not leave a healthy running projection. **Done in real-worker smoke for both JSON and SQLite: stop returns `awaiting_observation`, projection moves out of healthy running, and owner/workspace leases are released after daemon restart.**
 
 ### P1: Store Backend Hardening
 
@@ -178,8 +182,8 @@ python scripts\agentcall_dev.py smoke real-worker --store-backend sqlite
 
 ### P1: Scheduler and Lease Validation
 
-- Test same-workspace exclusive conflict with differently spelled Windows paths.
-- Test capacity rejection does not create hidden queued work.
+- Test same-workspace exclusive conflict with differently spelled Windows paths. **Covered by `ownership::tests::same_workspace_different_path_spelling_conflicts`.**
+- Test capacity rejection does not create hidden queued work. **Covered by scheduler global/per-owner capacity tests.**
 - Test `scope=mine` / owner filtering after multiple owners exist.
 
 ### P1: Process Ownership Validation
@@ -190,15 +194,46 @@ python scripts\agentcall_dev.py smoke real-worker --store-backend sqlite
 
 ### P2: Confidence and Report Review
 
-- Add examples where Claude claims success but observed evidence is missing.
-- Add examples where tests fail after a success report.
-- Keep natural-language report claims low-confidence unless backed by structured evidence.
+- Add examples where Claude claims success but observed evidence is missing. **Covered by `unbacked_report_claim_stays_low_confidence`.**
+- Add examples where tests fail after a success report. **Covered by `failed_validation_contradicts_success_claim`.**
+- Keep natural-language report claims low-confidence unless backed by structured evidence. **Covered by confidence ledger tests; continue expanding with real reports as fixtures.**
 
 ### P2: Skill Rollout
 
-- Run `python scripts/generate_agentcall_skill.py --check` in release-check.
-- Confirm the generated skill is the one installed/visible to Codex sessions.
-- Add a short operator note explaining that Codex should inspect board/session projection before sending or interrupting.
+- Run `python scripts/generate_agentcall_skill.py --check` in release-check. **Done.**
+- Confirm the generated skill is the one installed/visible to Codex sessions. **Partially done: repo-local generated skill is up to date; actual Codex session visibility remains an operator/environment check.**
+- Add a short operator note explaining that Codex should inspect board/session projection before sending or interrupting. **Done in generated skill action matrix and session-send rules.**
+
+## Next Todo Plan
+
+### P0: Close Remaining Live Write Audit
+
+- Trace hook/report/session write paths and mark every remaining direct state write as one of:
+  - migrated to `RuntimeStore`,
+  - projection/debug bootstrap only,
+  - legacy/manual and unavailable from default MCP flow.
+- Extend `scripts/agentcall_arch_audit.py` with any newly identified forbidden live-write calls.
+- Add one integration test proving report acceptance/confidence writes do not bypass RuntimeStore.
+
+### P1: Process Ownership Evidence
+
+- Add a Windows Job Object smoke where the PTY parent starts a child process, then `stop` or `kill_tree` proves the child is cleaned up.
+- If portable PTY cannot guarantee child cleanup, expose `portable_pty_best_effort` in runtime health and skill wording instead of claiming kill-tree guarantee.
+- Add actor failure / writer-closed projection tests so failed workers never remain healthy running.
+
+### P1: Owner-Scoped Views
+
+- Decide whether `scope=mine` belongs in MCP board/session projection for v5.2 or is deferred.
+- If kept in v5.2, implement owner-filtered board/session query and test multiple owners.
+- If deferred, document the deferral explicitly so scheduler owner limits are not confused with owner-scoped views.
+
+### P2: Real Report Fixtures
+
+- Add small real-world report fixtures for:
+  - success claim with missing deterministic evidence,
+  - success claim contradicted by failed validation,
+  - medium-confidence report artifact with incomplete daemon evidence.
+- Keep deterministic confidence rules; do not introduce LLM-based report parsing.
 
 ## Commit Recommendation
 
