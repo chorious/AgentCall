@@ -42,6 +42,11 @@ pub(crate) struct WorkspaceLease {
     pub(crate) expires_at: String,
 }
 
+pub(crate) struct RouteLeaseReservation {
+    pub(crate) owner_lease: OwnerLease,
+    pub(crate) workspace_lease: WorkspaceLease,
+}
+
 pub(crate) fn ensure_owner_lease(
     state: &AppState,
     session_id: &str,
@@ -57,19 +62,7 @@ pub(crate) fn ensure_owner_lease(
         }
         return Ok(existing.clone());
     }
-    let now = chrono::Utc::now();
-    let lease = OwnerLease {
-        lease_id: format!("lease-{session_id}-1"),
-        owner_id: owner_id.to_string(),
-        session_id: session_id.to_string(),
-        lease_generation: 1,
-        acquired_at: now.to_rfc3339(),
-        last_heartbeat_at: now.to_rfc3339(),
-        renewed_at: now.to_rfc3339(),
-        expires_at: (now + chrono::Duration::minutes(30)).to_rfc3339(),
-        status: LeaseStatus::Active,
-        recoverable: true,
-    };
+    let lease = build_owner_lease(session_id, owner_id);
     leases.insert(session_id.to_string(), lease.clone());
     persist_owner_leases(state, &leases)?;
     state.store.upsert_owner_lease(&lease)?;
@@ -132,6 +125,73 @@ pub(crate) fn attach_or_validate_owner_lease(
     Ok(enriched)
 }
 
+pub(crate) fn reserve_route_leases(
+    state: &AppState,
+    session_id: &str,
+    owner_id: &str,
+    workspace: &Path,
+    read_only: bool,
+) -> Result<RouteLeaseReservation, String> {
+    let owner_lease = build_owner_lease(session_id, owner_id);
+    let workspace_lease = build_workspace_lease(session_id, owner_id, workspace, read_only);
+    {
+        let owner_leases = state.owner_leases.lock().unwrap();
+        if let Some(existing) = owner_leases.get(session_id) {
+            return Err(format!(
+                "rejected_existing_owner_lease: session={session_id} owner={}",
+                existing.owner_id
+            ));
+        }
+    }
+    {
+        let workspace_leases = state.workspace_leases.lock().unwrap();
+        for existing in workspace_leases.values() {
+            if existing.workspace_key != workspace_lease.workspace_key
+                || existing.session_id == session_id
+            {
+                continue;
+            }
+            if existing.mode == WorkspaceLeaseMode::Exclusive
+                || workspace_lease.mode == WorkspaceLeaseMode::Exclusive
+            {
+                return Err(format!(
+                    "workspace_busy: workspace={} existing_session={} existing_mode={:?}",
+                    workspace.display(),
+                    existing.session_id,
+                    existing.mode
+                ));
+            }
+        }
+    }
+    Ok(RouteLeaseReservation {
+        owner_lease,
+        workspace_lease,
+    })
+}
+
+pub(crate) fn install_reserved_route_leases(
+    state: &AppState,
+    reservation: &RouteLeaseReservation,
+) -> Result<(), String> {
+    {
+        let mut owner_leases = state.owner_leases.lock().unwrap();
+        owner_leases.insert(
+            reservation.owner_lease.session_id.clone(),
+            reservation.owner_lease.clone(),
+        );
+        persist_owner_leases(state, &owner_leases)?;
+    }
+    {
+        let mut workspace_leases = state.workspace_leases.lock().unwrap();
+        workspace_leases.insert(
+            reservation.workspace_lease.session_id.clone(),
+            reservation.workspace_lease.clone(),
+        );
+        persist_workspace_leases(state, &workspace_leases)?;
+    }
+    Ok(())
+}
+
 pub(crate) fn release_owner_lease(
     state: &AppState,
     session_id: &str,
@@ -154,6 +214,7 @@ pub(crate) fn release_owner_lease(
     Ok(Some(lease))
 }
 
+#[allow(dead_code)]
 pub(crate) fn acquire_workspace_lease(
     state: &AppState,
     session_id: &str,
@@ -180,15 +241,7 @@ pub(crate) fn acquire_workspace_lease(
             ));
         }
     }
-    let lease = WorkspaceLease {
-        lease_id: format!("workspace-lease-{session_id}-1"),
-        workspace: workspace.display().to_string(),
-        workspace_key,
-        mode,
-        owner_id: "codex".to_string(),
-        session_id: session_id.to_string(),
-        expires_at: (chrono::Utc::now() + chrono::Duration::minutes(30)).to_rfc3339(),
-    };
+    let lease = build_workspace_lease_with_key(session_id, "codex", workspace, workspace_key, mode);
     leases.insert(session_id.to_string(), lease.clone());
     persist_workspace_leases(state, &leases)?;
     state.store.upsert_workspace_lease(&lease)?;
@@ -213,6 +266,55 @@ pub(crate) fn release_workspace_lease(
         json!({"session_id": session_id, "lease_id": lease.lease_id, "workspace_key": lease.workspace_key, "reason": reason}),
     );
     Ok(Some(lease))
+}
+
+fn build_owner_lease(session_id: &str, owner_id: &str) -> OwnerLease {
+    let now = chrono::Utc::now();
+    OwnerLease {
+        lease_id: format!("lease-{session_id}-1"),
+        owner_id: owner_id.to_string(),
+        session_id: session_id.to_string(),
+        lease_generation: 1,
+        acquired_at: now.to_rfc3339(),
+        last_heartbeat_at: now.to_rfc3339(),
+        renewed_at: now.to_rfc3339(),
+        expires_at: (now + chrono::Duration::minutes(30)).to_rfc3339(),
+        status: LeaseStatus::Active,
+        recoverable: true,
+    }
+}
+
+fn build_workspace_lease(
+    session_id: &str,
+    owner_id: &str,
+    workspace: &Path,
+    read_only: bool,
+) -> WorkspaceLease {
+    let mode = if read_only {
+        WorkspaceLeaseMode::SharedReadonly
+    } else {
+        WorkspaceLeaseMode::Exclusive
+    };
+    let workspace_key = canonical_workspace_key(workspace);
+    build_workspace_lease_with_key(session_id, owner_id, workspace, workspace_key, mode)
+}
+
+fn build_workspace_lease_with_key(
+    session_id: &str,
+    owner_id: &str,
+    workspace: &Path,
+    workspace_key: String,
+    mode: WorkspaceLeaseMode,
+) -> WorkspaceLease {
+    WorkspaceLease {
+        lease_id: format!("workspace-lease-{session_id}-1"),
+        workspace: workspace.display().to_string(),
+        workspace_key,
+        mode,
+        owner_id: owner_id.to_string(),
+        session_id: session_id.to_string(),
+        expires_at: (chrono::Utc::now() + chrono::Duration::minutes(30)).to_rfc3339(),
+    }
 }
 
 pub(crate) fn canonical_workspace_key(path: &Path) -> String {

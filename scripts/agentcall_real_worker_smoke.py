@@ -84,7 +84,7 @@ def main() -> int:
             "route_id": route.get("route_id"),
             "checks": [
                 "MCP route started a real PTY runtime",
-                "RuntimeStore recorded active owner/workspace leases",
+                "RuntimeStore recorded route session plus active owner/workspace leases",
                 "route initial prompt reached fake worker",
                 "MCP session_send used actor command path",
                 "MCP session default returned projection summary without raw terminal scan",
@@ -282,20 +282,31 @@ def verify_active_leases(workspace: Path, store_backend: str, session_name: str)
                 "SELECT lease_id FROM workspace_leases WHERE session_id = ?",
                 (session_name,),
             ).fetchone()
+            session_row = conn.execute(
+                "SELECT runtime FROM sessions WHERE session_id = ?",
+                (session_name,),
+            ).fetchone()
         if owner is None or owner[0] != "Active":
             raise SmokeError(f"sqlite lease recovery: expected active owner lease, got {owner!r}")
         if workspace_row is None:
             raise SmokeError("sqlite lease recovery: expected active workspace lease")
+        if session_row is None or session_row[0] != "pty":
+            raise SmokeError(
+                f"sqlite route recovery: expected durable pty session row, got {session_row!r}"
+            )
         return
 
     owner_index = read_json_file(workspace / ".agentcall" / "state" / "owner_leases.index.json")
     workspace_index = read_json_file(
         workspace / ".agentcall" / "state" / "workspace_leases.index.json"
     )
+    session_index = read_json_file(workspace / ".agentcall" / "state" / "sessions.index.json")
     if owner_index.get(session_name, {}).get("status") != "Active":
         raise SmokeError("json lease recovery: expected active owner lease")
     if workspace_index.get(session_name, {}).get("status") != "Active":
         raise SmokeError("json lease recovery: expected active workspace lease")
+    if session_index.get(session_name, {}).get("runtime") != "pty":
+        raise SmokeError("json route recovery: expected durable pty session row")
 
 
 def assert_released_leases(workspace: Path, store_backend: str, session_name: str) -> None:

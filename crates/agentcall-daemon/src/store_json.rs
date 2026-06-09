@@ -305,6 +305,10 @@ impl RuntimeStore for JsonRuntimeStore {
         owner_lease: &OwnerLease,
         workspace_lease: Option<&WorkspaceLease>,
     ) -> Result<RouteDecisionV1, String> {
+        self.upsert_owner_lease(owner_lease)?;
+        if let Some(workspace_lease) = workspace_lease {
+            self.upsert_workspace_lease(workspace_lease)?;
+        }
         upsert_index_record(
             &self.agent_dir().join("state").join("sessions.index.json"),
             &session.session_id,

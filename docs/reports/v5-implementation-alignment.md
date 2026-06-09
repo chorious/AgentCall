@@ -98,6 +98,7 @@ Current confidence: broad first pass is implemented. The main remaining risk is 
   - `python scripts\agentcall_dev.py smoke real-worker --store-backend json`
   - `python scripts\agentcall_dev.py smoke real-worker --store-backend sqlite`
 - Both backends now cover live route/session/projection and daemon restart recovery for:
+  - durable route session record,
   - default MCP session projection,
   - compact attention board projection,
   - session event query,

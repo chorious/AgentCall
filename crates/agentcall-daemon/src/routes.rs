@@ -1,12 +1,16 @@
 use crate::actor::submit_session_command;
 use crate::commands::build_session_send_command;
-use crate::ownership::{acquire_workspace_lease, release_workspace_lease};
+use crate::ownership::{
+    install_reserved_route_leases, release_owner_lease, release_workspace_lease,
+    reserve_route_leases,
+};
 use crate::runtime::{AgentRuntime, StartSpec};
 use crate::runtime_pty::ClaudeCodePtyRuntime;
 use crate::runtime_sdk::{ClaudeCodeSdkRuntime, sdk_runtime_enabled};
 use crate::scheduler::enforce_start_capacity;
 use crate::session::is_claude_command;
 use crate::state::{AppState, append_agent_event_locked, read_json_file, write_json_file};
+use crate::store::{RouteDecisionV1, SessionRecord};
 use crate::util::{now_ms, safe_name};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -459,12 +463,29 @@ fn start_pty_route(
     let containment = pty_containment(state, req, &session_name);
     let target_workspace = route_target_workspace(state, req);
     let schedule = enforce_start_capacity(state, "codex")?;
-    let workspace_lease = acquire_workspace_lease(
+    let leases = reserve_route_leases(
         state,
         &session_name,
+        "codex",
         &target_workspace,
         req.read_only.unwrap_or(false),
     )?;
+    let session_record = SessionRecord {
+        session_id: session_name.clone(),
+        owner_id: leases.owner_lease.owner_id.clone(),
+        workspace: target_workspace.display().to_string(),
+        workspace_key: leases.workspace_lease.workspace_key.clone(),
+        runtime: "pty".to_string(),
+    };
+    match state.store.acquire_route_leases_and_create_session(
+        &session_record,
+        &leases.owner_lease,
+        Some(&leases.workspace_lease),
+    )? {
+        RouteDecisionV1::Created => {}
+        RouteDecisionV1::Rejected(reason) => return Err(reason),
+    }
+    install_reserved_route_leases(state, &leases)?;
     let runtime = ClaudeCodePtyRuntime::new(Arc::clone(state));
     let runtime_session = runtime
         .start(StartSpec {
@@ -475,6 +496,7 @@ fn start_pty_route(
             rows: Some(40),
         })
         .inspect_err(|_| {
+            let _ = release_owner_lease(state, &session_name, "route_start_failed");
             let _ = release_workspace_lease(state, &session_name, "route_start_failed");
         })?;
     let prompt_gate = if is_claude_command(&runtime_session.info.command) {
@@ -508,7 +530,8 @@ fn start_pty_route(
             "command_path": runtime.capabilities().command_path,
         },
         "scheduler": schedule.to_value(),
-        "workspace_lease": workspace_lease,
+        "owner_lease": leases.owner_lease,
+        "workspace_lease": leases.workspace_lease,
         "prompt_gate": prompt_gate,
         "binding_gate": {
             "required": true,
