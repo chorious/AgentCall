@@ -1,5 +1,12 @@
+use crate::actor::ActorHandle;
 use crate::config::LocalConfig;
+use crate::events::{build_event_envelope, event_session_key};
+use crate::ownership::{OwnerLease, WorkspaceLease};
+use crate::projection::{SessionProjectionV1, apply_event_to_projection, read_session_projection};
 use crate::session::Session;
+use crate::store::{RuntimeStore, StoreWriterRuntimeStore};
+use crate::store_json::JsonRuntimeStore;
+use crate::store_sqlite::SqliteRuntimeStore;
 use std::collections::HashMap;
 use std::fs;
 use std::io::{Read, Seek, SeekFrom, Write};
@@ -7,7 +14,6 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
-const RECENT_EVENT_MAX_BYTES: u64 = 2 * 1024 * 1024;
 const ROTATING_LOG_MAX_BYTES: u64 = 4 * 1024 * 1024;
 const READ_TAIL_BYTES: u64 = 2 * 1024 * 1024;
 const RECENT_EVENT_LIMIT: usize = 80;
@@ -18,8 +24,14 @@ pub(crate) struct AppState {
     pub(crate) config: LocalConfig,
     pub(crate) config_error: Option<String>,
     pub(crate) sessions: Mutex<HashMap<String, Arc<Session>>>,
+    pub(crate) actors: Mutex<HashMap<String, ActorHandle>>,
+    pub(crate) owner_leases: Mutex<HashMap<String, OwnerLease>>,
+    pub(crate) workspace_leases: Mutex<HashMap<String, WorkspaceLease>>,
+    pub(crate) store: Arc<dyn RuntimeStore>,
     pub(crate) seq: AtomicU64,
     pub(crate) event_seq: AtomicU64,
+    pub(crate) event_session_seq: Mutex<HashMap<String, u64>>,
+    pub(crate) projections: Mutex<HashMap<String, SessionProjectionV1>>,
     pub(crate) state_writer: Mutex<()>,
 }
 
@@ -30,14 +42,22 @@ impl AppState {
         config_error: Option<String>,
     ) -> Self {
         let next_event_seq = next_event_number_from_log(&workspace);
+        let event_session_seq = next_session_event_numbers_from_log(&workspace);
         let next_seq = next_runtime_seq_from_state(&workspace);
+        let store = configured_runtime_store(&workspace, &config);
         Self {
             workspace,
             config,
             config_error,
             sessions: Mutex::new(HashMap::new()),
+            actors: Mutex::new(HashMap::new()),
+            owner_leases: Mutex::new(HashMap::new()),
+            workspace_leases: Mutex::new(HashMap::new()),
+            store,
             seq: AtomicU64::new(next_seq),
             event_seq: AtomicU64::new(next_event_seq),
+            event_session_seq: Mutex::new(event_session_seq),
+            projections: Mutex::new(HashMap::new()),
             state_writer: Mutex::new(()),
         }
     }
@@ -58,9 +78,27 @@ impl AppState {
         self.seq.fetch_add(1, Ordering::Relaxed)
     }
 
-    pub(crate) fn next_event_id(&self) -> String {
-        let number = self.event_seq.fetch_add(1, Ordering::SeqCst);
-        format!("evt-{number:06}")
+    pub(crate) fn next_event_global_seq(&self) -> u64 {
+        self.event_seq.fetch_add(1, Ordering::SeqCst)
+    }
+
+    pub(crate) fn next_event_session_seq(&self, session_key: &str) -> u64 {
+        let mut session_seq = self.event_session_seq.lock().unwrap();
+        let next = session_seq.get(session_key).copied().unwrap_or(1);
+        session_seq.insert(session_key.to_string(), next + 1);
+        next
+    }
+}
+
+fn configured_runtime_store(workspace: &Path, config: &LocalConfig) -> Arc<dyn RuntimeStore> {
+    match config.store_backend.as_deref() {
+        Some("sqlite") => Arc::new(StoreWriterRuntimeStore::new(Arc::new(
+            SqliteRuntimeStore::new(workspace.to_path_buf())
+                .expect("failed to initialize sqlite runtime store"),
+        ))),
+        _ => Arc::new(StoreWriterRuntimeStore::new(Arc::new(
+            JsonRuntimeStore::new(workspace.to_path_buf()),
+        ))),
     }
 }
 
@@ -128,24 +166,34 @@ pub(crate) fn append_agent_event_locked(
     data: serde_json::Value,
 ) -> Result<(), String> {
     fs::create_dir_all(&agent_dir).map_err(|err| err.to_string())?;
-    let event_id = state.next_event_id();
+    let global_seq = state.next_event_global_seq();
+    let event_id = format!("evt-{global_seq:06}");
+    let session_key = event_session_key(&data);
+    let session_seq = session_key
+        .as_deref()
+        .map(|key| state.next_event_session_seq(key));
     let data = sanitize_event_data(agent_dir, event_type, &event_id, data)?;
-    let event = serde_json::json!({
-        "id": event_id,
-        "ts": chrono::Utc::now().to_rfc3339(),
-        "type": event_type,
-        "task_id": null,
-        "run_id": null,
-        "message": message,
-        "data": data,
-    });
-    let text = serde_json::to_string(&event).unwrap_or_else(|_| "{}".to_string());
-    append_rotating_ndjson(
-        &agent_dir.join("events"),
-        "events",
-        &text,
-        RECENT_EVENT_MAX_BYTES,
-    )?;
+    let envelope =
+        build_event_envelope(event_id, global_seq, session_seq, event_type, message, data);
+    let event = envelope.to_compat_json();
+    let previous_projection = envelope
+        .session_id
+        .as_deref()
+        .and_then(|session_id| read_session_projection(state, session_id));
+    let projection_update = apply_event_to_projection(previous_projection, &envelope);
+    let _projection_reason = projection_update.reason.as_str();
+    let projection_changed = projection_update.changed;
+    let projection = projection_update.projection.clone();
+    state
+        .store
+        .append_event_and_update_projection(&envelope, projection_update)?;
+    if projection_changed {
+        state
+            .projections
+            .lock()
+            .unwrap()
+            .insert(projection.session_id.clone(), projection);
+    }
     append_hook_index(agent_dir, event_type, &event)
 }
 
@@ -454,20 +502,53 @@ pub(crate) fn next_event_number_from_log(workspace: &Path) -> u64 {
                 let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
                     continue;
                 };
-                let Some(id) = value.get("id").and_then(|value| value.as_str()) else {
+                if let Some(number) = value.get("global_seq").and_then(serde_json::Value::as_u64) {
+                    max_seen = max_seen.max(number);
                     continue;
-                };
-                let Some(number) = id
-                    .strip_prefix("evt-")
+                }
+                if let Some(number) = value
+                    .get("id")
+                    .and_then(|value| value.as_str())
+                    .and_then(|id| id.strip_prefix("evt-"))
                     .and_then(|value| value.parse::<u64>().ok())
-                else {
-                    continue;
-                };
-                max_seen = max_seen.max(number);
+                {
+                    max_seen = max_seen.max(number);
+                }
             }
         }
     }
     max_seen + 1
+}
+
+pub(crate) fn next_session_event_numbers_from_log(workspace: &Path) -> HashMap<String, u64> {
+    let mut max_seen: HashMap<String, u64> = HashMap::new();
+    for path in event_log_candidates(workspace) {
+        let Some(text) = read_tail_text(&path, READ_TAIL_BYTES) else {
+            continue;
+        };
+        for line in text.lines() {
+            let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
+                continue;
+            };
+            let Some(session_key) = value
+                .get("session_key")
+                .and_then(serde_json::Value::as_str)
+                .filter(|value| !value.trim().is_empty())
+            else {
+                continue;
+            };
+            let Some(session_seq) = value.get("session_seq").and_then(serde_json::Value::as_u64)
+            else {
+                continue;
+            };
+            let entry = max_seen.entry(session_key.to_string()).or_insert(0);
+            *entry = (*entry).max(session_seq);
+        }
+    }
+    max_seen
+        .into_iter()
+        .map(|(session_key, max_seq)| (session_key, max_seq + 1))
+        .collect()
 }
 
 pub(crate) fn next_runtime_seq_from_state(workspace: &Path) -> u64 {
@@ -600,6 +681,94 @@ mod tests {
             .join("PostToolUse")
             .join("recent.ndjson");
         assert!(hook_index.exists());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn event_envelope_v1_tracks_global_and_session_sequence() {
+        let root = test_workspace("event-envelope-v1");
+        let agent_dir = root.join(".agentcall");
+        let state = AppState::test(root.clone());
+
+        append_agent_event_locked(
+            &state,
+            &agent_dir,
+            "session.test",
+            "first",
+            serde_json::json!({"wrapper_session": "worker-a"}),
+        )
+        .unwrap();
+        append_agent_event_locked(
+            &state,
+            &agent_dir,
+            "session.test",
+            "second",
+            serde_json::json!({"wrapper_session": "worker-a"}),
+        )
+        .unwrap();
+        append_agent_event_locked(
+            &state,
+            &agent_dir,
+            "session.test",
+            "third",
+            serde_json::json!({"wrapper_session": "worker-b"}),
+        )
+        .unwrap();
+
+        let events_text =
+            fs::read_to_string(agent_dir.join("events").join("recent.ndjson")).unwrap();
+        let events: Vec<serde_json::Value> = events_text
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(events[0]["schema_version"], 1);
+        assert_eq!(events[0]["event_id"], "evt-000001");
+        assert_eq!(events[0]["global_seq"], 1);
+        assert_eq!(events[1]["global_seq"], 2);
+        assert_eq!(events[2]["global_seq"], 3);
+        assert_eq!(events[0]["session_key"], "worker-a");
+        assert_eq!(events[0]["session_seq"], 1);
+        assert_eq!(events[1]["session_seq"], 2);
+        assert_eq!(events[2]["session_key"], "worker-b");
+        assert_eq!(events[2]["session_seq"], 1);
+        assert_eq!(next_event_number_from_log(&root), 4);
+        assert_eq!(
+            next_session_event_numbers_from_log(&root)
+                .get("worker-a")
+                .copied(),
+            Some(3)
+        );
+        let projection_path = agent_dir
+            .join("state")
+            .join("projections")
+            .join("sessions")
+            .join("worker-a.json");
+        let projection: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(projection_path).unwrap()).unwrap();
+        assert_eq!(projection["session_id"], "worker-a");
+        assert_eq!(projection["projection_last_global_seq"], 2);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn local_config_can_select_sqlite_store_backend() {
+        let root = test_workspace("sqlite-backend-config");
+        let state = AppState::new(
+            root.clone(),
+            LocalConfig {
+                claude_workspace: Some(root.clone()),
+                store_backend: Some("sqlite".to_string()),
+                ..LocalConfig::default()
+            },
+            None,
+        );
+        assert_eq!(state.store.backend_name(), "sqlite");
+        assert!(
+            root.join(".agentcall")
+                .join("state")
+                .join("runtime.db")
+                .exists()
+        );
         let _ = fs::remove_dir_all(root);
     }
 

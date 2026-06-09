@@ -163,6 +163,7 @@ def cmd_release_check(root: Path, args: argparse.Namespace) -> int:
         env["PATH"] = str(cargo.parent) + os.pathsep + env.get("PATH", "")
 
     run_checked([sys.executable, "-m", "compileall", "scripts", "src"], root, "python compileall", env=env, timeout=120)
+    run_checked([sys.executable, "scripts/generate_agentcall_skill.py", "--check"], root, "agentcall supervisor skill check", env=env, timeout=60)
     node = shutil.which("node")
     if node:
         run_checked([node, "--check", "web\\board.js"], root, "node syntax check", env=env, timeout=60)

@@ -1,7 +1,12 @@
 use crate::config::Config;
 use serde_json::Value;
 use std::io::{BufRead, BufReader, Read, Write};
-use std::net::TcpStream;
+use std::net::{TcpStream, ToSocketAddrs};
+use std::time::Duration;
+
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
+const READ_TIMEOUT: Duration = Duration::from_secs(10);
+const WRITE_TIMEOUT: Duration = Duration::from_secs(3);
 
 pub(crate) fn daemon_get(config: &Config, path: &str) -> Result<Value, String> {
     daemon_request(config, "GET", path, None)
@@ -32,8 +37,19 @@ fn daemon_request(
     body: Option<Value>,
 ) -> Result<Value, String> {
     let (host, port) = parse_daemon_url(&config.daemon_url)?;
-    let mut stream = TcpStream::connect((host.as_str(), port))
+    let address = (host.as_str(), port)
+        .to_socket_addrs()
+        .map_err(|err| format!("failed to resolve daemon {}: {err}", config.daemon_url))?
+        .next()
+        .ok_or_else(|| format!("failed to resolve daemon {}", config.daemon_url))?;
+    let mut stream = TcpStream::connect_timeout(&address, CONNECT_TIMEOUT)
         .map_err(|err| format!("failed to connect daemon {}: {err}", config.daemon_url))?;
+    stream
+        .set_read_timeout(Some(READ_TIMEOUT))
+        .map_err(|err| format!("failed to set daemon read timeout: {err}"))?;
+    stream
+        .set_write_timeout(Some(WRITE_TIMEOUT))
+        .map_err(|err| format!("failed to set daemon write timeout: {err}"))?;
     let body_text = body
         .map(|value| serde_json::to_string(&value).unwrap_or_else(|_| "{}".to_string()))
         .unwrap_or_default();
@@ -48,10 +64,10 @@ fn daemon_request(
     };
     stream
         .write_all(request.as_bytes())
-        .map_err(|err| format!("failed to write daemon request: {err}"))?;
+        .map_err(|err| format_io_error("write daemon request", err))?;
     stream
         .flush()
-        .map_err(|err| format!("failed to flush daemon request: {err}"))?;
+        .map_err(|err| format_io_error("flush daemon request", err))?;
     read_http_json(stream)
 }
 
@@ -62,7 +78,7 @@ fn read_http_json(stream: TcpStream) -> Result<Value, String> {
         let mut line = String::new();
         let read = reader
             .read_line(&mut line)
-            .map_err(|err| format!("failed to read daemon response head: {err}"))?;
+            .map_err(|err| format_io_error("read daemon response head", err))?;
         if read == 0 {
             return Err("daemon closed connection before response head".to_string());
         }
@@ -81,7 +97,7 @@ fn read_http_json(stream: TcpStream) -> Result<Value, String> {
     let mut body = vec![0u8; content_length];
     reader
         .read_exact(&mut body)
-        .map_err(|err| format!("failed to read daemon response body: {err}"))?;
+        .map_err(|err| format_io_error("read daemon response body", err))?;
     serde_json::from_slice(&body).map_err(|err| format!("invalid daemon JSON: {err}"))
 }
 
@@ -98,4 +114,28 @@ fn content_length_from_head(head: &str) -> Result<usize, String> {
         }
     }
     Err("daemon response missing Content-Length".to_string())
+}
+
+fn format_io_error(action: &str, err: std::io::Error) -> String {
+    match err.kind() {
+        std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock => {
+            format!("daemon_query_timeout while attempting to {action}: {err}")
+        }
+        _ => format!("failed to {action}: {err}"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn timeout_errors_are_classified_for_mcp_callers() {
+        let message = format_io_error(
+            "read daemon response body",
+            std::io::Error::from(std::io::ErrorKind::TimedOut),
+        );
+        assert!(message.contains("daemon_query_timeout"));
+        assert!(message.contains("read daemon response body"));
+    }
 }

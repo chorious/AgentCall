@@ -1,9 +1,13 @@
-use crate::hooks::queue_supervisor_instruction;
+use crate::actor::submit_session_command;
+use crate::commands::{CommandType, PreparedCommand, prepare_session_send_command};
+use crate::confidence::attach_confidence_to_reports;
+use crate::projection::session_projection_summary;
 use crate::routes::{
     RouteRequest, checkpoint_session, handle_route, patch_route_record, route_for_wrapper_session,
 };
-use crate::session::{InputRequest, get_session, interrupt_session, write_input};
+use crate::session::get_session;
 use crate::state::{AppState, append_agent_event, read_events};
+use crate::store::EventQuery;
 use crate::summary::{board_state, clean_session_output, session_plan_artifact, session_summary};
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -24,8 +28,8 @@ pub(crate) fn mcp_tools() -> Vec<Value> {
                 "type": "object",
                 "properties": {
                     "root": {"type": "string"},
-                    "view": {"type": "string", "enum": ["full", "compact"], "default": "full"},
-                    "filter": {"type": "string", "enum": ["all", "attention"], "default": "all"},
+                    "view": {"type": "string", "enum": ["full", "compact"], "default": "compact"},
+                    "filter": {"type": "string", "enum": ["all", "attention"], "default": "attention"},
                     "section": {"type": "string", "enum": ["all", "sessions", "events", "reports", "claims", "transcripts", "routes"], "default": "all"}
                 },
                 "additionalProperties": false
@@ -40,7 +44,7 @@ pub(crate) fn mcp_tools() -> Vec<Value> {
                     "objective": {"type": "string"},
                     "workspace": {"type": "string"},
                     "mode": {"type": "string", "enum": ["recommend", "start"], "default": "recommend"},
-                    "runtime": {"type": "string", "enum": ["auto", "pty"], "default": "auto"},
+                    "runtime": {"type": "string", "enum": ["auto", "pty", "sdk"], "default": "auto", "description": "sdk is experimental and only works when daemon local config enables experimental_sdk_runtime; auto still selects PTY."},
                     "estimated_minutes": {"type": "integer", "minimum": 0},
                     "estimated_files": {"type": "integer", "minimum": 0},
                     "estimated_loc": {"type": "integer", "minimum": 0},
@@ -72,7 +76,10 @@ pub(crate) fn mcp_tools() -> Vec<Value> {
                 "properties": {
                     "root": {"type": "string"},
                     "name": {"type": "string"},
-                    "include": {"type": "array", "items": {"type": "string", "enum": ["summary", "clean_tail", "plan"]}, "default": ["summary"]}
+                    "include": {"type": "array", "items": {"type": "string", "enum": ["summary", "clean_tail", "plan", "events", "artifacts", "policy", "metrics", "debug"]}, "default": ["summary"]},
+                    "cursor": {"type": "integer", "minimum": 0},
+                    "limit": {"type": "integer", "minimum": 1, "maximum": 200, "default": 50},
+                    "event_types": {"type": "array", "items": {"type": "string"}}
                 },
                 "required": ["name"],
                 "additionalProperties": false
@@ -88,7 +95,12 @@ pub(crate) fn mcp_tools() -> Vec<Value> {
                     "name": {"type": "string"},
                     "action": {"type": "string", "enum": ["send", "continue", "stop", "request_report", "revise_plan", "approve_plan", "start_auto", "select_option", "interrupt"], "default": "send"},
                     "text": {"type": "string"},
-                    "enter": {"type": "boolean", "default": true}
+                    "enter": {"type": "boolean", "default": true},
+                    "idempotency_key": {"type": "string"},
+                    "precondition": {"type": "object"},
+                    "owner_id": {"type": "string"},
+                    "owner_lease_id": {"type": "string"},
+                    "lease_generation": {"type": "integer", "minimum": 0}
                 },
                 "required": ["name"],
                 "additionalProperties": false
@@ -161,11 +173,12 @@ fn mcp_route(state: &Arc<AppState>, args: Value) -> Result<Value, String> {
 fn mcp_session(state: &AppState, args: &Value) -> Result<Value, String> {
     let name = required_str(args, "name")?;
     let session = get_session(state, name).ok_or_else(|| "session not found".to_string())?;
-    let summary = session_summary(state, &session);
+    let summary = session_projection_summary(state, name);
     let include = string_array(args, "include");
     let include_clean_tail = include.iter().any(|item| item == "clean_tail");
     let include_plan = include.iter().any(|item| item == "plan");
-    if include_clean_tail || include_plan {
+    let include_events = include.iter().any(|item| item == "events");
+    if include_clean_tail || include_plan || include_events {
         let mut response = json!({
             "summary": summary,
         });
@@ -179,40 +192,78 @@ fn mcp_session(state: &AppState, args: &Value) -> Result<Value, String> {
         if include_plan {
             response["plan"] = session_plan_artifact(state, &session, true);
         }
+        if include_events {
+            response["events"] = session_events(state, name, args)?;
+        }
         Ok(response)
     } else {
         Ok(summary)
     }
 }
 
+fn session_events(state: &AppState, name: &str, args: &Value) -> Result<Value, String> {
+    let limit = args
+        .get("limit")
+        .and_then(Value::as_u64)
+        .unwrap_or(50)
+        .clamp(1, 200) as usize;
+    let cursor = args.get("cursor").and_then(Value::as_u64);
+    let event_types = string_array(args, "event_types");
+    let events = state.store.get_events(EventQuery {
+        session_id: Some(name.to_string()),
+        after_global_seq: cursor,
+        event_types,
+        limit,
+    })?;
+    let next_cursor = events
+        .last()
+        .map(|event| event.global_seq)
+        .unwrap_or_else(|| cursor.unwrap_or(0));
+    let values: Vec<Value> = events
+        .iter()
+        .map(|event| {
+            json!({
+                "event_id": event.event_id,
+                "global_seq": event.global_seq,
+                "session_seq": event.session_seq,
+                "event_type": event.event_type,
+                "severity": event.severity,
+                "ts": event.ts,
+                "message": event.message,
+                "data": event.payload,
+            })
+        })
+        .collect();
+    Ok(json!({
+        "session": name,
+        "cursor": cursor.unwrap_or(0),
+        "next_cursor": next_cursor,
+        "limit": limit,
+        "event_count": values.len(),
+        "events": values,
+    }))
+}
+
 fn mcp_session_send(state: &AppState, args: &Value) -> Result<Value, String> {
     let name = required_str(args, "name")?;
     let action = args.get("action").and_then(Value::as_str).unwrap_or("send");
+    let mut command = match prepare_session_send_command(state, name, action, args)? {
+        PreparedCommand::Submit(command) => command,
+        PreparedCommand::Deduped(value) => return Ok(value),
+    };
     if action == "stop" {
-        return crate::session::stop_session(state, name).map(|_| json!({"ok": true}));
+        return submit_session_command(state, name, command);
     }
     if action == "interrupt" {
-        let text = args.get("text").and_then(Value::as_str).map(str::to_string);
-        interrupt_session(state, name, text)?;
-        return Ok(json!({
-            "ok": true,
-            "action": "interrupt",
-            "status": "interrupt_sent",
-            "warning": "Use interrupt only when the worker is drifting, doing the wrong thing, or must be reclaimed immediately."
-        }));
+        return submit_session_command(state, name, command);
     }
     if action == "approve_plan" || action == "start_auto" {
         if !is_plan_then_auto_session(state, name) {
             return Err("session is not a plan_then_auto PTY route".to_string());
         }
-        write_input(
-            state,
-            name,
-            InputRequest {
-                text: "1".to_string(),
-                enter: Some(true),
-            },
-        )?;
+        command.payload["text"] = json!("1");
+        command.payload["enter"] = json!(true);
+        let result = submit_session_command(state, name, command)?;
         update_pty_workflow_route(
             state,
             name,
@@ -220,7 +271,9 @@ fn mcp_session_send(state: &AppState, args: &Value) -> Result<Value, String> {
             "auto",
             "approved via session_send action",
         )?;
-        return Ok(json!({"ok": true, "action": action, "workflow_status": "auto_running"}));
+        return Ok(
+            json!({"ok": true, "action": action, "workflow_status": "auto_running", "actor_result": result}),
+        );
     }
     if action == "select_option" {
         let choice = menu_choice(args)?;
@@ -248,14 +301,9 @@ fn mcp_session_send(state: &AppState, args: &Value) -> Result<Value, String> {
                 "hint": "select_option is only for visible PTY menus or permission prompts. Use send for normal natural-language input."
             }));
         }
-        write_input(
-            state,
-            name,
-            InputRequest {
-                text: choice.clone(),
-                enter: Some(true),
-            },
-        )?;
+        command.payload["text"] = json!(choice.clone());
+        command.payload["enter"] = json!(true);
+        let actor_result = submit_session_command(state, name, command)?;
         append_agent_event(
             state,
             "pty.menu_option_selected",
@@ -272,6 +320,7 @@ fn mcp_session_send(state: &AppState, args: &Value) -> Result<Value, String> {
             "action": action,
             "status": "menu_option_selected",
             "choice": choice,
+            "actor_result": actor_result,
             "hint": "Supervisor selected a visible PTY menu option; inspect session summary before sending further input."
         }));
     }
@@ -327,7 +376,10 @@ fn mcp_session_send(state: &AppState, args: &Value) -> Result<Value, String> {
         }));
     }
     if liveness_status == "working" && attention_status == "none" {
-        let queued = queue_supervisor_instruction(state, name, action, &text)?;
+        command.command_type = CommandType::QueueSupervisorInstruction;
+        command.payload["text"] = json!(text);
+        command.payload["action"] = json!(action);
+        let mut actor_result = submit_session_command(state, name, command)?;
         let post_tool_batch_seen = session_has_seen_hook_event(state, name, "PostToolBatch");
         let warning = if post_tool_batch_seen {
             Value::Null
@@ -336,24 +388,15 @@ fn mcp_session_send(state: &AppState, args: &Value) -> Result<Value, String> {
                 "This session has not emitted PostToolBatch in recent events. Queued instructions may remain pending until the worker is restarted with updated D:\\guKimi hooks."
             )
         };
-        return Ok(json!({
-            "ok": true,
-            "status": "queued_until_next_hook_injection",
-            "delivery": "PostToolBatch_or_next_context_hook",
-            "instruction": queued,
-            "post_tool_batch_seen": post_tool_batch_seen,
-            "warning": warning,
-            "hint": "Claude Code does not reliably accept new prompts mid-turn. AgentCall queued this instruction for hook additionalContext instead of blindly typing into the PTY."
-        }));
+        actor_result["post_tool_batch_seen"] = json!(post_tool_batch_seen);
+        actor_result["warning"] = warning;
+        return Ok(actor_result);
     }
-    write_input(
-        state,
-        name,
-        InputRequest {
-            text,
-            enter: args.get("enter").and_then(Value::as_bool),
-        },
-    )?;
+    command.payload["text"] = json!(text);
+    if let Some(enter) = args.get("enter").and_then(Value::as_bool) {
+        command.payload["enter"] = json!(enter);
+    }
+    let actor_result = submit_session_command(state, name, command)?;
     if action == "revise_plan" {
         let _ = update_pty_workflow_route(
             state,
@@ -363,7 +406,7 @@ fn mcp_session_send(state: &AppState, args: &Value) -> Result<Value, String> {
             "revision requested via session_send action",
         );
     }
-    Ok(json!({"ok": true}))
+    Ok(actor_result)
 }
 
 fn menu_choice(args: &Value) -> Result<String, String> {
@@ -484,9 +527,9 @@ fn mcp_report(state: &Arc<AppState>, args: &Value) -> Result<Value, String> {
                             .collect::<Vec<_>>()
                     })
                     .unwrap_or_default();
-                Ok(json!(filtered))
+                Ok(attach_confidence_to_reports(state, json!(filtered)))
             } else {
-                Ok(reports)
+                Ok(attach_confidence_to_reports(state, reports))
             }
         }
         other => Err(format!("unknown report action: {other}")),
@@ -532,6 +575,106 @@ mod tests {
                 "agentcall_report",
             ]
         );
+    }
+
+    #[test]
+    fn daemon_session_tool_schema_allows_explicit_debug_includes() {
+        let tools = mcp_tools();
+        let session_tool = tools
+            .iter()
+            .find(|tool| tool["name"] == "agentcall_session")
+            .unwrap();
+        let include_enum = session_tool["inputSchema"]["properties"]["include"]["items"]["enum"]
+            .as_array()
+            .unwrap();
+        assert!(include_enum.iter().any(|item| item == "clean_tail"));
+        assert!(include_enum.iter().any(|item| item == "plan"));
+        assert!(include_enum.iter().any(|item| item == "debug"));
+        assert!(include_enum.iter().any(|item| item == "policy"));
+        assert!(
+            session_tool["inputSchema"]["properties"]
+                .get("cursor")
+                .is_some()
+        );
+        assert!(
+            session_tool["inputSchema"]["properties"]
+                .get("event_types")
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn session_events_uses_store_cursor_and_filters() {
+        let root = std::env::temp_dir().join(format!(
+            "agentcall-mcp-session-events-{}",
+            std::process::id()
+        ));
+        let state = AppState::test(root.clone());
+        append_agent_event(
+            &state,
+            "hook.Notification",
+            "permission",
+            json!({"wrapper_session": "worker-a", "status": "needs_permission"}),
+        );
+        append_agent_event(
+            &state,
+            "hook.Stop",
+            "idle",
+            json!({"wrapper_session": "worker-a", "status": "idle"}),
+        );
+        let events = session_events(
+            &state,
+            "worker-a",
+            &json!({"cursor": 0, "limit": 10, "event_types": ["hook.Notification"]}),
+        )
+        .unwrap();
+        assert_eq!(events["event_count"], 1);
+        assert_eq!(events["events"][0]["event_type"], "hook.Notification");
+        assert_eq!(events["next_cursor"], 1);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn report_accept_attaches_deterministic_confidence() {
+        let root = std::env::temp_dir().join(format!(
+            "agentcall-mcp-report-confidence-{}",
+            std::process::id()
+        ));
+        let state = Arc::new(AppState::test(root.clone()));
+        let reports_dir = root.join(".agentcall/tasks/task-a/reports");
+        std::fs::create_dir_all(&reports_dir).unwrap();
+        std::fs::write(
+            reports_dir.join("report.json"),
+            serde_json::to_string(&json!({
+                "task_id": "task-a",
+                "session_id": "worker-a",
+                "status": "completed",
+                "report_path": "docs/report.md"
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        append_agent_event(
+            &state,
+            "hook.PostToolUse",
+            "write observed",
+            json!({
+                "wrapper_session": "worker-a",
+                "tool_name": "Write",
+                "decision": {"reason": "write observed", "files": ["src/app.rs"]}
+            }),
+        );
+
+        let reports = mcp_report(&state, &json!({"action": "accept"})).unwrap();
+        assert_eq!(reports[0]["confidence"]["band"], "high");
+        assert!(
+            reports[0]["confidence"]["evidence"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|item| item["kind"] == "file_written")
+        );
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]

@@ -1,0 +1,353 @@
+use crate::events::EventEnvelopeV1;
+use crate::session::{Session, SessionInfo};
+use crate::state::{AppState, read_json_file};
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
+use std::sync::Arc;
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub(crate) struct SessionProjectionV1 {
+    pub(crate) schema_version: u16,
+    pub(crate) projection_version: u64,
+    pub(crate) projection_last_global_seq: u64,
+    pub(crate) projection_last_session_seq: u64,
+    pub(crate) projection_last_updated_at: String,
+    pub(crate) projection_stale: bool,
+    pub(crate) session_id: String,
+    pub(crate) run_id: Option<String>,
+    pub(crate) owner: Option<String>,
+    pub(crate) workspace: String,
+    pub(crate) claude_cwd: String,
+    pub(crate) runtime: String,
+    pub(crate) liveness_status: String,
+    pub(crate) turn_status: String,
+    pub(crate) attention_status: String,
+    pub(crate) needs_attention: bool,
+    pub(crate) current_task: String,
+    pub(crate) pending_interaction: Value,
+    pub(crate) last_progress_age_seconds: u64,
+    pub(crate) last_progress_brief: Option<String>,
+    pub(crate) patience_status: String,
+    pub(crate) suggested_wait_seconds: u64,
+    pub(crate) next_recommended_action: String,
+    pub(crate) files_written_count: usize,
+    pub(crate) report_ready: bool,
+    pub(crate) last_error_brief: Option<String>,
+    pub(crate) warnings: Vec<String>,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct ProjectionUpdate {
+    pub(crate) projection: SessionProjectionV1,
+    pub(crate) changed: bool,
+    pub(crate) reason: String,
+}
+
+pub(crate) fn default_session_projection(session: &SessionInfo) -> SessionProjectionV1 {
+    SessionProjectionV1 {
+        schema_version: 1,
+        projection_version: 1,
+        projection_last_global_seq: 0,
+        projection_last_session_seq: 0,
+        projection_last_updated_at: chrono::Utc::now().to_rfc3339(),
+        projection_stale: false,
+        session_id: session.name.clone(),
+        run_id: None,
+        owner: None,
+        workspace: session.cwd.clone(),
+        claude_cwd: session.cwd.clone(),
+        runtime: "pty".to_string(),
+        liveness_status: session.status.clone(),
+        turn_status: "unknown".to_string(),
+        attention_status: "none".to_string(),
+        needs_attention: false,
+        current_task: String::new(),
+        pending_interaction: serde_json::json!(null),
+        last_progress_age_seconds: 0,
+        last_progress_brief: None,
+        patience_status: "unknown".to_string(),
+        suggested_wait_seconds: 60,
+        next_recommended_action: "inspect_summary".to_string(),
+        files_written_count: 0,
+        report_ready: false,
+        last_error_brief: None,
+        warnings: vec![],
+    }
+}
+
+pub(crate) fn stale_projection_for_session_name(session_name: &str) -> SessionProjectionV1 {
+    SessionProjectionV1 {
+        schema_version: 1,
+        projection_version: 0,
+        projection_last_global_seq: 0,
+        projection_last_session_seq: 0,
+        projection_last_updated_at: chrono::Utc::now().to_rfc3339(),
+        projection_stale: true,
+        session_id: session_name.to_string(),
+        run_id: None,
+        owner: None,
+        workspace: String::new(),
+        claude_cwd: String::new(),
+        runtime: "unknown".to_string(),
+        liveness_status: "unknown".to_string(),
+        turn_status: "unknown".to_string(),
+        attention_status: "low_confidence".to_string(),
+        needs_attention: true,
+        current_task: String::new(),
+        pending_interaction: serde_json::json!(null),
+        last_progress_age_seconds: 0,
+        last_progress_brief: None,
+        patience_status: "unknown".to_string(),
+        suggested_wait_seconds: 0,
+        next_recommended_action: "inspect_session_debug".to_string(),
+        files_written_count: 0,
+        report_ready: false,
+        last_error_brief: None,
+        warnings: vec!["projection missing; default path did not scan cold logs".to_string()],
+    }
+}
+
+#[allow(dead_code)]
+pub(crate) fn bootstrap_stale_projection_from_existing_session(
+    _state: &AppState,
+    session: &Arc<Session>,
+) -> SessionProjectionV1 {
+    let mut projection = stale_projection_for_session_name(&session.name);
+    projection.workspace = session.cwd.display().to_string();
+    projection.claude_cwd = session.cwd.display().to_string();
+    projection.runtime = "pty".to_string();
+    projection.liveness_status = session.status.lock().unwrap().clone();
+    projection
+}
+
+pub(crate) fn read_session_projection(
+    state: &AppState,
+    session_name: &str,
+) -> Option<SessionProjectionV1> {
+    if let Some(projection) = state.projections.lock().unwrap().get(session_name).cloned() {
+        return Some(projection);
+    }
+    let path = projection_path(state, session_name);
+    let value = read_json_file(&path, serde_json::json!(null));
+    if value.is_null() {
+        return None;
+    }
+    serde_json::from_value(value).ok()
+}
+
+pub(crate) fn session_projection_summary(state: &AppState, session_name: &str) -> Value {
+    let projection = read_session_projection(state, session_name)
+        .unwrap_or_else(|| stale_projection_for_session_name(session_name));
+    let mut value = serde_json::json!(projection);
+    value["projection_only"] = serde_json::json!(true);
+    value["session"] = value
+        .get("session_id")
+        .cloned()
+        .unwrap_or_else(|| serde_json::json!(session_name));
+    value
+}
+
+pub(crate) fn apply_event_to_projection(
+    previous: Option<SessionProjectionV1>,
+    event: &EventEnvelopeV1,
+) -> ProjectionUpdate {
+    let Some(session_id) = event.session_id.clone() else {
+        return ProjectionUpdate {
+            projection: stale_projection_for_session_name("unbound"),
+            changed: false,
+            reason: "event has no session_id".to_string(),
+        };
+    };
+    let mut projection = previous.unwrap_or_else(|| stale_projection_for_session_name(&session_id));
+    projection.projection_stale = false;
+    projection.projection_version = projection.projection_version.saturating_add(1);
+    projection.projection_last_global_seq = event.global_seq;
+    projection.projection_last_session_seq = event.session_seq.unwrap_or(0);
+    projection.projection_last_updated_at = event.ts.clone();
+    projection.session_id = session_id;
+    projection.run_id = event.run_id.clone();
+    projection.owner = event.owner_id.clone();
+
+    let mut reason = "event_reduced".to_string();
+    match event.event_type.as_str() {
+        "session.started" | "process.started" | "mcp.tool_called" => {
+            projection.liveness_status = "working".to_string();
+            projection.attention_status = "none".to_string();
+            projection.needs_attention = false;
+            projection.last_progress_brief = Some(event.message.clone());
+        }
+        "session.cleanup" | "process.exited" => {
+            projection.liveness_status = "completed".to_string();
+            projection.attention_status = "none".to_string();
+            projection.needs_attention = false;
+            projection.last_progress_brief = Some(event.message.clone());
+        }
+        event_type if event_type.starts_with("hook.") => {
+            reduce_hook_event(&mut projection, event);
+            reason = "hook_event_reduced".to_string();
+        }
+        event_type if event_type.contains("policy") || event_type.contains("denial") => {
+            projection.attention_status = "blocked_by_policy".to_string();
+            projection.needs_attention = true;
+            projection.last_error_brief = Some(event.message.clone());
+        }
+        _ => {
+            projection.last_progress_brief = Some(event.message.clone());
+        }
+    }
+
+    ProjectionUpdate {
+        projection,
+        changed: true,
+        reason,
+    }
+}
+
+pub(crate) fn board_attention_projection(state: &AppState) -> Value {
+    let sessions = crate::session::list_sessions(state);
+    let mut attention = Vec::new();
+    let mut live_daemon_sessions = Vec::new();
+    for session in sessions {
+        let projection = read_session_projection(state, &session.name)
+            .unwrap_or_else(|| stale_projection_for_session_name(&session.name));
+        let item = serde_json::json!({
+            "session": projection.session_id,
+            "liveness_status": projection.liveness_status,
+            "attention_status": projection.attention_status,
+            "needs_attention": projection.needs_attention,
+            "projection_stale": projection.projection_stale,
+            "projection_last_global_seq": projection.projection_last_global_seq,
+            "projection_last_session_seq": projection.projection_last_session_seq,
+            "last_progress_brief": projection.last_progress_brief,
+            "next_recommended_action": projection.next_recommended_action,
+            "warnings": projection.warnings,
+        });
+        live_daemon_sessions.push(item.clone());
+        if projection.needs_attention || projection.attention_status != "none" {
+            attention.push(item);
+        }
+    }
+    serde_json::json!({
+        "workspace": state.workspace,
+        "view": "compact",
+        "filter": "attention",
+        "projection_only": true,
+        "live_daemon_sessions": live_daemon_sessions,
+        "attention": attention,
+    })
+}
+
+fn reduce_hook_event(projection: &mut SessionProjectionV1, event: &EventEnvelopeV1) {
+    let status = event
+        .payload
+        .get("status")
+        .and_then(Value::as_str)
+        .unwrap_or("working");
+    projection.liveness_status = match status {
+        "needs_permission" => "needs_permission",
+        "waiting_input" => "waiting_input",
+        "checkpoint_due" => "checkpoint_due",
+        "idle" => "idle",
+        _ => "working",
+    }
+    .to_string();
+    projection.attention_status = match status {
+        "needs_permission" => "needs_permission",
+        "waiting_input" => "waiting_input",
+        "checkpoint_due" => "checkpoint_due",
+        _ => "none",
+    }
+    .to_string();
+    projection.needs_attention = projection.attention_status != "none";
+    projection.last_progress_brief = Some(event.message.clone());
+    if let Some(workspace) = event.payload.get("workspace").and_then(Value::as_str) {
+        projection.workspace = workspace.to_string();
+    }
+}
+
+fn projection_path(state: &AppState, session_name: &str) -> std::path::PathBuf {
+    state
+        .workspace
+        .join(".agentcall")
+        .join("state")
+        .join("projections")
+        .join("sessions")
+        .join(format!("{}.json", safe_path_component(session_name)))
+}
+
+fn safe_path_component(text: &str) -> String {
+    text.chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.') {
+                ch
+            } else {
+                '-'
+            }
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn projection_default_has_stale_false() {
+        let projection = default_session_projection(&SessionInfo {
+            name: "worker-a".to_string(),
+            command: vec!["claude".to_string()],
+            cwd: "D:\\guKimi".to_string(),
+            status: "running".to_string(),
+            child_pid: Some(1234),
+            created_at: 1,
+            updated_at: 1,
+            replay_bytes: 0,
+            decode_health: crate::terminal::DecodeHealth::default(),
+        });
+        assert!(!projection.projection_stale);
+        assert_eq!(projection.session_id, "worker-a");
+    }
+
+    #[test]
+    fn reducer_updates_projection_from_hook_event() {
+        let event = EventEnvelopeV1 {
+            schema_version: 1,
+            event_id: "evt-1".to_string(),
+            global_seq: 1,
+            session_seq: Some(1),
+            session_id: Some("worker-a".to_string()),
+            run_id: None,
+            owner_id: None,
+            ts: "2026-06-09T00:00:00Z".to_string(),
+            source: "hook".to_string(),
+            event_type: "hook.Notification".to_string(),
+            severity: "info".to_string(),
+            command_id: None,
+            idempotency_key: None,
+            trace_id: None,
+            message: "permission requested".to_string(),
+            payload: serde_json::json!({"status": "needs_permission"}),
+        };
+        let update = apply_event_to_projection(None, &event);
+        assert!(update.changed);
+        assert_eq!(update.projection.session_id, "worker-a");
+        assert_eq!(update.projection.liveness_status, "needs_permission");
+        assert_eq!(update.projection.attention_status, "needs_permission");
+        assert!(update.projection.needs_attention);
+    }
+
+    #[test]
+    fn missing_projection_summary_is_stale_without_cold_scan() {
+        let root = std::env::temp_dir().join(format!(
+            "agentcall-projection-missing-{}",
+            std::process::id()
+        ));
+        let state = AppState::test(root.clone());
+        let summary = session_projection_summary(&state, "worker-missing");
+        assert_eq!(summary["projection_only"], true);
+        assert_eq!(summary["projection_stale"], true);
+        assert_eq!(summary["session"], "worker-missing");
+        assert_eq!(summary["attention_status"], "low_confidence");
+        let _ = std::fs::remove_dir_all(root);
+    }
+}

@@ -2,7 +2,7 @@ use serde::Serialize;
 
 const CLEAN_LIMIT: usize = 512 * 1024;
 
-#[derive(Clone, Default, Serialize)]
+#[derive(Clone, Debug, Default, Serialize)]
 pub(crate) struct DecodeHealth {
     pub(crate) pending_bytes: usize,
     pub(crate) invalid_sequence_count: u64,

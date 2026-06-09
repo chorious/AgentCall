@@ -41,8 +41,8 @@ fn board_tool() -> Value {
             "type": "object",
             "properties": {
                 "root": {"type": "string"},
-                "view": {"type": "string", "enum": ["full", "compact"], "default": "full"},
-                "filter": {"type": "string", "enum": ["all", "attention"], "default": "all"},
+                "view": {"type": "string", "enum": ["full", "compact"], "default": "compact"},
+                "filter": {"type": "string", "enum": ["all", "attention"], "default": "attention"},
                 "section": {"type": "string", "enum": ["all", "sessions", "events", "reports", "claims", "transcripts", "routes"], "default": "all"}
             },
             "additionalProperties": false
@@ -95,7 +95,10 @@ fn session_tool() -> Value {
             "properties": {
                 "root": {"type": "string"},
                 "name": {"type": "string"},
-                "include": {"type": "array", "items": {"type": "string", "enum": ["summary", "clean_tail", "plan"]}, "default": ["summary"]}
+                "include": {"type": "array", "items": {"type": "string", "enum": ["summary", "clean_tail", "plan", "events", "artifacts", "policy", "metrics", "debug"]}, "default": ["summary"]},
+                "cursor": {"type": "integer", "minimum": 0},
+                "limit": {"type": "integer", "minimum": 1, "maximum": 200, "default": 50},
+                "event_types": {"type": "array", "items": {"type": "string"}}
             },
             "required": ["name"],
             "additionalProperties": false
@@ -114,7 +117,12 @@ fn session_send_tool() -> Value {
                 "name": {"type": "string"},
                 "action": {"type": "string", "enum": ["send", "continue", "stop", "request_report", "revise_plan", "approve_plan", "start_auto", "select_option", "interrupt"], "default": "send"},
                 "text": {"type": "string"},
-                "enter": {"type": "boolean", "default": true}
+                "enter": {"type": "boolean", "default": true},
+                "idempotency_key": {"type": "string"},
+                "precondition": {"type": "object"},
+                "owner_id": {"type": "string"},
+                "owner_lease_id": {"type": "string"},
+                "lease_generation": {"type": "integer", "minimum": 0}
             },
             "required": ["name"],
             "additionalProperties": false
@@ -171,5 +179,41 @@ mod tests {
                 "agentcall_report".to_string()
             ]
         );
+    }
+
+    #[test]
+    fn board_tool_defaults_to_compact_attention() {
+        let tool = board_tool();
+        assert_eq!(
+            tool["inputSchema"]["properties"]["view"]["default"],
+            "compact"
+        );
+        assert_eq!(
+            tool["inputSchema"]["properties"]["filter"]["default"],
+            "attention"
+        );
+    }
+
+    #[test]
+    fn session_tool_schema_allows_explicit_debug_includes() {
+        let tool = session_tool();
+        let include_enum = tool["inputSchema"]["properties"]["include"]["items"]["enum"]
+            .as_array()
+            .unwrap();
+        assert!(include_enum.iter().any(|item| item == "clean_tail"));
+        assert!(include_enum.iter().any(|item| item == "plan"));
+        assert!(include_enum.iter().any(|item| item == "debug"));
+        assert!(include_enum.iter().any(|item| item == "policy"));
+        let properties = &tool["inputSchema"]["properties"];
+        assert!(properties.get("cursor").is_some());
+        assert!(properties.get("event_types").is_some());
+    }
+
+    #[test]
+    fn session_send_tool_exposes_safety_fields() {
+        let tool = session_send_tool();
+        let properties = &tool["inputSchema"]["properties"];
+        assert!(properties.get("idempotency_key").is_some());
+        assert!(properties.get("precondition").is_some());
     }
 }

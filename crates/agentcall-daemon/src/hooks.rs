@@ -18,6 +18,7 @@ pub(crate) struct EventAppendRequest {
     event_type: String,
     message: Option<String>,
     data: Option<serde_json::Value>,
+    idempotency_key: Option<String>,
 }
 
 pub(crate) fn file_claims_state(state: &AppState) -> serde_json::Value {
@@ -445,14 +446,28 @@ fn take_pending_supervisor_instructions_locked(
     Ok(items)
 }
 
-pub(crate) fn append_event_request(state: &AppState, req: EventAppendRequest) -> serde_json::Value {
+pub(crate) fn append_event_request(
+    state: &AppState,
+    req: EventAppendRequest,
+) -> Result<serde_json::Value, String> {
+    let idempotency_key = req
+        .idempotency_key
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| "write command rejected: idempotency_key is required".to_string())?;
+    let mut data = req.data.unwrap_or_else(|| serde_json::json!({}));
+    if !data.is_object() {
+        data = serde_json::json!({"payload": data});
+    }
+    data["idempotency_key"] = serde_json::json!(idempotency_key);
     append_agent_event(
         state,
         &req.event_type,
         req.message.as_deref().unwrap_or(""),
-        req.data.unwrap_or_else(|| serde_json::json!({})),
+        data,
     );
-    serde_json::json!({"ok": true})
+    Ok(serde_json::json!({"ok": true, "idempotency_key": idempotency_key}))
 }
 
 pub(crate) fn append_unmatched_hook_locked(
@@ -1461,6 +1476,39 @@ mod tests {
             }),
         )
         .unwrap();
+    }
+
+    #[test]
+    fn append_event_request_requires_idempotency_key() {
+        let state = test_state("append-event-idempotency");
+        let missing = append_event_request(
+            &state,
+            EventAppendRequest {
+                event_type: "manual.event".to_string(),
+                message: Some("missing key".to_string()),
+                data: Some(serde_json::json!({"session_id": "worker-a"})),
+                idempotency_key: None,
+            },
+        )
+        .unwrap_err();
+        assert!(missing.contains("idempotency_key"));
+
+        let accepted = append_event_request(
+            &state,
+            EventAppendRequest {
+                event_type: "manual.event".to_string(),
+                message: Some("has key".to_string()),
+                data: Some(serde_json::json!({"session_id": "worker-a"})),
+                idempotency_key: Some("cmd-123".to_string()),
+            },
+        )
+        .unwrap();
+        assert_eq!(accepted["ok"], true);
+
+        let events = crate::state::read_events(&state.workspace.join(".agentcall/events.ndjson"));
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0]["data"]["idempotency_key"], "cmd-123");
+        assert_eq!(events[0]["session_key"], "worker-a");
     }
 
     #[test]

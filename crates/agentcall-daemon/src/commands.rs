@@ -1,0 +1,437 @@
+use crate::ownership::attach_or_validate_owner_lease;
+use crate::state::{AppState, read_json_file, write_json_file};
+use serde::{Deserialize, Serialize};
+use serde_json::{Value, json};
+use std::fs;
+use std::io::Write;
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub(crate) struct CommandEnvelopeV1 {
+    pub(crate) schema_version: u16,
+    pub(crate) command_id: String,
+    pub(crate) session_id: String,
+    pub(crate) run_id: Option<String>,
+    pub(crate) owner_id: String,
+    pub(crate) owner_lease_id: String,
+    pub(crate) lease_generation: u64,
+    pub(crate) idempotency_key: String,
+    pub(crate) command_type: CommandType,
+    pub(crate) payload: Value,
+    pub(crate) precondition: Option<CommandPrecondition>,
+    pub(crate) created_at: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub(crate) enum CommandType {
+    SendInput,
+    QueueSupervisorInstruction,
+    SelectOption,
+    InterruptTurn,
+    CancelCommand,
+    StopSession,
+    KillSession,
+    RequestReport,
+    RefreshProjection,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub(crate) struct CommandPrecondition {
+    pub(crate) projection_last_session_seq: Option<u64>,
+    pub(crate) turn_state: Option<String>,
+    pub(crate) owner_lease_id: Option<String>,
+    pub(crate) lease_generation: Option<u64>,
+}
+
+pub(crate) struct SessionSendSafety {
+    pub(crate) requires_idempotency: bool,
+    pub(crate) requires_precondition: bool,
+}
+
+#[derive(Debug)]
+pub(crate) enum IdempotencyDecision {
+    Recorded,
+    Deduped(Value),
+}
+
+pub(crate) enum PreparedCommand {
+    Submit(CommandEnvelopeV1),
+    Deduped(Value),
+}
+
+pub(crate) fn prepare_session_send_command(
+    state: &AppState,
+    session: &str,
+    action: &str,
+    args: &Value,
+) -> Result<PreparedCommand, String> {
+    let safety = classify_session_send_action(action);
+    let idempotency_key = args
+        .get("idempotency_key")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    if safety.requires_idempotency && idempotency_key.is_none() {
+        return Err(format!(
+            "rejected_missing_idempotency_key: action={action} requires idempotency_key"
+        ));
+    }
+    if safety.requires_precondition && !args.get("precondition").is_some_and(Value::is_object) {
+        return Err(format!(
+            "rejected_missing_safety_fields: action={action} requires precondition"
+        ));
+    }
+    let idempotency_key = idempotency_key.unwrap_or("read-only");
+    let enriched_args = attach_or_validate_owner_lease(state, session, args)?;
+    let fingerprint = session_send_fingerprint(session, action, &enriched_args);
+    match check_or_record_idempotency(state, session, idempotency_key, &fingerprint)? {
+        IdempotencyDecision::Recorded => Ok(PreparedCommand::Submit(build_session_send_command(
+            session,
+            action,
+            idempotency_key,
+            &enriched_args,
+        ))),
+        IdempotencyDecision::Deduped(previous) => Ok(PreparedCommand::Deduped(json!({
+            "ok": true,
+            "status": "command_deduped",
+            "idempotency_key": idempotency_key,
+            "previous": previous
+        }))),
+    }
+}
+
+pub(crate) fn classify_session_send_action(action: &str) -> SessionSendSafety {
+    match action {
+        "stop" | "interrupt" => SessionSendSafety {
+            requires_idempotency: true,
+            requires_precondition: true,
+        },
+        "send" | "continue" | "request_report" | "revise_plan" | "approve_plan" | "start_auto"
+        | "select_option" => SessionSendSafety {
+            requires_idempotency: true,
+            requires_precondition: false,
+        },
+        _ => SessionSendSafety {
+            requires_idempotency: true,
+            requires_precondition: false,
+        },
+    }
+}
+
+pub(crate) fn command_type_for_session_send(action: &str) -> CommandType {
+    match action {
+        "stop" => CommandType::StopSession,
+        "interrupt" => CommandType::InterruptTurn,
+        "select_option" => CommandType::SelectOption,
+        "request_report" => CommandType::RequestReport,
+        "continue" | "send" | "revise_plan" | "approve_plan" | "start_auto" => {
+            CommandType::SendInput
+        }
+        _ => CommandType::SendInput,
+    }
+}
+
+pub(crate) fn build_session_send_command(
+    session: &str,
+    action: &str,
+    idempotency_key: &str,
+    args: &Value,
+) -> CommandEnvelopeV1 {
+    let precondition = args
+        .get("precondition")
+        .cloned()
+        .and_then(|value| serde_json::from_value::<CommandPrecondition>(value).ok());
+    let owner_id = args
+        .get("owner_id")
+        .and_then(Value::as_str)
+        .unwrap_or("codex")
+        .to_string();
+    let owner_lease_id = precondition
+        .as_ref()
+        .and_then(|value| value.owner_lease_id.clone())
+        .or_else(|| {
+            args.get("owner_lease_id")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        })
+        .unwrap_or_else(|| "unleased".to_string());
+    let lease_generation = precondition
+        .as_ref()
+        .and_then(|value| value.lease_generation)
+        .or_else(|| args.get("lease_generation").and_then(Value::as_u64))
+        .unwrap_or(0);
+    CommandEnvelopeV1 {
+        schema_version: 1,
+        command_id: format!(
+            "cmd-{}",
+            chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ),
+        session_id: session.to_string(),
+        run_id: args
+            .get("run_id")
+            .and_then(Value::as_str)
+            .map(str::to_string),
+        owner_id,
+        owner_lease_id,
+        lease_generation,
+        idempotency_key: idempotency_key.to_string(),
+        command_type: command_type_for_session_send(action),
+        payload: session_send_payload(action, args),
+        precondition,
+        created_at: chrono::Utc::now().to_rfc3339(),
+    }
+}
+
+pub(crate) fn session_send_payload(action: &str, args: &Value) -> Value {
+    let mut payload = serde_json::Map::new();
+    payload.insert("action".to_string(), json!(action));
+    if let Some(text) = args.get("text").and_then(Value::as_str) {
+        payload.insert("text".to_string(), json!(text));
+    }
+    if let Some(enter) = args.get("enter").and_then(Value::as_bool) {
+        payload.insert("enter".to_string(), json!(enter));
+    }
+    Value::Object(payload)
+}
+
+pub(crate) fn session_send_fingerprint(session: &str, action: &str, args: &Value) -> String {
+    let mut normalized = serde_json::Map::new();
+    normalized.insert("session".to_string(), json!(session));
+    normalized.insert("action".to_string(), json!(action));
+    normalized.insert(
+        "text".to_string(),
+        args.get("text").cloned().unwrap_or(Value::Null),
+    );
+    normalized.insert(
+        "enter".to_string(),
+        args.get("enter").cloned().unwrap_or(Value::Null),
+    );
+    normalized.insert(
+        "precondition".to_string(),
+        args.get("precondition").cloned().unwrap_or(Value::Null),
+    );
+    serde_json::to_string(&Value::Object(normalized)).unwrap_or_default()
+}
+
+pub(crate) fn check_or_record_idempotency(
+    state: &AppState,
+    session: &str,
+    key: &str,
+    fingerprint: &str,
+) -> Result<IdempotencyDecision, String> {
+    let _guard = state.state_writer.lock().unwrap();
+    let index_path = commands_index_path(state);
+    let log_path = commands_log_path(state);
+    let mut ledger = read_json_file(&index_path, json!(null));
+    if !ledger.is_object() {
+        ledger = rebuild_commands_index_from_log(&log_path);
+        write_json_file(&index_path, &ledger)?;
+    }
+    if !ledger.is_object() {
+        ledger = json!({});
+    }
+    let scope = format!("session_send:{session}:{key}");
+    if let Some(previous) = ledger.get(&scope) {
+        let previous_fingerprint = previous
+            .get("fingerprint")
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        if previous_fingerprint != fingerprint {
+            append_command_registry_line(
+                &log_path,
+                &json!({
+                    "scope": scope,
+                    "session": session,
+                    "idempotency_key": key,
+                    "fingerprint": fingerprint,
+                    "status": "rejected",
+                    "reason": "different_payload",
+                    "created_at": chrono::Utc::now().to_rfc3339()
+                }),
+            )?;
+            return Err(format!(
+                "rejected_idempotency_key_reuse_with_different_payload: key={key}"
+            ));
+        }
+        append_command_registry_line(
+            &log_path,
+            &json!({
+                "scope": scope,
+                "session": session,
+                "idempotency_key": key,
+                "fingerprint": fingerprint,
+                "status": "deduped",
+                "created_at": chrono::Utc::now().to_rfc3339()
+            }),
+        )?;
+        return Ok(IdempotencyDecision::Deduped(previous.clone()));
+    }
+    let record = json!({
+        "scope": scope,
+        "session": session,
+        "idempotency_key": key,
+        "fingerprint": fingerprint,
+        "status": "accepted",
+        "recorded_at": chrono::Utc::now().to_rfc3339()
+    });
+    append_command_registry_line(&log_path, &record)?;
+    ledger[&scope] = record;
+    write_json_file(&index_path, &ledger)?;
+    Ok(IdempotencyDecision::Recorded)
+}
+
+fn commands_log_path(state: &AppState) -> std::path::PathBuf {
+    state
+        .workspace
+        .join(".agentcall")
+        .join("state")
+        .join("commands.ndjson")
+}
+
+fn commands_index_path(state: &AppState) -> std::path::PathBuf {
+    state
+        .workspace
+        .join(".agentcall")
+        .join("state")
+        .join("commands.index.json")
+}
+
+fn append_command_registry_line(
+    path: &std::path::Path,
+    record: &serde_json::Value,
+) -> Result<(), String> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(|err| err.to_string())?;
+    }
+    let mut file = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .map_err(|err| err.to_string())?;
+    let text = serde_json::to_string(record).map_err(|err| err.to_string())?;
+    writeln!(file, "{text}").map_err(|err| err.to_string())
+}
+
+fn rebuild_commands_index_from_log(path: &std::path::Path) -> serde_json::Value {
+    let Ok(text) = fs::read_to_string(path) else {
+        return json!({});
+    };
+    let mut index = serde_json::Map::new();
+    for line in text.lines() {
+        let Ok(record) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue;
+        };
+        if record.get("status").and_then(Value::as_str) != Some("accepted") {
+            continue;
+        }
+        let Some(scope) = record.get("scope").and_then(Value::as_str) else {
+            continue;
+        };
+        index.insert(scope.to_string(), record);
+    }
+    Value::Object(index)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::util::now_ms;
+    use std::fs;
+
+    fn test_state(name: &str) -> AppState {
+        let root = std::env::temp_dir().join(format!(
+            "agentcall-commands-{name}-{}-{}",
+            std::process::id(),
+            now_ms()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join(".agentcall").join("state")).unwrap();
+        AppState::test(root)
+    }
+
+    #[test]
+    fn session_send_safety_classifies_destructive_actions() {
+        let stop = classify_session_send_action("stop");
+        assert!(stop.requires_idempotency);
+        assert!(stop.requires_precondition);
+
+        let send = classify_session_send_action("send");
+        assert!(send.requires_idempotency);
+        assert!(!send.requires_precondition);
+    }
+
+    #[test]
+    fn session_send_idempotency_dedupes_and_rejects_key_reuse() {
+        let state = test_state("idempotency");
+        let first = check_or_record_idempotency(&state, "worker-a", "cmd-1", "payload-a").unwrap();
+        assert!(matches!(first, IdempotencyDecision::Recorded));
+
+        let second = check_or_record_idempotency(&state, "worker-a", "cmd-1", "payload-a").unwrap();
+        assert!(matches!(second, IdempotencyDecision::Deduped(_)));
+
+        let reused =
+            check_or_record_idempotency(&state, "worker-a", "cmd-1", "payload-b").unwrap_err();
+        assert!(reused.contains("different_payload"));
+        let _ = fs::remove_dir_all(&state.workspace);
+    }
+
+    #[test]
+    fn commands_index_rebuilds_from_append_only_log() {
+        let state = test_state("commands-index-rebuild");
+        let first = check_or_record_idempotency(&state, "worker-a", "cmd-1", "payload-a").unwrap();
+        assert!(matches!(first, IdempotencyDecision::Recorded));
+
+        fs::remove_file(commands_index_path(&state)).unwrap();
+        let rebuilt =
+            check_or_record_idempotency(&state, "worker-a", "cmd-1", "payload-a").unwrap();
+        assert!(matches!(rebuilt, IdempotencyDecision::Deduped(_)));
+
+        let log_text = fs::read_to_string(commands_log_path(&state)).unwrap();
+        assert!(log_text.contains(r#""status":"accepted""#));
+        assert!(log_text.contains(r#""status":"deduped""#));
+        let _ = fs::remove_dir_all(&state.workspace);
+    }
+
+    #[test]
+    fn session_send_action_maps_to_command_type() {
+        assert_eq!(
+            command_type_for_session_send("interrupt"),
+            CommandType::InterruptTurn
+        );
+        assert_eq!(
+            command_type_for_session_send("select_option"),
+            CommandType::SelectOption
+        );
+        assert_eq!(
+            command_type_for_session_send("request_report"),
+            CommandType::RequestReport
+        );
+    }
+
+    #[test]
+    fn command_envelope_v1_carries_owner_and_precondition() {
+        let envelope = CommandEnvelopeV1 {
+            schema_version: 1,
+            command_id: "cmd-1".to_string(),
+            session_id: "worker-a".to_string(),
+            run_id: Some("run-1".to_string()),
+            owner_id: "codex-main".to_string(),
+            owner_lease_id: "lease-1".to_string(),
+            lease_generation: 3,
+            idempotency_key: "idem-1".to_string(),
+            command_type: CommandType::SendInput,
+            payload: serde_json::json!({"text": "continue"}),
+            precondition: Some(CommandPrecondition {
+                projection_last_session_seq: Some(42),
+                turn_state: Some("Idle".to_string()),
+                owner_lease_id: Some("lease-1".to_string()),
+                lease_generation: Some(3),
+            }),
+            created_at: "2026-06-09T00:00:00Z".to_string(),
+        };
+        let value = serde_json::to_value(&envelope).unwrap();
+        assert_eq!(value["schema_version"], 1);
+        assert_eq!(value["command_type"], "SendInput");
+        assert_eq!(value["owner_lease_id"], "lease-1");
+        assert_eq!(value["precondition"]["projection_last_session_seq"], 42);
+    }
+}

@@ -1,13 +1,27 @@
 #![recursion_limit = "256"]
 
+mod actor;
+mod commands;
+mod confidence;
 mod config;
+mod events;
 mod hooks;
 mod http;
 mod mcp;
+mod ownership;
+mod process;
+mod projection;
 mod routes;
+mod runtime;
 mod runtime_lock;
+mod runtime_pty;
+mod runtime_sdk;
+mod scheduler;
 mod session;
 mod state;
+mod store;
+mod store_json;
+mod store_sqlite;
 mod summary;
 mod terminal;
 mod util;
@@ -45,6 +59,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         Err(err) => (LocalConfig::default(), Some(err)),
     };
     let state = Arc::new(AppState::new(workspace, config, config_error));
+    ownership::load_owner_leases(&state);
+    ownership::load_workspace_leases(&state);
     let listener = TcpListener::bind(("127.0.0.1", port))?;
     println!("AgentCall daemon: http://localhost:{port}");
     append_agent_event(

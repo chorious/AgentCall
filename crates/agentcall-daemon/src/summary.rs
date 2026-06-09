@@ -1,7 +1,12 @@
 use crate::hooks::{
     pending_supervisor_instructions_state, policy_denials_state, runtime_bindings_state,
 };
+use crate::ownership::{owner_leases_summary, workspace_leases_summary};
+use crate::process::default_process_controller_kind;
+use crate::projection::board_attention_projection;
 use crate::routes::routes_state;
+use crate::runtime_sdk::sdk_runtime_enabled;
+use crate::scheduler::scheduler_health;
 use crate::session::{Session, SessionInfo, list_sessions};
 use crate::state::{AppState, read_events, read_json_file, write_json_file};
 use crate::terminal::{clean_terminal_text, tail_lines};
@@ -23,6 +28,9 @@ pub(crate) fn board_state(
     filter: Option<&str>,
     section: Option<&str>,
 ) -> serde_json::Value {
+    if view == Some("compact") && filter == Some("attention") {
+        return board_attention_projection(state);
+    }
     let agent_dir = state.workspace.join(".agentcall");
     let live_daemon_sessions = list_sessions(state);
     cleanup_stale_runtime_state(state, &live_daemon_sessions);
@@ -137,8 +145,16 @@ pub(crate) fn runtime_health(state: &AppState) -> serde_json::Value {
         "claude_workspace": state.config.claude_workspace,
         "missing_required_config": state.config.claude_workspace.is_none(),
         "state_writer": "daemon",
+        "store_backend": state.store.backend_name(),
+        "configured_store_backend": state.config.store_backend,
+        "runtime_capabilities": runtime_capabilities(state),
         "utf8_decoder": "streaming",
         "hook_aware_summary": true,
+        "process_controller": default_process_controller_kind(),
+        "process_cleanup_guarantee": if cfg!(windows) { "windows_job_when_assignable" } else { "best_effort_parent_kill_only" },
+        "owner_leases": owner_leases_summary(state),
+        "workspace_leases": workspace_leases_summary(state),
+        "scheduler": scheduler_health(state),
         "event_next": state.event_seq.load(Ordering::SeqCst),
         "active_pty_sessions": running_sessions,
         "live_daemon_sessions": running_sessions,
@@ -153,6 +169,31 @@ pub(crate) fn runtime_health(state: &AppState) -> serde_json::Value {
         "claude_hook_config_status": claude_hook_config_status,
         "warnings": hook_warnings,
         "status": if state.config.claude_workspace.is_some() { "ok" } else { "config_missing" }
+    })
+}
+
+fn runtime_capabilities(state: &AppState) -> Value {
+    let mut runtimes = vec![serde_json::json!({
+        "runtime_id": "claude_code_pty",
+        "supports_pty": true,
+        "supports_sdk": false,
+        "command_path": "SessionActor",
+        "default": true,
+    })];
+    if sdk_runtime_enabled(state) {
+        runtimes.push(serde_json::json!({
+            "runtime_id": "claude_code_sdk",
+            "supports_pty": false,
+            "supports_sdk": true,
+            "command_path": "EventEnvelopeProjectionContract",
+            "default": false,
+            "experimental": true,
+        }));
+    }
+    serde_json::json!({
+        "default_runtime": "pty",
+        "experimental_sdk_runtime": sdk_runtime_enabled(state),
+        "runtimes": runtimes,
     })
 }
 
@@ -1408,6 +1449,7 @@ pub(crate) fn read_reports(tasks_dir: &Path) -> Vec<serde_json::Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::LocalConfig;
     use crate::state::AppState;
 
     #[test]
@@ -1418,6 +1460,58 @@ mod tests {
             vec!["report_v2.0.md", "report_v2.1.md"]
         );
         assert_eq!(last_error(text), None);
+    }
+
+    #[test]
+    fn runtime_health_hides_sdk_runtime_until_enabled() {
+        let root = std::env::temp_dir().join(format!(
+            "agentcall-runtime-health-sdk-{}",
+            std::process::id()
+        ));
+        let disabled = AppState::new(
+            root.join("disabled"),
+            LocalConfig {
+                claude_workspace: Some(root.join("disabled")),
+                experimental_sdk_runtime: Some(false),
+                ..LocalConfig::default()
+            },
+            None,
+        );
+        let disabled_health = runtime_health(&disabled);
+        assert_eq!(
+            disabled_health["runtime_capabilities"]["experimental_sdk_runtime"],
+            false
+        );
+        assert_eq!(
+            disabled_health["runtime_capabilities"]["runtimes"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
+
+        let enabled = AppState::new(
+            root.join("enabled"),
+            LocalConfig {
+                claude_workspace: Some(root.join("enabled")),
+                experimental_sdk_runtime: Some(true),
+                ..LocalConfig::default()
+            },
+            None,
+        );
+        let enabled_health = runtime_health(&enabled);
+        assert_eq!(
+            enabled_health["runtime_capabilities"]["experimental_sdk_runtime"],
+            true
+        );
+        assert!(
+            enabled_health["runtime_capabilities"]["runtimes"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|runtime| runtime["runtime_id"] == "claude_code_sdk")
+        );
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
@@ -1557,6 +1651,29 @@ mod tests {
         assert_eq!(legacy[0]["name"], "legacy-one");
         assert_eq!(legacy[0]["status_class"], "legacy_detached");
         assert_eq!(legacy[0]["live"], false);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn compact_attention_board_uses_projection_hot_path() {
+        let root = std::env::temp_dir().join(format!(
+            "agentcall-board-hot-path-test-{}",
+            std::process::id()
+        ));
+        let agent_dir = root.join(".agentcall");
+        fs::create_dir_all(agent_dir.join("tasks")).unwrap();
+        fs::write(agent_dir.join("events.ndjson"), r#"{"id":"evt-old"}"#).unwrap();
+        fs::write(
+            agent_dir.join("tasks").join("Report_old.md"),
+            "# old report\n",
+        )
+        .unwrap();
+        let state = AppState::test(root.clone());
+        let board = board_state(&state, Some("compact"), Some("attention"), None);
+        assert_eq!(board["projection_only"], true);
+        assert!(board.get("recent_events").is_none());
+        assert!(board.get("reports").is_none());
+        assert!(board.get("legacy_detached_sessions").is_none());
         let _ = fs::remove_dir_all(root);
     }
 

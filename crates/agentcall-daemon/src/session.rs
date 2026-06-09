@@ -1,16 +1,18 @@
+use crate::actor::{spawn_session_actor, submit_raw_write};
 use crate::hooks::cleanup_wrapper_session;
+use crate::ownership::{ensure_owner_lease, release_owner_lease, release_workspace_lease};
+use crate::process::ProcessHandle;
 use crate::state::{AppState, append_agent_event};
 use crate::terminal::{DecodeHealth, append_limited_text, decode_utf8_stream};
 use crate::util::{now_ms, safe_name};
 use portable_pty::{Child, ChildKiller, CommandBuilder, MasterPty, PtySize, native_pty_system};
 use serde::{Deserialize, Serialize};
-use std::io::{Read, Write};
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::Sender;
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::Duration;
 
 const REPLAY_LIMIT: usize = 512 * 1024;
 
@@ -19,8 +21,9 @@ pub(crate) struct Session {
     pub(crate) command: Vec<String>,
     pub(crate) cwd: PathBuf,
     pub(crate) master: Mutex<Box<dyn MasterPty + Send>>,
-    pub(crate) writer: Mutex<Box<dyn Write + Send>>,
     pub(crate) child: Mutex<Box<dyn Child + Send>>,
+    pub(crate) child_pid: Option<u32>,
+    pub(crate) process: Mutex<ProcessHandle>,
     pub(crate) killer: Mutex<Box<dyn ChildKiller + Send + Sync>>,
     pub(crate) status: Mutex<String>,
     pub(crate) created_at: u64,
@@ -31,16 +34,17 @@ pub(crate) struct Session {
     pub(crate) clients: Mutex<Vec<Sender<StreamEvent>>>,
 }
 
-#[derive(Clone, Serialize)]
+#[derive(Clone, Debug, Serialize)]
 pub(crate) struct SessionInfo {
     pub(crate) name: String,
-    command: Vec<String>,
-    cwd: String,
+    pub(crate) command: Vec<String>,
+    pub(crate) cwd: String,
     pub(crate) status: String,
-    created_at: u64,
-    updated_at: u64,
-    replay_bytes: usize,
-    decode_health: DecodeHealth,
+    pub(crate) child_pid: Option<u32>,
+    pub(crate) created_at: u64,
+    pub(crate) updated_at: u64,
+    pub(crate) replay_bytes: usize,
+    pub(crate) decode_health: DecodeHealth,
 }
 
 #[derive(Clone, Serialize)]
@@ -58,12 +62,6 @@ pub(crate) struct StartRequest {
     pub(crate) cwd: Option<String>,
     pub(crate) cols: Option<u16>,
     pub(crate) rows: Option<u16>,
-}
-
-#[derive(Deserialize)]
-pub(crate) struct InputRequest {
-    pub(crate) text: String,
-    pub(crate) enter: Option<bool>,
 }
 
 #[derive(Deserialize)]
@@ -116,6 +114,8 @@ pub(crate) fn start_session(
         .slave
         .spawn_command(command)
         .map_err(|err| err.to_string())?;
+    let child_pid = child.process_id();
+    let process = ProcessHandle::create(&req.name, child_pid);
     let killer = child.clone_killer();
     let reader = pair
         .master
@@ -128,8 +128,9 @@ pub(crate) fn start_session(
         command: req.command,
         cwd,
         master: Mutex::new(pair.master),
-        writer: Mutex::new(writer),
         child: Mutex::new(child),
+        child_pid,
+        process: Mutex::new(process),
         killer: Mutex::new(killer),
         status: Mutex::new("running".to_string()),
         created_at: now_ms(),
@@ -145,6 +146,8 @@ pub(crate) fn start_session(
         .lock()
         .unwrap()
         .insert(session.name.clone(), Arc::clone(&session));
+    let owner_lease = ensure_owner_lease(state, &session.name, "codex")?;
+    spawn_session_actor(Arc::clone(state), Arc::clone(&session), writer);
     append_agent_event(
         state,
         "pty.session_started",
@@ -153,6 +156,11 @@ pub(crate) fn start_session(
             "name": session.name,
             "command": session.command,
             "cwd": session.cwd,
+            "child_pid": session.child_pid,
+            "process_controller": session.process.lock().unwrap().controller,
+            "owner_lease_id": owner_lease.lease_id,
+            "lease_generation": owner_lease.lease_generation,
+            "owner_id": owner_lease.owner_id,
             "requested_cwd": requested_cwd,
             "cwd_policy": if is_claude_command(&session.command) { "force_configured_claude_workspace" } else { "requested_or_default" },
             "runtime": "pty"
@@ -191,10 +199,7 @@ pub(crate) fn spawn_reader(
                         .windows(4)
                         .filter(|window| *window == b"\x1b[6n")
                     {
-                        if let Ok(mut writer) = session.writer.lock() {
-                            let _ = writer.write_all(b"\x1b[1;1R");
-                            let _ = writer.flush();
-                        }
+                        submit_raw_write(&state, &session.name, b"\x1b[1;1R".to_vec());
                     }
                     control_tail.clear();
                     control_tail
@@ -251,8 +256,25 @@ pub(crate) fn spawn_waiter(state: Arc<AppState>, session: Arc<Session>) {
             &state,
             "pty.session_ended",
             "PTY session ended.",
-            serde_json::json!({"name": session.name, "status": session.status.lock().unwrap().clone(), "cwd": session.cwd}),
+            serde_json::json!({"name": session.name, "status": session.status.lock().unwrap().clone(), "cwd": session.cwd, "child_pid": session.child_pid}),
         );
+        state.actors.lock().unwrap().remove(&session.name);
+        if let Err(err) = release_owner_lease(&state, &session.name, "session_exited") {
+            append_agent_event(
+                &state,
+                "owner_lease.release_failed",
+                "Owner lease release failed.",
+                serde_json::json!({"name": session.name, "reason": "session_exited", "error": err}),
+            );
+        }
+        if let Err(err) = release_workspace_lease(&state, &session.name, "session_exited") {
+            append_agent_event(
+                &state,
+                "workspace_lease.release_failed",
+                "Workspace lease release failed.",
+                serde_json::json!({"name": session.name, "reason": "session_exited", "error": err}),
+            );
+        }
         if let Err(err) = cleanup_wrapper_session(&state, &session.name, "session_exited") {
             append_agent_event(
                 &state,
@@ -318,6 +340,7 @@ pub(crate) fn session_info(session: &Arc<Session>) -> SessionInfo {
         command: session.command.clone(),
         cwd: session.cwd.display().to_string(),
         status: session.status.lock().unwrap().clone(),
+        child_pid: session.child_pid,
         created_at: session.created_at,
         updated_at: session.updated_at.load(Ordering::Relaxed),
         replay_bytes: session.replay.lock().unwrap().len(),
@@ -327,64 +350,6 @@ pub(crate) fn session_info(session: &Arc<Session>) -> SessionInfo {
 
 pub(crate) fn get_session(state: &AppState, name: &str) -> Option<Arc<Session>> {
     state.sessions.lock().unwrap().get(name).cloned()
-}
-
-pub(crate) fn write_input(state: &AppState, name: &str, req: InputRequest) -> Result<(), String> {
-    let session = get_session(state, name).ok_or_else(|| "session not found".to_string())?;
-    let enter = req.enter.unwrap_or(true);
-    let mut writer = session.writer.lock().unwrap();
-    let text_len = req.text.len();
-    if !req.text.is_empty() {
-        writer
-            .write_all(req.text.as_bytes())
-            .map_err(|err| err.to_string())?;
-    }
-    if enter {
-        thread::sleep(Duration::from_millis(80));
-        writer.write_all(b"\r").map_err(|err| err.to_string())?;
-    }
-    append_agent_event(
-        state,
-        "pty.input_sent",
-        "Input sent to PTY session.",
-        serde_json::json!({"name": name, "chars": text_len + if enter { 1 } else { 0 }, "enter": enter, "submit_split": enter}),
-    );
-    Ok(())
-}
-
-pub(crate) fn interrupt_session(
-    state: &AppState,
-    name: &str,
-    redirect_text: Option<String>,
-) -> Result<(), String> {
-    let session = get_session(state, name).ok_or_else(|| "session not found".to_string())?;
-    {
-        let mut writer = session.writer.lock().unwrap();
-        writer.write_all(b"\x1b").map_err(|err| err.to_string())?;
-        writer.flush().map_err(|err| err.to_string())?;
-    }
-    append_agent_event(
-        state,
-        "pty.interrupt_sent",
-        "Interrupt sent to PTY session.",
-        serde_json::json!({
-            "name": name,
-            "control": "esc",
-            "warning": "Use interrupt only when the worker is drifting, doing the wrong thing, or must be reclaimed immediately."
-        }),
-    );
-    if let Some(text) = redirect_text.filter(|value| !value.trim().is_empty()) {
-        thread::sleep(Duration::from_millis(250));
-        write_input(
-            state,
-            name,
-            InputRequest {
-                text,
-                enter: Some(true),
-            },
-        )?;
-    }
-    Ok(())
 }
 
 pub(crate) fn resize_session(
@@ -415,6 +380,7 @@ pub(crate) fn resize_session(
 
 pub(crate) fn stop_session(state: &AppState, name: &str) -> Result<(), String> {
     let session = get_session(state, name).ok_or_else(|| "session not found".to_string())?;
+    let process_kill = session.process.lock().unwrap().kill_tree();
     let kill_result = session.killer.lock().unwrap().kill();
     if let Err(err) = kill_result {
         if err.raw_os_error() != Some(0) {
@@ -427,13 +393,36 @@ pub(crate) fn stop_session(state: &AppState, name: &str) -> Result<(), String> {
         state,
         "pty.stop_requested",
         "PTY stop requested.",
-        serde_json::json!({"name": name}),
+        serde_json::json!({
+            "name": name,
+            "child_pid": session.child_pid,
+            "process_controller": process_kill.controller,
+            "cleanup_guarantee": process_kill.cleanup_guarantee,
+            "fallback_used": process_kill.fallback_used,
+            "process_error": process_kill.error,
+        }),
     );
     if let Err(err) = cleanup_wrapper_session(state, name, "stop_requested") {
         append_agent_event(
             state,
             "session.cleanup_failed",
             "Session runtime cleanup failed.",
+            serde_json::json!({"name": name, "reason": "stop_requested", "error": err}),
+        );
+    }
+    if let Err(err) = release_owner_lease(state, name, "stop_requested") {
+        append_agent_event(
+            state,
+            "owner_lease.release_failed",
+            "Owner lease release failed.",
+            serde_json::json!({"name": name, "reason": "stop_requested", "error": err}),
+        );
+    }
+    if let Err(err) = release_workspace_lease(state, name, "stop_requested") {
+        append_agent_event(
+            state,
+            "workspace_lease.release_failed",
+            "Workspace lease release failed.",
             serde_json::json!({"name": name, "reason": "stop_requested", "error": err}),
         );
     }

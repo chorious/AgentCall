@@ -1,4 +1,10 @@
-use crate::session::{InputRequest, StartRequest, start_session, write_input};
+use crate::actor::submit_session_command;
+use crate::commands::build_session_send_command;
+use crate::ownership::{acquire_workspace_lease, release_workspace_lease};
+use crate::runtime::{AgentRuntime, StartSpec};
+use crate::runtime_pty::ClaudeCodePtyRuntime;
+use crate::runtime_sdk::{ClaudeCodeSdkRuntime, sdk_runtime_enabled};
+use crate::scheduler::enforce_start_capacity;
 use crate::state::{AppState, append_agent_event_locked, read_json_file, write_json_file};
 use crate::util::{now_ms, safe_name};
 use serde::{Deserialize, Serialize};
@@ -89,8 +95,14 @@ pub(crate) fn handle_route(state: &Arc<AppState>, req: RouteRequest) -> Result<V
         return Err("mode must be recommend or start".to_string());
     }
     let runtime = req.runtime.as_deref().unwrap_or("auto");
-    if !matches!(runtime, "auto" | "pty") {
-        return Err("runtime must be auto or pty".to_string());
+    if !matches!(runtime, "auto" | "pty" | "sdk") {
+        return Err("runtime must be auto, pty, or sdk".to_string());
+    }
+    if runtime == "sdk" && !sdk_runtime_enabled(state) {
+        return Err(
+            "sdk runtime is experimental and disabled; set experimental_sdk_runtime=true in local config"
+                .to_string(),
+        );
     }
     let route_id = format!("route-{}", state.next_seq());
     let decision = route_decision(&req);
@@ -122,6 +134,7 @@ pub(crate) fn handle_route(state: &Arc<AppState>, req: RouteRequest) -> Result<V
     if mode == "start" {
         match decision.runtime.as_str() {
             "pty" => start_pty_route(state, &req, &mut record)?,
+            "sdk" => start_sdk_route(state, &req, &mut record)?,
             other => return Err(format!("unsupported route runtime: {other}")),
         }
     }
@@ -348,6 +361,18 @@ struct RouteDecision {
 
 fn route_decision(req: &RouteRequest) -> RouteDecision {
     let requested = req.runtime.as_deref().unwrap_or("auto");
+    if requested == "sdk" {
+        return RouteDecision {
+            runtime: "sdk".to_string(),
+            reason: "runtime forced by caller: experimental SDK runtime".to_string(),
+            score_breakdown: json!({
+                "decision_model": "explicit_experimental_runtime",
+                "requested_runtime": requested,
+                "recommended_runtime": "sdk",
+                "experimental": true,
+            }),
+        };
+    }
     if requested == "pty" || requested == "auto" {
         return RouteDecision {
             runtime: "pty".to_string(),
@@ -378,6 +403,39 @@ fn route_decision(req: &RouteRequest) -> RouteDecision {
     }
 }
 
+fn start_sdk_route(
+    state: &Arc<AppState>,
+    req: &RouteRequest,
+    record: &mut RouteRecord,
+) -> Result<(), String> {
+    let runtime = ClaudeCodeSdkRuntime::new(Arc::clone(state));
+    let result = runtime.start(StartSpec {
+        name: req
+            .session_name
+            .clone()
+            .unwrap_or_else(|| record.route_id.replace("route-", "route-sdk-")),
+        command: req.command.clone().unwrap_or_default(),
+        cwd: req.workspace.clone(),
+        cols: None,
+        rows: None,
+    });
+    record.status = "unsupported_experimental_runtime".to_string();
+    record.required_next_step =
+        "use runtime=pty until native SDK worker start is implemented".to_string();
+    record.result = json!({
+        "runtime": runtime.id(),
+        "runtime_session": Value::Null,
+        "capabilities": {
+            "runtime_id": runtime.capabilities().runtime_id,
+            "supports_pty": runtime.capabilities().supports_pty,
+            "supports_sdk": runtime.capabilities().supports_sdk,
+            "command_path": runtime.capabilities().command_path,
+        },
+        "error": result.err().unwrap_or_else(|| "sdk runtime did not start".to_string()),
+    });
+    Ok(())
+}
+
 fn start_pty_route(
     state: &Arc<AppState>,
     req: &RouteRequest,
@@ -398,16 +456,26 @@ fn start_pty_route(
     };
     let command = pty_command(req, &workflow, claude_session_id.as_deref())?;
     let containment = pty_containment(state, req, &session_name);
-    let info = start_session(
+    let target_workspace = route_target_workspace(state, req);
+    let schedule = enforce_start_capacity(state, "codex")?;
+    let workspace_lease = acquire_workspace_lease(
         state,
-        StartRequest {
+        &session_name,
+        &target_workspace,
+        req.read_only.unwrap_or(false),
+    )?;
+    let runtime = ClaudeCodePtyRuntime::new(Arc::clone(state));
+    let runtime_session = runtime
+        .start(StartSpec {
             name: session_name.clone(),
             command,
             cwd: req.workspace.clone(),
             cols: Some(100),
             rows: Some(40),
-        },
-    )?;
+        })
+        .inspect_err(|_| {
+            let _ = release_workspace_lease(state, &session_name, "route_start_failed");
+        })?;
     let prompt_gate =
         submit_pty_prompt_with_ack(state, &session_name, pty_prompt(req, &containment));
     let prompt_status = prompt_gate
@@ -429,7 +497,14 @@ fn start_pty_route(
         "claude_session_id": claude_session_id,
         "plan_session_name": if workflow == PtyWorkflow::PlanThenAuto { Some(session_name.clone()) } else { None },
         "auto_session_name": serde_json::Value::Null,
-        "session": info,
+        "session": runtime_session.info,
+        "runtime_session": {
+            "session_id": runtime_session.session_id,
+            "runtime": runtime_session.runtime,
+            "command_path": runtime.capabilities().command_path,
+        },
+        "scheduler": schedule.to_value(),
+        "workspace_lease": workspace_lease,
         "prompt_gate": prompt_gate,
         "binding_gate": {
             "required": true,
@@ -445,6 +520,13 @@ fn start_pty_route(
         "containment": containment
     });
     Ok(())
+}
+
+fn route_target_workspace(state: &AppState, req: &RouteRequest) -> std::path::PathBuf {
+    req.workspace
+        .as_ref()
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| state.workspace.clone())
 }
 
 fn pty_containment(state: &AppState, req: &RouteRequest, session_name: &str) -> Value {
@@ -660,14 +742,21 @@ fn submit_pty_prompt_with_ack(
 ) -> Value {
     let mut last_error = None;
     for attempt in 1..=2u64 {
-        match write_input(
-            state,
+        let args = json!({
+            "text": prompt.clone(),
+            "enter": true,
+            "idempotency_key": format!("route-prompt-{wrapper_session}-{attempt}"),
+            "owner_id": "codex"
+        });
+        let command = build_session_send_command(
             wrapper_session,
-            InputRequest {
-                text: prompt.clone(),
-                enter: Some(true),
-            },
-        ) {
+            "send",
+            args.get("idempotency_key")
+                .and_then(Value::as_str)
+                .unwrap_or("route-prompt"),
+            &args,
+        );
+        match submit_session_command(state, wrapper_session, command) {
             Ok(_) => {
                 if wait_for_user_prompt_submit(state, wrapper_session, Duration::from_secs(8)) {
                     return json!({
@@ -815,6 +904,7 @@ fn count_tools(value: &Value, tool_uses: &mut u64, tool_results: &mut u64) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::LocalConfig;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]
@@ -851,6 +941,94 @@ mod tests {
         assert_eq!(route["status"], "recommended");
         assert_eq!(route["recommended_runtime"], "pty");
         assert_eq!(route["score_breakdown"]["decision_model"], "pty_only_v3");
+    }
+
+    #[test]
+    fn sdk_route_is_rejected_until_experimental_config_enabled() {
+        let state = Arc::new(AppState::test(test_workspace("sdk-disabled")));
+        let err = handle_route(
+            &state,
+            RouteRequest {
+                objective: "try sdk".to_string(),
+                workspace: None,
+                mode: Some("recommend".to_string()),
+                runtime: Some("sdk".to_string()),
+                estimated_minutes: None,
+                estimated_files: None,
+                estimated_loc: None,
+                needs_continuity: None,
+                risk: None,
+                session_name: None,
+                command: None,
+                task_id: None,
+                call_id: None,
+                phase: None,
+                role: None,
+                allowed_paths: None,
+                acceptance_criteria: None,
+                persist_context: None,
+                report_path: None,
+                read_only: None,
+                pty_workflow: None,
+                initial_permission_mode: None,
+            },
+        )
+        .unwrap_err();
+        assert!(err.contains("experimental and disabled"));
+    }
+
+    #[test]
+    fn enabled_sdk_route_returns_explicit_experimental_stub() {
+        let workspace = test_workspace("sdk-enabled");
+        let state = Arc::new(AppState::new(
+            workspace.clone(),
+            LocalConfig {
+                claude_workspace: Some(workspace),
+                experimental_sdk_runtime: Some(true),
+                ..LocalConfig::default()
+            },
+            None,
+        ));
+        let route = handle_route(
+            &state,
+            RouteRequest {
+                objective: "try sdk".to_string(),
+                workspace: None,
+                mode: Some("start".to_string()),
+                runtime: Some("sdk".to_string()),
+                estimated_minutes: None,
+                estimated_files: None,
+                estimated_loc: None,
+                needs_continuity: None,
+                risk: None,
+                session_name: Some("sdk-a".to_string()),
+                command: None,
+                task_id: None,
+                call_id: None,
+                phase: None,
+                role: None,
+                allowed_paths: None,
+                acceptance_criteria: None,
+                persist_context: None,
+                report_path: None,
+                read_only: None,
+                pty_workflow: None,
+                initial_permission_mode: None,
+            },
+        )
+        .unwrap();
+        assert_eq!(route["status"], "unsupported_experimental_runtime");
+        assert_eq!(route["recommended_runtime"], "sdk");
+        assert_eq!(
+            route["result"]["capabilities"]["command_path"],
+            "EventEnvelopeProjectionContract"
+        );
+        assert!(
+            route["result"]["error"]
+                .as_str()
+                .unwrap()
+                .contains("experimental_stub")
+        );
     }
 
     #[test]
@@ -957,6 +1135,25 @@ mod tests {
             parts
                 .iter()
                 .all(|part| part.chars().all(|ch| ch.is_ascii_hexdigit()))
+        );
+    }
+
+    #[test]
+    fn route_start_uses_runtime_boundary() {
+        let source = include_str!("routes.rs");
+        let direct_start_call = ["start", "_", "session", "("].concat();
+        let direct_start_import = ["use crate::session::", "start", "_", "session"].concat();
+        assert!(
+            !source.contains(&direct_start_call),
+            "routes.rs must not call session start directly"
+        );
+        assert!(
+            !source.contains(&direct_start_import),
+            "routes.rs must not import session start directly"
+        );
+        assert!(
+            source.contains("ClaudeCodePtyRuntime"),
+            "PTY route must cross the AgentRuntime boundary"
         );
     }
 

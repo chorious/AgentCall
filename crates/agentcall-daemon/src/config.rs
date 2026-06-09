@@ -4,6 +4,10 @@ use std::path::{Path, PathBuf};
 #[derive(Clone, Debug, Default, Deserialize)]
 pub(crate) struct LocalConfig {
     pub(crate) claude_workspace: Option<PathBuf>,
+    pub(crate) store_backend: Option<String>,
+    pub(crate) max_sessions: Option<usize>,
+    pub(crate) per_owner_max_sessions: Option<usize>,
+    pub(crate) experimental_sdk_runtime: Option<bool>,
 }
 
 impl LocalConfig {

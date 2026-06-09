@@ -1,3 +1,5 @@
+use crate::actor::{submit_raw_write, submit_session_command};
+use crate::commands::{PreparedCommand, prepare_session_send_command};
 use crate::hooks::{
     EventAppendRequest, HookIngestRequest, append_event_request, file_claims_state, ingest_hook,
     unmatched_hooks_state,
@@ -8,8 +10,8 @@ use crate::routes::{
     handle_route, index_transcript, route_state,
 };
 use crate::session::{
-    InputRequest, ResizeRequest, Session, StartRequest, StreamEvent, get_session, list_sessions,
-    resize_session, start_session, stop_session, write_input,
+    ResizeRequest, Session, StartRequest, StreamEvent, get_session, list_sessions, resize_session,
+    start_session,
 };
 use crate::state::{AppState, append_agent_event};
 use crate::summary::{
@@ -171,7 +173,7 @@ pub(crate) fn route(request: Request, state: Arc<AppState>) -> Response {
             Err(err) => error_response(400, &err),
         },
         ("POST", "/api/events") => match parse_json::<EventAppendRequest>(&request.body)
-            .map(|req| append_event_request(&state, req))
+            .and_then(|req| append_event_request(&state, req))
         {
             Ok(result) => json_response(&result),
             Err(err) => error_response(400, &err),
@@ -257,10 +259,10 @@ pub(crate) fn dynamic_route(request: Request, state: Arc<AppState>) -> Response 
             })),
             None => error_response(404, "session not found"),
         },
-        ("POST", "input") => match parse_json::<InputRequest>(&request.body)
-            .and_then(|req| write_input(&state, &name, req))
+        ("POST", "input") => match parse_json::<serde_json::Value>(&request.body)
+            .and_then(|args| submit_http_session_command(&state, &name, "send", args))
         {
-            Ok(()) => json_response(&serde_json::json!({"ok": true})),
+            Ok(result) => json_response(&result),
             Err(err) => error_response(400, &err),
         },
         ("POST", "resize") => match parse_json::<ResizeRequest>(&request.body)
@@ -269,8 +271,10 @@ pub(crate) fn dynamic_route(request: Request, state: Arc<AppState>) -> Response 
             Ok(()) => json_response(&serde_json::json!({"ok": true})),
             Err(err) => error_response(400, &err),
         },
-        ("POST", "stop") => match stop_session(&state, &name) {
-            Ok(()) => json_response(&serde_json::json!({"ok": true})),
+        ("POST", "stop") => match parse_json_or_empty(&request.body)
+            .and_then(|args| submit_http_session_command(&state, &name, "stop", args))
+        {
+            Ok(result) => json_response(&result),
             Err(err) => error_response(400, &err),
         },
         ("POST", "checkpoint") => match checkpoint_session(&state, &name) {
@@ -391,7 +395,7 @@ pub(crate) fn handle_ws_message(state: &AppState, session: &Arc<Session>, text: 
     match value.get("type").and_then(|v| v.as_str()) {
         Some("input") => {
             if let Some(data) = value.get("data").and_then(|v| v.as_str()) {
-                let _ = session.writer.lock().unwrap().write_all(data.as_bytes());
+                submit_raw_write(state, &session.name, data.as_bytes().to_vec());
                 append_agent_event(
                     state,
                     "pty.input_sent",
@@ -657,6 +661,33 @@ pub(crate) fn write_fixed(
 
 pub(crate) fn parse_json<T: for<'de> Deserialize<'de>>(body: &[u8]) -> Result<T, String> {
     serde_json::from_slice(body).map_err(|err| err.to_string())
+}
+
+fn parse_json_or_empty(body: &[u8]) -> Result<serde_json::Value, String> {
+    if body.is_empty() {
+        Ok(serde_json::json!({}))
+    } else {
+        parse_json::<serde_json::Value>(body)
+    }
+}
+
+fn submit_http_session_command(
+    state: &AppState,
+    name: &str,
+    action: &str,
+    mut args: serde_json::Value,
+) -> Result<serde_json::Value, String> {
+    if !args.is_object() {
+        return Err("session command body must be a JSON object".to_string());
+    }
+    args["action"] = serde_json::json!(action);
+    if action == "send" && !args.get("text").is_some_and(serde_json::Value::is_string) {
+        return Err("input command requires text".to_string());
+    }
+    match prepare_session_send_command(state, name, action, &args)? {
+        PreparedCommand::Submit(command) => submit_session_command(state, name, command),
+        PreparedCommand::Deduped(value) => Ok(value),
+    }
 }
 
 pub(crate) fn url_decode(value: &str) -> String {
