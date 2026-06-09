@@ -173,6 +173,8 @@ python scripts\agentcall_dev.py smoke real-worker --store-backend sqlite
 - Add SQLite transaction failure tests for command completion.
   - unknown command completion rejects without writing event/projection.
   - event uniqueness failure rolls back command status to `accepted`.
+- Add SQLite transaction failure tests for route/session/lease creation.
+  - injected workspace lease insert failure rolls back session row and owner lease row.
 
 ### P1: Scheduler and Lease Validation
 

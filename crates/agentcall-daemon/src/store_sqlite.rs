@@ -670,6 +670,7 @@ fn command_status_text(status: CommandStatus) -> &'static str {
 mod tests {
     use super::*;
     use crate::commands::{CommandEnvelopeV1, CommandType};
+    use crate::ownership::{LeaseStatus, WorkspaceLeaseMode};
     use crate::projection::apply_event_to_projection;
     use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -856,6 +857,53 @@ mod tests {
         assert_eq!(events[0].event_type, "pty.session_started");
     }
 
+    #[test]
+    fn sqlite_route_session_and_leases_roll_back_when_workspace_lease_fails() {
+        let store = test_store("route-rollback");
+        let conn = store.connect().unwrap();
+        conn.execute_batch(
+            "CREATE TRIGGER fail_workspace_lease_insert \
+             BEFORE INSERT ON workspace_leases \
+             BEGIN SELECT RAISE(ABORT, 'injected_workspace_lease_failure'); END;",
+        )
+        .unwrap();
+        drop(conn);
+
+        let session = session_record_for("worker-route");
+        let owner_lease = owner_lease_for("worker-route");
+        let workspace_lease = workspace_lease_for("worker-route");
+        let err = store
+            .acquire_route_leases_and_create_session(&session, &owner_lease, Some(&workspace_lease))
+            .unwrap_err();
+        assert!(err.contains("injected_workspace_lease_failure"));
+
+        let conn = store.connect().unwrap();
+        let session_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sessions WHERE session_id = ?1",
+                params!["worker-route"],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let owner_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM owner_leases WHERE session_id = ?1",
+                params!["worker-route"],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let workspace_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM workspace_leases WHERE session_id = ?1",
+                params!["worker-route"],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(session_count, 0);
+        assert_eq!(owner_count, 0);
+        assert_eq!(workspace_count, 0);
+    }
+
     fn command_for(command_id: &str, idempotency_key: &str, text: &str) -> CommandEnvelopeV1 {
         CommandEnvelopeV1 {
             schema_version: 1,
@@ -870,6 +918,44 @@ mod tests {
             payload: json!({"text": text}),
             precondition: None,
             created_at: chrono::Utc::now().to_rfc3339(),
+        }
+    }
+
+    fn session_record_for(session_id: &str) -> SessionRecord {
+        SessionRecord {
+            session_id: session_id.to_string(),
+            owner_id: "codex".to_string(),
+            workspace: "E:\\Project\\AgentCall".to_string(),
+            workspace_key: "e:\\project\\agentcall".to_string(),
+            runtime: "pty".to_string(),
+        }
+    }
+
+    fn owner_lease_for(session_id: &str) -> OwnerLease {
+        let now = chrono::Utc::now();
+        OwnerLease {
+            lease_id: format!("lease-{session_id}-1"),
+            owner_id: "codex".to_string(),
+            session_id: session_id.to_string(),
+            lease_generation: 1,
+            acquired_at: now.to_rfc3339(),
+            last_heartbeat_at: now.to_rfc3339(),
+            renewed_at: now.to_rfc3339(),
+            expires_at: (now + chrono::Duration::minutes(30)).to_rfc3339(),
+            status: LeaseStatus::Active,
+            recoverable: true,
+        }
+    }
+
+    fn workspace_lease_for(session_id: &str) -> WorkspaceLease {
+        WorkspaceLease {
+            lease_id: format!("workspace-lease-{session_id}-1"),
+            workspace: "E:\\Project\\AgentCall".to_string(),
+            workspace_key: "e:\\project\\agentcall".to_string(),
+            mode: WorkspaceLeaseMode::Exclusive,
+            owner_id: "codex".to_string(),
+            session_id: session_id.to_string(),
+            expires_at: (chrono::Utc::now() + chrono::Duration::minutes(30)).to_rfc3339(),
         }
     }
 
