@@ -153,6 +153,7 @@ pub(crate) fn start_session(
         "pty.session_started",
         "PTY session started.",
         serde_json::json!({
+            "session_id": session.name,
             "name": session.name,
             "command": session.command,
             "cwd": session.cwd,
@@ -256,7 +257,7 @@ pub(crate) fn spawn_waiter(state: Arc<AppState>, session: Arc<Session>) {
             &state,
             "pty.session_ended",
             "PTY session ended.",
-            serde_json::json!({"name": session.name, "status": session.status.lock().unwrap().clone(), "cwd": session.cwd, "child_pid": session.child_pid}),
+            serde_json::json!({"session_id": session.name, "name": session.name, "status": session.status.lock().unwrap().clone(), "cwd": session.cwd, "child_pid": session.child_pid}),
         );
         state.actors.lock().unwrap().remove(&session.name);
         if let Err(err) = release_owner_lease(&state, &session.name, "session_exited") {
@@ -394,6 +395,7 @@ pub(crate) fn stop_session(state: &AppState, name: &str) -> Result<(), String> {
         "pty.stop_requested",
         "PTY stop requested.",
         serde_json::json!({
+            "session_id": name,
             "name": name,
             "child_pid": session.child_pid,
             "process_controller": process_kill.controller,

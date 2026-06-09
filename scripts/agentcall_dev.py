@@ -70,6 +70,16 @@ def main() -> int:
     release.add_argument("--skip-plugin", action="store_true", help="Skip Codex plugin validation.")
     release.set_defaults(func=cmd_release_check)
 
+    smoke = sub.add_parser("smoke", help="Run bounded integration smoke checks.")
+    smoke_sub = smoke.add_subparsers(dest="smoke_command", required=True)
+    real_worker = smoke_sub.add_parser(
+        "real-worker",
+        help="Start a temporary daemon and deterministic PTY worker to validate route/session/projection control.",
+    )
+    real_worker.add_argument("--daemon-bin", default=None, help="Path to agentcall-daemon executable.")
+    real_worker.add_argument("--keep-workspace", action="store_true", help="Keep temporary smoke workspace.")
+    real_worker.set_defaults(func=cmd_smoke_real_worker)
+
     paths = sub.add_parser("paths", help="Print resolved important local paths.")
     paths.set_defaults(func=cmd_paths)
 
@@ -188,6 +198,16 @@ def cmd_release_check(root: Path, args: argparse.Namespace) -> int:
 
     run_checked(["git", "-C", str(root), "diff", "--check"], root, "git diff whitespace check", env=env, timeout=60)
     print("[OK] release-check completed")
+    return 0
+
+
+def cmd_smoke_real_worker(root: Path, args: argparse.Namespace) -> int:
+    cmd = [sys.executable, str(root / "scripts" / "agentcall_real_worker_smoke.py"), "--root", str(root)]
+    if args.daemon_bin:
+        cmd.extend(["--daemon-bin", args.daemon_bin])
+    if args.keep_workspace:
+        cmd.append("--keep-workspace")
+    run_checked(cmd, root, "real worker PTY smoke", timeout=90)
     return 0
 
 

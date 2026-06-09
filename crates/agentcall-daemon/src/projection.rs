@@ -170,14 +170,38 @@ pub(crate) fn apply_event_to_projection(
 
     let mut reason = "event_reduced".to_string();
     match event.event_type.as_str() {
-        "session.started" | "process.started" | "mcp.tool_called" => {
+        "session.started" | "process.started" | "mcp.tool_called" | "pty.session_started" => {
+            projection.liveness_status = "working".to_string();
+            projection.attention_status = "none".to_string();
+            projection.needs_attention = false;
+            projection.last_progress_brief = Some(event.message.clone());
+            if let Some(workspace) = event.payload.get("cwd").and_then(Value::as_str) {
+                projection.workspace = workspace.to_string();
+                projection.claude_cwd = workspace.to_string();
+            }
+        }
+        "command.accepted" | "command.completed" | "pty.input_sent" => {
             projection.liveness_status = "working".to_string();
             projection.attention_status = "none".to_string();
             projection.needs_attention = false;
             projection.last_progress_brief = Some(event.message.clone());
         }
-        "session.cleanup" | "process.exited" => {
+        "command.awaiting_observation" => {
+            projection.liveness_status = "working".to_string();
+            projection.turn_status = "awaiting_observation".to_string();
+            projection.attention_status = "none".to_string();
+            projection.needs_attention = false;
+            projection.last_progress_brief = Some(event.message.clone());
+        }
+        "session.cleanup" | "process.exited" | "pty.session_ended" => {
             projection.liveness_status = "completed".to_string();
+            projection.attention_status = "none".to_string();
+            projection.needs_attention = false;
+            projection.last_progress_brief = Some(event.message.clone());
+        }
+        "pty.stop_requested" => {
+            projection.liveness_status = "stopping".to_string();
+            projection.turn_status = "awaiting_observation".to_string();
             projection.attention_status = "none".to_string();
             projection.needs_attention = false;
             projection.last_progress_brief = Some(event.message.clone());
@@ -337,6 +361,60 @@ mod tests {
     }
 
     #[test]
+    fn reducer_tracks_real_pty_lifecycle_events() {
+        let started = apply_event_to_projection(
+            None,
+            &test_projection_event(1, "worker-a", "pty.session_started", "PTY session started."),
+        );
+        assert_eq!(started.projection.liveness_status, "working");
+        assert_eq!(started.projection.attention_status, "none");
+        assert!(!started.projection.projection_stale);
+
+        let stopped = apply_event_to_projection(
+            Some(started.projection),
+            &test_projection_event(2, "worker-a", "pty.stop_requested", "PTY stop requested."),
+        );
+        assert_eq!(stopped.projection.liveness_status, "stopping");
+        assert_eq!(stopped.projection.turn_status, "awaiting_observation");
+        assert_eq!(stopped.projection.attention_status, "none");
+
+        let ended = apply_event_to_projection(
+            Some(stopped.projection),
+            &test_projection_event(3, "worker-a", "pty.session_ended", "PTY session ended."),
+        );
+        assert_eq!(ended.projection.liveness_status, "completed");
+        assert_eq!(ended.projection.attention_status, "none");
+    }
+
+    #[test]
+    fn reducer_tracks_actor_command_events() {
+        let accepted = apply_event_to_projection(
+            None,
+            &test_projection_event(
+                1,
+                "worker-a",
+                "command.accepted",
+                "Session actor accepted command.",
+            ),
+        );
+        assert_eq!(accepted.projection.liveness_status, "working");
+        assert_eq!(accepted.projection.attention_status, "none");
+
+        let awaiting = apply_event_to_projection(
+            Some(accepted.projection),
+            &test_projection_event(
+                2,
+                "worker-a",
+                "command.awaiting_observation",
+                "Session actor dispatched command and is waiting for observed worker state.",
+            ),
+        );
+        assert_eq!(awaiting.projection.liveness_status, "working");
+        assert_eq!(awaiting.projection.turn_status, "awaiting_observation");
+        assert_eq!(awaiting.projection.attention_status, "none");
+    }
+
+    #[test]
     fn missing_projection_summary_is_stale_without_cold_scan() {
         let root = std::env::temp_dir().join(format!(
             "agentcall-projection-missing-{}",
@@ -349,5 +427,31 @@ mod tests {
         assert_eq!(summary["session"], "worker-missing");
         assert_eq!(summary["attention_status"], "low_confidence");
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    fn test_projection_event(
+        global_seq: u64,
+        session_id: &str,
+        event_type: &str,
+        message: &str,
+    ) -> EventEnvelopeV1 {
+        EventEnvelopeV1 {
+            schema_version: 1,
+            event_id: format!("evt-{global_seq:06}"),
+            global_seq,
+            session_seq: Some(global_seq),
+            session_id: Some(session_id.to_string()),
+            run_id: None,
+            owner_id: Some("codex".to_string()),
+            ts: chrono::Utc::now().to_rfc3339(),
+            source: "daemon".to_string(),
+            event_type: event_type.to_string(),
+            severity: "info".to_string(),
+            command_id: None,
+            idempotency_key: None,
+            trace_id: None,
+            message: message.to_string(),
+            payload: serde_json::json!({"session_id": session_id, "cwd": "E:\\Project\\AgentCall"}),
+        }
     }
 }

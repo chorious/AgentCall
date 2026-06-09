@@ -5,6 +5,7 @@ use crate::runtime::{AgentRuntime, StartSpec};
 use crate::runtime_pty::ClaudeCodePtyRuntime;
 use crate::runtime_sdk::{ClaudeCodeSdkRuntime, sdk_runtime_enabled};
 use crate::scheduler::enforce_start_capacity;
+use crate::session::is_claude_command;
 use crate::state::{AppState, append_agent_event_locked, read_json_file, write_json_file};
 use crate::util::{now_ms, safe_name};
 use serde::{Deserialize, Serialize};
@@ -476,8 +477,11 @@ fn start_pty_route(
         .inspect_err(|_| {
             let _ = release_workspace_lease(state, &session_name, "route_start_failed");
         })?;
-    let prompt_gate =
-        submit_pty_prompt_with_ack(state, &session_name, pty_prompt(req, &containment));
+    let prompt_gate = if is_claude_command(&runtime_session.info.command) {
+        submit_pty_prompt_with_ack(state, &session_name, pty_prompt(req, &containment))
+    } else {
+        submit_pty_prompt_without_hook_ack(state, &session_name, pty_prompt(req, &containment))
+    };
     let prompt_status = prompt_gate
         .get("status")
         .and_then(Value::as_str)
@@ -777,6 +781,42 @@ fn submit_pty_prompt_with_ack(
         "acknowledged": false,
         "last_error": last_error
     })
+}
+
+fn submit_pty_prompt_without_hook_ack(
+    state: &Arc<AppState>,
+    wrapper_session: &str,
+    prompt: String,
+) -> Value {
+    let args = json!({
+        "text": prompt,
+        "enter": true,
+        "idempotency_key": format!("route-prompt-{wrapper_session}-custom-worker"),
+        "owner_id": "codex"
+    });
+    let command = build_session_send_command(
+        wrapper_session,
+        "send",
+        args.get("idempotency_key")
+            .and_then(Value::as_str)
+            .unwrap_or("route-prompt"),
+        &args,
+    );
+    match submit_session_command(state, wrapper_session, command) {
+        Ok(result) => json!({
+            "status": "started_prompt_dispatched_without_hook_ack",
+            "expected_hook": Value::Null,
+            "acknowledged": false,
+            "actor_result": result,
+            "reason": "custom PTY command is not expected to emit Claude Code UserPromptSubmit hooks"
+        }),
+        Err(err) => json!({
+            "status": "started_pending_prompt_dispatch",
+            "expected_hook": Value::Null,
+            "acknowledged": false,
+            "last_error": err
+        }),
+    }
 }
 
 fn pty_initial_permission_mode(req: &RouteRequest, workflow: &PtyWorkflow) -> String {

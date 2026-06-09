@@ -172,6 +172,7 @@ fn execute_command(
                 "pty.interrupt_sent",
                 "Interrupt sent to PTY session.",
                 json!({
+                    "session_id": session_id,
                     "name": session_id,
                     "control": "esc",
                     "warning": "Use interrupt only when the worker is drifting, doing the wrong thing, or must be reclaimed immediately."
@@ -268,7 +269,7 @@ fn actor_write_input(
         state,
         "pty.input_sent",
         "Input sent to PTY session.",
-        json!({"name": session_id, "chars": text.len() + if enter { 1 } else { 0 }, "enter": enter, "submit_split": enter}),
+        json!({"session_id": session_id, "name": session_id, "chars": text.len() + if enter { 1 } else { 0 }, "enter": enter, "submit_split": enter}),
     );
     Ok(())
 }
