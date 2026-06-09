@@ -8,7 +8,9 @@ use crate::routes::{
 use crate::session::get_session;
 use crate::state::{AppState, append_agent_event, read_events};
 use crate::store::EventQuery;
-use crate::summary::{board_state, clean_session_output, session_plan_artifact, session_summary};
+use crate::summary::{
+    board_owner_filter, board_state, clean_session_output, session_plan_artifact, session_summary,
+};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use std::sync::Arc;
@@ -30,7 +32,9 @@ pub(crate) fn mcp_tools() -> Vec<Value> {
                     "root": {"type": "string"},
                     "view": {"type": "string", "enum": ["full", "compact"], "default": "compact"},
                     "filter": {"type": "string", "enum": ["all", "attention"], "default": "attention"},
-                    "section": {"type": "string", "enum": ["all", "sessions", "events", "reports", "claims", "transcripts", "routes"], "default": "all"}
+                    "section": {"type": "string", "enum": ["all", "sessions", "events", "reports", "claims", "transcripts", "routes"], "default": "all"},
+                    "scope": {"type": "string", "enum": ["all", "mine"], "default": "all"},
+                    "owner_id": {"type": "string"}
                 },
                 "additionalProperties": false
             }
@@ -156,11 +160,16 @@ pub(crate) fn mcp_call(state: &Arc<AppState>, req: McpCallRequest) -> Result<Val
 }
 
 fn mcp_board(state: &AppState, args: &Value) -> Result<Value, String> {
+    let owner_id = board_owner_filter(
+        args.get("scope").and_then(Value::as_str),
+        args.get("owner_id").and_then(Value::as_str),
+    );
     Ok(board_state(
         state,
         args.get("view").and_then(Value::as_str),
         args.get("filter").and_then(Value::as_str),
         args.get("section").and_then(Value::as_str),
+        owner_id.as_deref(),
     ))
 }
 
@@ -518,7 +527,7 @@ fn mcp_report(state: &Arc<AppState>, args: &Value) -> Result<Value, String> {
             checkpoint_session(state, session_id)
         }
         "accept" => {
-            let reports = board_state(state, None, None, Some("reports"))
+            let reports = board_state(state, None, None, Some("reports"), None)
                 .get("reports")
                 .cloned()
                 .unwrap_or_else(|| json!([]));

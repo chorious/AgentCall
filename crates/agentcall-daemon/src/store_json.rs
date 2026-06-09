@@ -104,6 +104,9 @@ impl RuntimeStore for JsonRuntimeStore {
                 {
                     continue;
                 }
+                if !projection_matches_owner(&value, query.owner_id.as_deref()) {
+                    continue;
+                }
                 sessions.push(value);
             }
         }
@@ -515,6 +518,13 @@ fn command_record_to_value(scope: &str, record: &CommandRecord) -> Value {
         "fingerprint": record.fingerprint,
         "status": record.status,
     })
+}
+
+fn projection_matches_owner(value: &Value, owner_id: Option<&str>) -> bool {
+    let Some(owner_id) = owner_id else {
+        return true;
+    };
+    value.get("owner").and_then(Value::as_str) == Some(owner_id)
 }
 
 fn patch_command_status(path: &Path, command_id: &str, status: &str) -> Result<(), String> {

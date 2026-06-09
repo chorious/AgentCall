@@ -1,0 +1,63 @@
+[
+  {
+    "name": "natural_language_success_without_artifact_or_daemon_evidence",
+    "report": {
+      "status": "completed",
+      "summary": "The worker says everything is done."
+    },
+    "events": [],
+    "expected_band": "low",
+    "expected_required_action": "request_daemon_observed_evidence"
+  },
+  {
+    "name": "report_artifact_success_without_deterministic_evidence",
+    "report": {
+      "status": "success",
+      "report_path": "docs/reports/Report_worker.md",
+      "session_id": "worker-a"
+    },
+    "events": [],
+    "expected_band": "medium"
+  },
+  {
+    "name": "success_report_contradicted_by_failed_validation",
+    "report": {
+      "status": "success",
+      "report_path": "docs/reports/Report_worker.md",
+      "session_id": "worker-a"
+    },
+    "events": [
+      {
+        "event_id": "evt-validation-failed",
+        "event_type": "validation.completed",
+        "payload": {
+          "status": "failed"
+        }
+      }
+    ],
+    "expected_band": "low",
+    "expected_contradiction": "failed test"
+  },
+  {
+    "name": "success_report_backed_by_daemon_file_write",
+    "report": {
+      "status": "completed",
+      "report_path": "docs/reports/Report_worker.md",
+      "session_id": "worker-a"
+    },
+    "events": [
+      {
+        "event_id": "evt-file-write",
+        "event_type": "hook.PostToolUse",
+        "payload": {
+          "tool_name": "Write",
+          "decision": {
+            "reason": "write observed",
+            "files": ["src/app.rs"]
+          }
+        }
+      }
+    ],
+    "expected_band": "high"
+  }
+]

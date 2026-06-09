@@ -366,6 +366,56 @@ mod tests {
         );
     }
 
+    #[test]
+    fn report_confidence_fixture_cases_are_deterministic() {
+        let cases: Value = serde_json::from_str(include_str!(
+            "../testdata/confidence/report_confidence_cases.json"
+        ))
+        .unwrap();
+        for case in cases.as_array().unwrap() {
+            let name = case["name"].as_str().unwrap();
+            let events: Vec<EventEnvelopeV1> = case["events"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .enumerate()
+                .map(|(index, item)| {
+                    let event_id = item["event_id"].as_str().unwrap();
+                    let event_type = item["event_type"].as_str().unwrap();
+                    let payload = item["payload"].clone();
+                    let mut event = event(event_id, event_type, payload);
+                    event.global_seq = index as u64 + 1;
+                    event
+                })
+                .collect();
+            let ledger = confidence_for_report(&case["report"], &events);
+            assert_eq!(
+                ledger.band, case["expected_band"],
+                "unexpected confidence band for {name}"
+            );
+            if let Some(expected) = case.get("expected_required_action").and_then(Value::as_str) {
+                assert!(
+                    ledger
+                        .required_review_actions
+                        .iter()
+                        .any(|item| item == expected),
+                    "missing required action {expected} for {name}: {:?}",
+                    ledger.required_review_actions
+                );
+            }
+            if let Some(expected) = case.get("expected_contradiction").and_then(Value::as_str) {
+                assert!(
+                    ledger
+                        .contradictions
+                        .iter()
+                        .any(|item| item.contains(expected)),
+                    "missing contradiction containing {expected} for {name}: {:?}",
+                    ledger.contradictions
+                );
+            }
+        }
+    }
+
     fn event(id: &str, event_type: &str, payload: Value) -> EventEnvelopeV1 {
         EventEnvelopeV1 {
             schema_version: 1,

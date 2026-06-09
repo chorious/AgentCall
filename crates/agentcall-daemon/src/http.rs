@@ -16,7 +16,8 @@ use crate::session::{
 };
 use crate::state::{AppState, append_agent_event};
 use crate::summary::{
-    board_state, clean_session_output, projects_state, runtime_health, session_summary,
+    board_owner_filter, board_state, clean_session_output, projects_state, runtime_health,
+    session_summary,
 };
 use portable_pty::PtySize;
 use serde::{Deserialize, Serialize};
@@ -155,11 +156,16 @@ pub(crate) fn route(request: Request, state: Arc<AppState>) -> Response {
         ("GET", "/api/sessions") => json_response(&list_sessions(&state)),
         ("GET", "/api/board") => {
             let query = query_params(&request.path);
+            let owner_id = board_owner_filter(
+                query.get("scope").map(String::as_str),
+                query.get("owner_id").map(String::as_str),
+            );
             json_response(&board_state(
                 &state,
                 query.get("view").map(String::as_str),
                 query.get("filter").map(String::as_str),
                 query.get("section").map(String::as_str),
+                owner_id.as_deref(),
             ))
         }
         ("GET", "/api/runtime/health") => json_response(&runtime_health(&state)),

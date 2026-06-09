@@ -228,17 +228,19 @@ pub(crate) fn apply_event_to_projection(
     }
 }
 
-pub(crate) fn board_attention_projection(state: &AppState) -> Value {
+pub(crate) fn board_attention_projection(state: &AppState, owner_id: Option<&str>) -> Value {
     let all = state
         .store
         .list_board_projection(BoardQuery {
             attention_only: false,
+            owner_id: owner_id.map(str::to_string),
         })
         .unwrap_or_else(|_| serde_json::json!({"sessions": []}));
     let attention_projection = state
         .store
         .list_board_projection(BoardQuery {
             attention_only: true,
+            owner_id: owner_id.map(str::to_string),
         })
         .unwrap_or_else(|_| serde_json::json!({"sessions": []}));
     let live_daemon_sessions = projection_items(all.get("sessions").and_then(Value::as_array));
@@ -251,6 +253,7 @@ pub(crate) fn board_attention_projection(state: &AppState) -> Value {
         "workspace": state.workspace,
         "view": "compact",
         "filter": "attention",
+        "owner_id": owner_id,
         "projection_only": true,
         "store_backend": state.store.backend_name(),
         "live_daemon_sessions": live_daemon_sessions,
@@ -265,6 +268,7 @@ fn projection_items(items: Option<&Vec<Value>>) -> Vec<Value> {
         .map(|projection| {
             serde_json::json!({
                 "session": projection.get("session_id").cloned().unwrap_or(Value::Null),
+                "owner": projection.get("owner").cloned().unwrap_or(Value::Null),
                 "liveness_status": projection.get("liveness_status").cloned().unwrap_or(Value::Null),
                 "attention_status": projection.get("attention_status").cloned().unwrap_or(Value::Null),
                 "needs_attention": projection.get("needs_attention").cloned().unwrap_or(Value::Null),

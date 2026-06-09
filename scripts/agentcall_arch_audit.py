@@ -13,6 +13,7 @@ def main() -> int:
     failures.extend(check_actor_writer_boundary(root))
     failures.extend(check_mcp_default_session_fast_path(root))
     failures.extend(check_board_attention_fast_path(root))
+    failures.extend(check_runtime_store_transaction_boundary(root))
 
     if failures:
         print("[FAIL] AgentCall architecture audit failed:")
@@ -94,8 +95,33 @@ def check_board_attention_fast_path(root: Path) -> list[str]:
         failures.append("board_state must special-case compact+attention")
     elif cold_index >= 0 and marker_index > cold_index:
         failures.append("board_state compact+attention fast path must run before cold state reads")
-    if "return board_attention_projection(state);" not in body:
+    if "return board_attention_projection(state," not in body:
         failures.append("board_state compact+attention must return board_attention_projection")
+    return failures
+
+
+def check_runtime_store_transaction_boundary(root: Path) -> list[str]:
+    failures: list[str] = []
+    src = root / "crates" / "agentcall-daemon" / "src"
+    allowed_transaction_callers = {
+        src / "state.rs",
+        src / "store.rs",
+        src / "store_json.rs",
+        src / "store_sqlite.rs",
+    }
+    transaction_calls = (
+        ".append_event_and_update_projection(",
+        ".complete_command_with_event(",
+    )
+    for path in src.glob("*.rs"):
+        text = path.read_text(encoding="utf-8")
+        if path in allowed_transaction_callers:
+            continue
+        for call in transaction_calls:
+            if call in text:
+                failures.append(
+                    f"{rel(root, path)} calls RuntimeStore {call}; live event/projection writes must go through state.rs transaction helpers"
+                )
     return failures
 
 

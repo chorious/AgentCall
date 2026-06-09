@@ -43,7 +43,9 @@ fn board_tool() -> Value {
                 "root": {"type": "string"},
                 "view": {"type": "string", "enum": ["full", "compact"], "default": "compact"},
                 "filter": {"type": "string", "enum": ["all", "attention"], "default": "attention"},
-                "section": {"type": "string", "enum": ["all", "sessions", "events", "reports", "claims", "transcripts", "routes"], "default": "all"}
+                "section": {"type": "string", "enum": ["all", "sessions", "events", "reports", "claims", "transcripts", "routes"], "default": "all"},
+                "scope": {"type": "string", "enum": ["all", "mine"], "default": "all"},
+                "owner_id": {"type": "string"}
             },
             "additionalProperties": false
         }

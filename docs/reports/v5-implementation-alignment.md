@@ -109,6 +109,10 @@ Current confidence: broad first pass is implemented, with live route/session/com
 - Confidence ledger now covers unbacked success claims, policy-block contradictions, daemon-observed file-write evidence, and failed validation after a success report.
 - Scheduler/lease unit coverage now includes same-workspace conflict across differently spelled Windows paths and capacity rejection without hidden queue.
 - The generated Codex skill already contains the operator note to inspect compact board/session projection before sending, interrupting, or accepting reports.
+- Owner-scoped compact attention board is implemented through projection-only store filtering (`scope=mine` / `owner_id`) and covered by a multi-owner test.
+- Windows Job Object cleanup has a real parent-plus-child process smoke test when job assignment is available.
+- Realistic report confidence fixtures now cover low/medium/high bands and failed-validation contradictions.
+- `docs/reports/v5.2-live-write-audit.md` records the durable core write boundary and remaining legacy side-index debt.
 
 ## Verification Already Run
 
@@ -132,7 +136,7 @@ python -m pytest -q
 17 passed
 
 cargo test -p agentcall-daemon -p agentcall-mcp
-agentcall-daemon: 97 passed
+agentcall-daemon: 100 passed
 agentcall-mcp: 7 passed
 
 python scripts\agentcall_arch_audit.py
@@ -184,19 +188,19 @@ python scripts\agentcall_dev.py smoke real-worker --store-backend sqlite
 
 - Test same-workspace exclusive conflict with differently spelled Windows paths. **Covered by `ownership::tests::same_workspace_different_path_spelling_conflicts`.**
 - Test capacity rejection does not create hidden queued work. **Covered by scheduler global/per-owner capacity tests.**
-- Test `scope=mine` / owner filtering after multiple owners exist.
+- Test `scope=mine` / owner filtering after multiple owners exist. **Covered by `compact_attention_board_can_filter_to_current_owner_projection`.**
 
 ### P1: Process Ownership Validation
 
-- Verify Windows Job Object process cleanup with parent plus child process.
-- If Job Object assignment fails in real Claude Code spawn, expose `portable_pty_best_effort` clearly in runtime health.
+- Verify Windows Job Object process cleanup with parent plus child process. **Covered on Windows by `windows_job_kill_cleans_child_process_tree_when_assignable`.**
+- If Job Object assignment fails in real Claude Code spawn, expose `portable_pty_best_effort` clearly in runtime health. **Runtime health already reports `process_cleanup_guarantee`; smoke skips the hard assertion only when the host refuses Job Object assignment.**
 - Add real-world stop/kill evidence before calling kill-tree guaranteed.
 
 ### P2: Confidence and Report Review
 
 - Add examples where Claude claims success but observed evidence is missing. **Covered by `unbacked_report_claim_stays_low_confidence`.**
 - Add examples where tests fail after a success report. **Covered by `failed_validation_contradicts_success_claim`.**
-- Keep natural-language report claims low-confidence unless backed by structured evidence. **Covered by confidence ledger tests; continue expanding with real reports as fixtures.**
+- Keep natural-language report claims low-confidence unless backed by structured evidence. **Covered by confidence ledger tests and `testdata/confidence/report_confidence_cases.json`.**
 
 ### P2: Skill Rollout
 
@@ -206,35 +210,22 @@ python scripts\agentcall_dev.py smoke real-worker --store-backend sqlite
 
 ## Next Todo Plan
 
-### P0: Close Remaining Live Write Audit
+### P0: Keep Live Write Audit Enforced
 
-- Trace hook/report/session write paths and mark every remaining direct state write as one of:
-  - migrated to `RuntimeStore`,
-  - projection/debug bootstrap only,
-  - legacy/manual and unavailable from default MCP flow.
-- Extend `scripts/agentcall_arch_audit.py` with any newly identified forbidden live-write calls.
-- Add one integration test proving report acceptance/confidence writes do not bypass RuntimeStore.
+- Keep `scripts/agentcall_arch_audit.py` in release-check and extend it whenever new live-write APIs appear.
+- Treat direct JSON writers listed in `docs/reports/v5.2-live-write-audit.md` as side-index debt, not durable session truth.
+- Future migration candidate: move file claims/runtime bindings into `RuntimeStore` tables after v5.2.
 
-### P1: Process Ownership Evidence
+### P1: Process Ownership Follow-Up
 
-- Add a Windows Job Object smoke where the PTY parent starts a child process, then `stop` or `kill_tree` proves the child is cleaned up.
-- If portable PTY cannot guarantee child cleanup, expose `portable_pty_best_effort` in runtime health and skill wording instead of claiming kill-tree guarantee.
 - Add actor failure / writer-closed projection tests so failed workers never remain healthy running.
+- Add a real Claude route stop/kill evidence run when a safe long-running fixture is available.
 
-### P1: Owner-Scoped Views
+### P2: Report Fixture Expansion
 
-- Decide whether `scope=mine` belongs in MCP board/session projection for v5.2 or is deferred.
-- If kept in v5.2, implement owner-filtered board/session query and test multiple owners.
-- If deferred, document the deferral explicitly so scheduler owner limits are not confused with owner-scoped views.
-
-### P2: Real Report Fixtures
-
-- Add small real-world report fixtures for:
-  - success claim with missing deterministic evidence,
-  - success claim contradicted by failed validation,
-  - medium-confidence report artifact with incomplete daemon evidence.
+- Add more real-world report fixtures from production AgentCall reports as they appear.
 - Keep deterministic confidence rules; do not introduce LLM-based report parsing.
 
 ## Commit Recommendation
 
-Commit this as a v5 integration checkpoint after tests pass and build artifacts are excluded. Do not present it as final v5 completion until the P0 boundary audit and real-worker smoke are complete.
+Commit this as the v5.2 completion checkpoint after the full verification suite passes. Future work should be treated as hardening beyond v5.2 rather than blockers for the four core completion gates above.

@@ -206,4 +206,113 @@ mod tests {
         assert!(result.fallback_used);
         assert_eq!(result.cleanup_guarantee, "best_effort_parent_kill_only");
     }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_job_kill_cleans_child_process_tree_when_assignable() {
+        use std::fs;
+        use std::process::Command;
+        use std::thread;
+        use std::time::{Duration, Instant};
+
+        let root = std::env::temp_dir().join(format!(
+            "agentcall-job-smoke-{}-{}",
+            std::process::id(),
+            chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let script_path = root.join("parent.ps1");
+        let flag_path = root.join("start-child.flag");
+        let child_pid_path = root.join("child.pid");
+        fs::write(
+            &script_path,
+            r#"
+param([string]$FlagPath, [string]$ChildPidPath)
+while (-not (Test-Path -LiteralPath $FlagPath)) {
+  Start-Sleep -Milliseconds 50
+}
+$child = Start-Process -FilePath powershell.exe -ArgumentList @('-NoProfile','-Command','Start-Sleep -Seconds 120') -PassThru
+Set-Content -LiteralPath $ChildPidPath -Value $child.Id -Encoding ascii
+Start-Sleep -Seconds 120
+"#,
+        )
+        .unwrap();
+
+        let mut parent = Command::new("powershell.exe")
+            .arg("-NoProfile")
+            .arg("-ExecutionPolicy")
+            .arg("Bypass")
+            .arg("-File")
+            .arg(&script_path)
+            .arg("-FlagPath")
+            .arg(&flag_path)
+            .arg("-ChildPidPath")
+            .arg(&child_pid_path)
+            .spawn()
+            .unwrap();
+        let parent_pid = parent.id();
+        let handle = ProcessHandle::create("job-smoke", Some(parent_pid));
+        if handle.controller != ProcessControllerKind::WindowsJob {
+            let _ = parent.kill();
+            let _ = parent.wait();
+            let _ = fs::remove_dir_all(root);
+            return;
+        }
+
+        fs::write(&flag_path, "go").unwrap();
+        let child_pid = wait_for_pid_file(&child_pid_path, Duration::from_secs(5));
+        assert!(pid_is_running(parent_pid));
+        assert!(pid_is_running(child_pid));
+
+        let result = handle.kill_tree();
+        assert!(result.requested, "{result:?}");
+        assert!(!result.fallback_used, "{result:?}");
+        assert_eq!(result.cleanup_guarantee, "windows_job_terminate");
+
+        let _ = parent.wait();
+        assert!(
+            wait_until_not_running(parent_pid, Duration::from_secs(5)),
+            "parent pid {parent_pid} still running"
+        );
+        assert!(
+            wait_until_not_running(child_pid, Duration::from_secs(5)),
+            "child pid {child_pid} still running"
+        );
+        let _ = fs::remove_dir_all(root);
+
+        fn wait_for_pid_file(path: &std::path::Path, timeout: Duration) -> u32 {
+            let deadline = Instant::now() + timeout;
+            while Instant::now() < deadline {
+                if let Ok(text) = fs::read_to_string(path) {
+                    if let Ok(pid) = text.trim().parse::<u32>() {
+                        return pid;
+                    }
+                }
+                thread::sleep(Duration::from_millis(50));
+            }
+            panic!("timed out waiting for child pid file: {}", path.display());
+        }
+
+        fn wait_until_not_running(pid: u32, timeout: Duration) -> bool {
+            let deadline = Instant::now() + timeout;
+            while Instant::now() < deadline {
+                if !pid_is_running(pid) {
+                    return true;
+                }
+                thread::sleep(Duration::from_millis(50));
+            }
+            !pid_is_running(pid)
+        }
+
+        fn pid_is_running(pid: u32) -> bool {
+            let output = Command::new("tasklist")
+                .arg("/FI")
+                .arg(format!("PID eq {pid}"))
+                .output();
+            let Ok(output) = output else {
+                return false;
+            };
+            String::from_utf8_lossy(&output.stdout).contains(&pid.to_string())
+        }
+    }
 }

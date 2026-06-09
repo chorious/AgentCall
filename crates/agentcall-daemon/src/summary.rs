@@ -22,14 +22,25 @@ const STALE_SESSION_MS: u64 = 5 * 60 * 1000;
 const PATIENCE_SECONDS: u64 = 60;
 const STALL_THRESHOLD_SECONDS: u64 = 300;
 
+pub(crate) fn board_owner_filter(scope: Option<&str>, owner_id: Option<&str>) -> Option<String> {
+    owner_id
+        .filter(|value| !value.trim().is_empty())
+        .map(str::to_string)
+        .or_else(|| match scope {
+            Some("mine") => Some("codex".to_string()),
+            _ => None,
+        })
+}
+
 pub(crate) fn board_state(
     state: &AppState,
     view: Option<&str>,
     filter: Option<&str>,
     section: Option<&str>,
+    owner_id: Option<&str>,
 ) -> serde_json::Value {
     if view == Some("compact") && filter == Some("attention") {
-        return board_attention_projection(state);
+        return board_attention_projection(state, owner_id);
     }
     let agent_dir = state.workspace.join(".agentcall");
     let live_daemon_sessions = list_sessions(state);
@@ -1646,7 +1657,7 @@ mod tests {
         )
         .unwrap();
         let state = AppState::test(root.clone());
-        let board = board_state(&state, Some("compact"), None, None);
+        let board = board_state(&state, Some("compact"), None, None, None);
         let legacy = board["legacy_detached_sessions"].as_array().unwrap();
         assert_eq!(legacy[0]["name"], "legacy-one");
         assert_eq!(legacy[0]["status_class"], "legacy_detached");
@@ -1669,7 +1680,7 @@ mod tests {
         )
         .unwrap();
         let state = AppState::test(root.clone());
-        let board = board_state(&state, Some("compact"), Some("attention"), None);
+        let board = board_state(&state, Some("compact"), Some("attention"), None, None);
         assert_eq!(board["projection_only"], true);
         assert!(board.get("recent_events").is_none());
         assert!(board.get("reports").is_none());
@@ -1691,13 +1702,58 @@ mod tests {
             serde_json::json!({"wrapper_session": "worker-a", "status": "needs_permission"}),
         );
 
-        let board = board_state(&state, Some("compact"), Some("attention"), None);
+        let board = board_state(&state, Some("compact"), Some("attention"), None, None);
         assert_eq!(board["projection_only"], true);
         assert_eq!(board["live_daemon_sessions"][0]["session"], "worker-a");
         assert_eq!(
             board["attention"][0]["attention_status"],
             "needs_permission"
         );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn compact_attention_board_can_filter_to_current_owner_projection() {
+        let root = std::env::temp_dir().join(format!(
+            "agentcall-board-owner-filter-test-{}",
+            std::process::id()
+        ));
+        let state = AppState::test(root.clone());
+        crate::state::append_agent_event(
+            &state,
+            "hook.Notification",
+            "codex permission",
+            serde_json::json!({
+                "wrapper_session": "codex-worker",
+                "status": "needs_permission",
+                "owner_id": "codex"
+            }),
+        );
+        crate::state::append_agent_event(
+            &state,
+            "hook.Notification",
+            "other permission",
+            serde_json::json!({
+                "wrapper_session": "other-worker",
+                "status": "needs_permission",
+                "owner_id": "other"
+            }),
+        );
+
+        let board = board_state(
+            &state,
+            Some("compact"),
+            Some("attention"),
+            None,
+            Some("codex"),
+        );
+        assert_eq!(board["projection_only"], true);
+        assert_eq!(board["owner_id"], "codex");
+        assert_eq!(board["live_daemon_sessions"].as_array().unwrap().len(), 1);
+        assert_eq!(board["live_daemon_sessions"][0]["session"], "codex-worker");
+        assert_eq!(board["live_daemon_sessions"][0]["owner"], "codex");
+        assert_eq!(board["attention"].as_array().unwrap().len(), 1);
+        assert_eq!(board["attention"][0]["session"], "codex-worker");
         let _ = fs::remove_dir_all(root);
     }
 

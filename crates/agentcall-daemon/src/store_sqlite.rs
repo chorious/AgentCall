@@ -148,6 +148,9 @@ impl RuntimeStore for SqliteRuntimeStore {
         let mut sessions = Vec::new();
         for row in rows {
             if let Ok(value) = serde_json::from_str::<Value>(&row.map_err(|err| err.to_string())?) {
+                if !projection_matches_owner(&value, query.owner_id.as_deref()) {
+                    continue;
+                }
                 sessions.push(value);
             }
         }
@@ -645,6 +648,13 @@ fn push_event_json(events: &mut Vec<EventEnvelopeV1>, text: &str) {
 
 fn idempotency_scope(owner: &str, key: &str) -> String {
     format!("{owner}:{key}")
+}
+
+fn projection_matches_owner(value: &Value, owner_id: Option<&str>) -> bool {
+    let Some(owner_id) = owner_id else {
+        return true;
+    };
+    value.get("owner").and_then(Value::as_str) == Some(owner_id)
 }
 
 fn command_fingerprint(command: &CommandEnvelopeV1) -> String {

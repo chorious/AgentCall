@@ -20,6 +20,7 @@ pub(crate) struct EventQuery {
 #[derive(Clone, Debug)]
 pub(crate) struct BoardQuery {
     pub(crate) attention_only: bool,
+    pub(crate) owner_id: Option<String>,
 }
 
 #[derive(Clone, Debug)]
