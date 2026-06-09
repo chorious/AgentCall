@@ -24,3 +24,5 @@ tools/agentapi.exe
 node_modules/
 target/
 target-v061-hook/
+target-*/
+.local_archive/

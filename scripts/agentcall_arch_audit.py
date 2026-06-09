@@ -29,6 +29,7 @@ def check_no_tracked_build_outputs(root: Path) -> list[str]:
     tracked = git_ls_files(root)
     forbidden_prefixes = (
         "target/",
+        "target-",
         "target-v061-hook/",
         ".agentcall/",
         ".agentcall_build/",
