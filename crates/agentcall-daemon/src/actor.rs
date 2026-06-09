@@ -1,7 +1,8 @@
 use crate::commands::{CommandEnvelopeV1, CommandType};
 use crate::hooks::queue_supervisor_instruction;
 use crate::session::{Session, stop_session};
-use crate::state::{AppState, append_agent_event};
+use crate::state::{AppState, append_agent_event, complete_command_event};
+use crate::store::CommandStatus;
 use serde_json::{Value, json};
 use std::io::Write;
 use std::sync::Arc;
@@ -228,8 +229,14 @@ fn execute_command(
         }
     };
     let (event_type, message, awaiting_observation) = command_terminal_event(&command.command_type);
-    append_agent_event(
+    complete_command_event(
         state,
+        &command.command_id,
+        if awaiting_observation {
+            CommandStatus::Accepted
+        } else {
+            CommandStatus::Completed
+        },
         event_type,
         message,
         json!({
@@ -239,7 +246,7 @@ fn execute_command(
             "command_type": format!("{:?}", command.command_type),
             "awaiting_observation": awaiting_observation,
         }),
-    );
+    )?;
     Ok(result)
 }
 

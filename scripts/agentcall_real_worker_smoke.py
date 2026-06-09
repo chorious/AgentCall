@@ -90,7 +90,7 @@ def main() -> int:
                 "MCP session default returned projection summary without raw terminal scan",
                 "stop returned awaiting observation",
                 "compact attention board returned projection-only payload",
-                "daemon restart recovered projection/events/command/lease records from durable state",
+                "daemon restart recovered projection/events/completed-command/lease records from durable state",
             ],
         }, ensure_ascii=False, indent=2))
         return 0
@@ -342,14 +342,19 @@ def assert_command_record(workspace: Path, store_backend: str, idempotency_key: 
             ).fetchone()
         if row is None:
             raise SmokeError("sqlite command recovery: expected command idempotency row")
+        if row[0] != "completed":
+            raise SmokeError(f"sqlite command recovery: expected completed command, got {row!r}")
         return
 
     index_path = workspace / ".agentcall" / "state" / "commands.index.json"
     if not index_path.exists():
         raise SmokeError(f"json command recovery: missing index {index_path}")
     value = json.loads(index_path.read_text(encoding="utf-8"))
-    if f"codex:{idempotency_key}" not in value:
+    record = value.get(f"codex:{idempotency_key}")
+    if record is None:
         raise SmokeError("json command recovery: expected command idempotency record")
+    if record.get("status") != "completed":
+        raise SmokeError(f"json command recovery: expected completed command, got {record!r}")
 
 
 def read_json_file(path: Path) -> dict[str, Any]:

@@ -281,13 +281,19 @@ impl RuntimeStore for JsonRuntimeStore {
         event: &EventEnvelopeV1,
         projection_update: ProjectionUpdate,
     ) -> Result<(), String> {
+        let status_text = command_status_text(status);
         append_ndjson(
             &self.agent_dir().join("state").join("command-status.ndjson"),
             &json!({
                 "command_id": command_id,
-                "status": format!("{status:?}"),
+                "status": status_text,
                 "updated_at": chrono::Utc::now().to_rfc3339(),
             }),
+        )?;
+        patch_command_status(
+            &commands_index_path(&self.workspace),
+            command_id,
+            status_text,
         )?;
         self.append_event_and_update_projection(event, projection_update)
             .map(|_| ())
@@ -430,6 +436,34 @@ fn command_record_to_value(scope: &str, record: &CommandRecord) -> Value {
         "fingerprint": record.fingerprint,
         "status": record.status,
     })
+}
+
+fn patch_command_status(path: &Path, command_id: &str, status: &str) -> Result<(), String> {
+    let mut index = read_json_file(path, json!({}));
+    let Some(records) = index.as_object_mut() else {
+        return Ok(());
+    };
+    for value in records.values_mut() {
+        if value.get("command_id").and_then(Value::as_str) == Some(command_id) {
+            if let Some(object) = value.as_object_mut() {
+                object.insert("status".to_string(), json!(status));
+                object.insert(
+                    "updated_at".to_string(),
+                    json!(chrono::Utc::now().to_rfc3339()),
+                );
+            }
+        }
+    }
+    write_json_file(path, &index)
+}
+
+fn command_status_text(status: CommandStatus) -> &'static str {
+    match status {
+        CommandStatus::Accepted => "accepted",
+        CommandStatus::Completed => "completed",
+        CommandStatus::Failed => "failed",
+        CommandStatus::Rejected => "rejected",
+    }
 }
 
 fn command_record_from_value(value: &Value) -> Option<CommandRecord> {

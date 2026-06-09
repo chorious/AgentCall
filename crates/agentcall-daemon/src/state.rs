@@ -1,10 +1,10 @@
 use crate::actor::ActorHandle;
 use crate::config::LocalConfig;
-use crate::events::{build_event_envelope, event_session_key};
+use crate::events::{EventEnvelopeV1, build_event_envelope, event_session_key};
 use crate::ownership::{OwnerLease, WorkspaceLease};
 use crate::projection::{SessionProjectionV1, apply_event_to_projection, read_session_projection};
 use crate::session::Session;
-use crate::store::{RuntimeStore, StoreWriterRuntimeStore};
+use crate::store::{CommandStatus, RuntimeStore, StoreWriterRuntimeStore};
 use crate::store_json::JsonRuntimeStore;
 use crate::store_sqlite::SqliteRuntimeStore;
 use std::collections::HashMap;
@@ -158,6 +158,40 @@ pub(crate) fn append_agent_event(
     }
 }
 
+pub(crate) fn complete_command_event(
+    state: &AppState,
+    command_id: &str,
+    status: CommandStatus,
+    event_type: &str,
+    message: &str,
+    data: serde_json::Value,
+) -> Result<(), String> {
+    let _guard = state.state_writer.lock().unwrap();
+    let envelope = build_agent_event_envelope(state, event_type, message, data)?;
+    let previous_projection = envelope
+        .session_id
+        .as_deref()
+        .and_then(|session_id| read_session_projection(state, session_id));
+    let projection_update = apply_event_to_projection(previous_projection, &envelope);
+    let projection_changed = projection_update.changed;
+    let projection = projection_update.projection.clone();
+    state
+        .store
+        .complete_command_with_event(command_id, status, &envelope, projection_update)?;
+    if projection_changed {
+        state
+            .projections
+            .lock()
+            .unwrap()
+            .insert(projection.session_id.clone(), projection);
+    }
+    append_hook_index(
+        &state.workspace.join(".agentcall"),
+        event_type,
+        &envelope.to_compat_json(),
+    )
+}
+
 pub(crate) fn append_agent_event_locked(
     state: &AppState,
     agent_dir: &Path,
@@ -166,15 +200,8 @@ pub(crate) fn append_agent_event_locked(
     data: serde_json::Value,
 ) -> Result<(), String> {
     fs::create_dir_all(&agent_dir).map_err(|err| err.to_string())?;
-    let global_seq = state.next_event_global_seq();
-    let event_id = format!("evt-{global_seq:06}");
-    let session_key = event_session_key(&data);
-    let session_seq = session_key
-        .as_deref()
-        .map(|key| state.next_event_session_seq(key));
-    let data = sanitize_event_data(agent_dir, event_type, &event_id, data)?;
     let envelope =
-        build_event_envelope(event_id, global_seq, session_seq, event_type, message, data);
+        build_agent_event_envelope_with_dir(state, agent_dir, event_type, message, data)?;
     let event = envelope.to_compat_json();
     let previous_projection = envelope
         .session_id
@@ -195,6 +222,46 @@ pub(crate) fn append_agent_event_locked(
             .insert(projection.session_id.clone(), projection);
     }
     append_hook_index(agent_dir, event_type, &event)
+}
+
+fn build_agent_event_envelope(
+    state: &AppState,
+    event_type: &str,
+    message: &str,
+    data: serde_json::Value,
+) -> Result<EventEnvelopeV1, String> {
+    build_agent_event_envelope_with_dir(
+        state,
+        &state.workspace.join(".agentcall"),
+        event_type,
+        message,
+        data,
+    )
+}
+
+fn build_agent_event_envelope_with_dir(
+    state: &AppState,
+    agent_dir: &Path,
+    event_type: &str,
+    message: &str,
+    data: serde_json::Value,
+) -> Result<EventEnvelopeV1, String> {
+    fs::create_dir_all(agent_dir).map_err(|err| err.to_string())?;
+    let global_seq = state.next_event_global_seq();
+    let event_id = format!("evt-{global_seq:06}");
+    let session_key = event_session_key(&data);
+    let session_seq = session_key
+        .as_deref()
+        .map(|key| state.next_event_session_seq(key));
+    let data = sanitize_event_data(agent_dir, event_type, &event_id, data)?;
+    Ok(build_event_envelope(
+        event_id,
+        global_seq,
+        session_seq,
+        event_type,
+        message,
+        data,
+    ))
 }
 
 fn sanitize_event_data(
