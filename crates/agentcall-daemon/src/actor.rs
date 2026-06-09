@@ -46,6 +46,7 @@ pub(crate) struct ActorHandle {
 pub(crate) enum ActorControlCommand {
     Submit(CommandEnvelopeV1, Sender<Result<Value, String>>),
     RawWrite(Vec<u8>),
+    #[allow(dead_code)]
     RefreshProjection,
 }
 

@@ -97,8 +97,11 @@ Current confidence: broad first pass is implemented. The main remaining risk is 
 - Real-worker smoke now supports both `json` and `sqlite` store backends:
   - `python scripts\agentcall_dev.py smoke real-worker --store-backend json`
   - `python scripts\agentcall_dev.py smoke real-worker --store-backend sqlite`
-- SQLite live route/session/projection parity is covered by smoke.
-- Daemon restart recovery parity remains open.
+- Both backends now cover live route/session/projection and daemon restart recovery for:
+  - default MCP session projection,
+  - compact attention board projection,
+  - session event query,
+  - command idempotency record.
 
 ## Verification Already Run
 
@@ -154,12 +157,12 @@ python scripts\agentcall_dev.py smoke real-worker --store-backend sqlite
 
 ### P1: Store Backend Hardening
 
-- Run the same smoke with `store_backend=json` and `store_backend=sqlite`. **Done for live route/session/projection path.**
+- Run the same smoke with `store_backend=json` and `store_backend=sqlite`. **Done for live route/session/projection and restart recovery path.**
 - Confirm daemon restart preserves:
-  - events
-  - projections
-  - idempotency records
-  - command records
+  - events **covered by real-worker smoke**
+  - projections **covered by real-worker smoke**
+  - idempotency records **covered by real-worker smoke**
+  - command records **covered by real-worker smoke**
   - leases
 - Add corruption/rebuild tests for command index and projection snapshot.
 

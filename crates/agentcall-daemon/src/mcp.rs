@@ -172,7 +172,6 @@ fn mcp_route(state: &Arc<AppState>, args: Value) -> Result<Value, String> {
 
 fn mcp_session(state: &AppState, args: &Value) -> Result<Value, String> {
     let name = required_str(args, "name")?;
-    let session = get_session(state, name).ok_or_else(|| "session not found".to_string())?;
     let summary = session_projection_summary(state, name);
     let include = string_array(args, "include");
     let include_clean_tail = include.iter().any(|item| item == "clean_tail");
@@ -182,7 +181,15 @@ fn mcp_session(state: &AppState, args: &Value) -> Result<Value, String> {
         let mut response = json!({
             "summary": summary,
         });
+        let session = if include_clean_tail || include_plan {
+            Some(get_session(state, name).ok_or_else(|| {
+                "session is not live; clean_tail/plan require an in-memory PTY session".to_string()
+            })?)
+        } else {
+            None
+        };
         if include_clean_tail {
+            let session = session.as_ref().unwrap();
             response["clean_tail"] = json!({
                     "session": name,
                     "clean_output": clean_session_output(&session),
@@ -190,6 +197,7 @@ fn mcp_session(state: &AppState, args: &Value) -> Result<Value, String> {
             });
         }
         if include_plan {
+            let session = session.as_ref().unwrap();
             response["plan"] = session_plan_artifact(state, &session, true);
         }
         if include_events {
@@ -631,6 +639,34 @@ mod tests {
         assert_eq!(events["event_count"], 1);
         assert_eq!(events["events"][0]["event_type"], "hook.Notification");
         assert_eq!(events["next_cursor"], 1);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn default_session_reads_projection_without_live_pty() {
+        let root = std::env::temp_dir().join(format!(
+            "agentcall-mcp-session-projection-{}",
+            std::process::id()
+        ));
+        let state = AppState::test(root.clone());
+        append_agent_event(
+            &state,
+            "hook.Notification",
+            "permission",
+            json!({"wrapper_session": "worker-a", "status": "needs_permission"}),
+        );
+
+        let summary = mcp_session(&state, &json!({"name": "worker-a"})).unwrap();
+        assert_eq!(summary["projection_only"], true);
+        assert_eq!(summary["projection_stale"], false);
+        assert_eq!(summary["attention_status"], "needs_permission");
+
+        let err = mcp_session(
+            &state,
+            &json!({"name": "worker-a", "include": ["clean_tail"]}),
+        )
+        .unwrap_err();
+        assert!(err.contains("session is not live"));
         let _ = std::fs::remove_dir_all(root);
     }
 

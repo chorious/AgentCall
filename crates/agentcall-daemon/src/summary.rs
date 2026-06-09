@@ -1678,6 +1678,30 @@ mod tests {
     }
 
     #[test]
+    fn compact_attention_board_reads_store_projection_without_live_session() {
+        let root = std::env::temp_dir().join(format!(
+            "agentcall-board-store-projection-test-{}",
+            std::process::id()
+        ));
+        let state = AppState::test(root.clone());
+        crate::state::append_agent_event(
+            &state,
+            "hook.Notification",
+            "permission",
+            serde_json::json!({"wrapper_session": "worker-a", "status": "needs_permission"}),
+        );
+
+        let board = board_state(&state, Some("compact"), Some("attention"), None);
+        assert_eq!(board["projection_only"], true);
+        assert_eq!(board["live_daemon_sessions"][0]["session"], "worker-a");
+        assert_eq!(
+            board["attention"][0]["attention_status"],
+            "needs_permission"
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn route_result_for_session_supports_board_array_shape() {
         let routes = serde_json::json!([
             {

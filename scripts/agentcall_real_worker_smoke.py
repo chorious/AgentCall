@@ -53,7 +53,7 @@ def main() -> int:
         port = args.port or free_port()
         proc = start_daemon(daemon_bin, workspace, port, daemon_log)
         base_url = f"http://127.0.0.1:{port}"
-        wait_for_daemon(base_url, proc)
+        wait_for_daemon(base_url, proc, daemon_log)
         session_name = f"v5-smoke-{int(time.time())}"
         route = start_route(base_url, root, workspace, session_name)
         assert_eq(route.get("status"), "started_prompt_dispatched_without_hook_ack", "route status")
@@ -70,6 +70,10 @@ def main() -> int:
         wait_for_summary_status(base_url, session_name, {"stopping", "completed"}, "stop projection")
         board = get_json(f"{base_url}/api/board?view=compact&filter=attention")
         assert_eq(board.get("projection_only"), True, "board projection_only")
+        terminate_daemon(proc)
+        proc = start_daemon(daemon_bin, workspace, port, daemon_log)
+        wait_for_daemon(base_url, proc, daemon_log)
+        verify_restart_recovery(base_url, workspace, args.store_backend, session_name)
         print(json.dumps({
             "status": "ok",
             "workspace": str(workspace),
@@ -84,6 +88,7 @@ def main() -> int:
                 "MCP session default returned projection summary without raw terminal scan",
                 "stop returned awaiting observation",
                 "compact attention board returned projection-only payload",
+                "daemon restart recovered projection/events/command record from durable state",
             ],
         }, ensure_ascii=False, indent=2))
         return 0
@@ -94,11 +99,7 @@ def main() -> int:
         return 1
     finally:
         if proc is not None:
-            proc.terminate()
-            try:
-                proc.wait(timeout=5)
-            except subprocess.TimeoutExpired:
-                proc.kill()
+            terminate_daemon(proc)
         if args.keep_workspace:
             print(f"[INFO] kept smoke workspace: {workspace}")
         else:
@@ -172,11 +173,11 @@ def start_daemon(
     )
 
 
-def wait_for_daemon(base_url: str, proc: subprocess.Popen[str]) -> None:
+def wait_for_daemon(base_url: str, proc: subprocess.Popen[str], daemon_log: Path) -> None:
     deadline = time.time() + 10
     while time.time() < deadline:
         if proc.poll() is not None:
-            raise SmokeError(f"daemon exited early with code {proc.returncode}\n{daemon_tail(proc)}")
+            raise SmokeError(f"daemon exited early with code {proc.returncode}\n{daemon_tail(daemon_log)}")
         try:
             health = get_json(f"{base_url}/api/runtime/health", timeout=1.0)
             if health.get("status") in {"ok", "running"}:
@@ -228,6 +229,64 @@ def stop_session(base_url: str, session_name: str) -> dict[str, Any]:
             "precondition": {"turn_state": "working"},
         },
     )
+
+
+def verify_restart_recovery(
+    base_url: str,
+    workspace: Path,
+    store_backend: str,
+    session_name: str,
+) -> None:
+    summary = mcp_call(base_url, "agentcall_session", {"name": session_name})
+    assert_eq(summary.get("projection_only"), True, "restart session projection_only")
+    assert_eq(summary.get("projection_stale"), False, "restart session projection_stale")
+    if summary.get("liveness_status") not in {"stopping", "completed", "working"}:
+        raise SmokeError(f"restart liveness unexpected: {summary.get('liveness_status')!r}")
+
+    session_with_events = mcp_call(
+        base_url,
+        "agentcall_session",
+        {"name": session_name, "include": ["events"], "limit": 20},
+    )
+    event_count = (
+        session_with_events.get("events", {})
+        .get("event_count", 0)
+        if isinstance(session_with_events.get("events"), dict)
+        else 0
+    )
+    if event_count <= 0:
+        raise SmokeError("restart event recovery: expected persisted session events")
+
+    board = get_json(f"{base_url}/api/board?view=compact&filter=attention")
+    sessions = board.get("live_daemon_sessions", [])
+    if not any(item.get("session") == session_name for item in sessions if isinstance(item, dict)):
+        raise SmokeError("restart board recovery: expected persisted projection in compact board")
+
+    assert_command_record(workspace, store_backend, f"smoke-send-{session_name}-AGENTCALL_SMOKE_PING")
+
+
+def assert_command_record(workspace: Path, store_backend: str, idempotency_key: str) -> None:
+    if store_backend == "sqlite":
+        import sqlite3
+
+        db_path = workspace / ".agentcall" / "state" / "runtime.db"
+        if not db_path.exists():
+            raise SmokeError(f"sqlite command recovery: missing db {db_path}")
+        with sqlite3.connect(db_path) as conn:
+            row = conn.execute(
+                "SELECT status FROM commands WHERE owner_id = ? AND idempotency_key = ?",
+                ("codex", idempotency_key),
+            ).fetchone()
+        if row is None:
+            raise SmokeError("sqlite command recovery: expected command idempotency row")
+        return
+
+    index_path = workspace / ".agentcall" / "state" / "commands.index.json"
+    if not index_path.exists():
+        raise SmokeError(f"json command recovery: missing index {index_path}")
+    value = json.loads(index_path.read_text(encoding="utf-8"))
+    if f"codex:{idempotency_key}" not in value:
+        raise SmokeError("json command recovery: expected command idempotency record")
 
 
 def mcp_call(base_url: str, name: str, arguments: dict[str, Any]) -> dict[str, Any]:
@@ -314,6 +373,17 @@ def daemon_tail(path: Path) -> str:
         return path.read_text(encoding="utf-8", errors="replace")[-4000:]
     except OSError:
         return ""
+
+
+def terminate_daemon(proc: subprocess.Popen[str]) -> None:
+    if proc.poll() is not None:
+        return
+    proc.terminate()
+    try:
+        proc.wait(timeout=5)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        proc.wait(timeout=5)
 
 
 if __name__ == "__main__":

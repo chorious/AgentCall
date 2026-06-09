@@ -1,6 +1,7 @@
 use crate::events::EventEnvelopeV1;
 use crate::session::{Session, SessionInfo};
-use crate::state::{AppState, read_json_file};
+use crate::state::AppState;
+use crate::store::BoardQuery;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::sync::Arc;
@@ -43,6 +44,7 @@ pub(crate) struct ProjectionUpdate {
     pub(crate) reason: String,
 }
 
+#[allow(dead_code)]
 pub(crate) fn default_session_projection(session: &SessionInfo) -> SessionProjectionV1 {
     SessionProjectionV1 {
         schema_version: 1,
@@ -127,12 +129,11 @@ pub(crate) fn read_session_projection(
     if let Some(projection) = state.projections.lock().unwrap().get(session_name).cloned() {
         return Some(projection);
     }
-    let path = projection_path(state, session_name);
-    let value = read_json_file(&path, serde_json::json!(null));
-    if value.is_null() {
-        return None;
-    }
-    serde_json::from_value(value).ok()
+    state
+        .store
+        .get_session_projection(session_name)
+        .ok()
+        .flatten()
 }
 
 pub(crate) fn session_projection_summary(state: &AppState, session_name: &str) -> Value {
@@ -228,37 +229,54 @@ pub(crate) fn apply_event_to_projection(
 }
 
 pub(crate) fn board_attention_projection(state: &AppState) -> Value {
-    let sessions = crate::session::list_sessions(state);
-    let mut attention = Vec::new();
-    let mut live_daemon_sessions = Vec::new();
-    for session in sessions {
-        let projection = read_session_projection(state, &session.name)
-            .unwrap_or_else(|| stale_projection_for_session_name(&session.name));
-        let item = serde_json::json!({
-            "session": projection.session_id,
-            "liveness_status": projection.liveness_status,
-            "attention_status": projection.attention_status,
-            "needs_attention": projection.needs_attention,
-            "projection_stale": projection.projection_stale,
-            "projection_last_global_seq": projection.projection_last_global_seq,
-            "projection_last_session_seq": projection.projection_last_session_seq,
-            "last_progress_brief": projection.last_progress_brief,
-            "next_recommended_action": projection.next_recommended_action,
-            "warnings": projection.warnings,
-        });
-        live_daemon_sessions.push(item.clone());
-        if projection.needs_attention || projection.attention_status != "none" {
-            attention.push(item);
-        }
-    }
+    let all = state
+        .store
+        .list_board_projection(BoardQuery {
+            attention_only: false,
+        })
+        .unwrap_or_else(|_| serde_json::json!({"sessions": []}));
+    let attention_projection = state
+        .store
+        .list_board_projection(BoardQuery {
+            attention_only: true,
+        })
+        .unwrap_or_else(|_| serde_json::json!({"sessions": []}));
+    let live_daemon_sessions = projection_items(all.get("sessions").and_then(Value::as_array));
+    let attention = projection_items(
+        attention_projection
+            .get("sessions")
+            .and_then(Value::as_array),
+    );
     serde_json::json!({
         "workspace": state.workspace,
         "view": "compact",
         "filter": "attention",
         "projection_only": true,
+        "store_backend": state.store.backend_name(),
         "live_daemon_sessions": live_daemon_sessions,
         "attention": attention,
     })
+}
+
+fn projection_items(items: Option<&Vec<Value>>) -> Vec<Value> {
+    items
+        .into_iter()
+        .flatten()
+        .map(|projection| {
+            serde_json::json!({
+                "session": projection.get("session_id").cloned().unwrap_or(Value::Null),
+                "liveness_status": projection.get("liveness_status").cloned().unwrap_or(Value::Null),
+                "attention_status": projection.get("attention_status").cloned().unwrap_or(Value::Null),
+                "needs_attention": projection.get("needs_attention").cloned().unwrap_or(Value::Null),
+                "projection_stale": projection.get("projection_stale").cloned().unwrap_or(Value::Null),
+                "projection_last_global_seq": projection.get("projection_last_global_seq").cloned().unwrap_or(Value::Null),
+                "projection_last_session_seq": projection.get("projection_last_session_seq").cloned().unwrap_or(Value::Null),
+                "last_progress_brief": projection.get("last_progress_brief").cloned().unwrap_or(Value::Null),
+                "next_recommended_action": projection.get("next_recommended_action").cloned().unwrap_or(Value::Null),
+                "warnings": projection.get("warnings").cloned().unwrap_or_else(|| serde_json::json!([])),
+            })
+        })
+        .collect()
 }
 
 fn reduce_hook_event(projection: &mut SessionProjectionV1, event: &EventEnvelopeV1) {
@@ -287,28 +305,6 @@ fn reduce_hook_event(projection: &mut SessionProjectionV1, event: &EventEnvelope
     if let Some(workspace) = event.payload.get("workspace").and_then(Value::as_str) {
         projection.workspace = workspace.to_string();
     }
-}
-
-fn projection_path(state: &AppState, session_name: &str) -> std::path::PathBuf {
-    state
-        .workspace
-        .join(".agentcall")
-        .join("state")
-        .join("projections")
-        .join("sessions")
-        .join(format!("{}.json", safe_path_component(session_name)))
-}
-
-fn safe_path_component(text: &str) -> String {
-    text.chars()
-        .map(|ch| {
-            if ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.') {
-                ch
-            } else {
-                '-'
-            }
-        })
-        .collect()
 }
 
 #[cfg(test)]

@@ -1,8 +1,13 @@
 use crate::ownership::attach_or_validate_owner_lease;
-use crate::state::{AppState, read_json_file, write_json_file};
+use crate::state::AppState;
+#[cfg(test)]
+use crate::state::{read_json_file, write_json_file};
+use crate::store::IdempotencyDecisionV1;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+#[cfg(test)]
 use std::fs;
+#[cfg(test)]
 use std::io::Write;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -47,6 +52,7 @@ pub(crate) struct SessionSendSafety {
     pub(crate) requires_precondition: bool,
 }
 
+#[cfg(test)]
 #[derive(Debug)]
 pub(crate) enum IdempotencyDecision {
     Recorded,
@@ -82,20 +88,22 @@ pub(crate) fn prepare_session_send_command(
     }
     let idempotency_key = idempotency_key.unwrap_or("read-only");
     let enriched_args = attach_or_validate_owner_lease(state, session, args)?;
-    let fingerprint = session_send_fingerprint(session, action, &enriched_args);
-    match check_or_record_idempotency(state, session, idempotency_key, &fingerprint)? {
-        IdempotencyDecision::Recorded => Ok(PreparedCommand::Submit(build_session_send_command(
-            session,
-            action,
-            idempotency_key,
-            &enriched_args,
-        ))),
-        IdempotencyDecision::Deduped(previous) => Ok(PreparedCommand::Deduped(json!({
+    let command = build_session_send_command(session, action, idempotency_key, &enriched_args);
+    match state.store.register_command_idempotently(&command)? {
+        IdempotencyDecisionV1::Recorded(_) => Ok(PreparedCommand::Submit(command)),
+        IdempotencyDecisionV1::Deduped(previous) => Ok(PreparedCommand::Deduped(json!({
             "ok": true,
             "status": "command_deduped",
             "idempotency_key": idempotency_key,
-            "previous": previous
+            "previous": {
+                "command_id": previous.command_id,
+                "owner_id": previous.owner_id,
+                "status": previous.status,
+            }
         }))),
+        IdempotencyDecisionV1::RejectedDifferentFingerprint(_) => Err(format!(
+            "rejected_idempotency_key_reuse_with_different_payload: key={idempotency_key}"
+        )),
     }
 }
 
@@ -193,25 +201,7 @@ pub(crate) fn session_send_payload(action: &str, args: &Value) -> Value {
     Value::Object(payload)
 }
 
-pub(crate) fn session_send_fingerprint(session: &str, action: &str, args: &Value) -> String {
-    let mut normalized = serde_json::Map::new();
-    normalized.insert("session".to_string(), json!(session));
-    normalized.insert("action".to_string(), json!(action));
-    normalized.insert(
-        "text".to_string(),
-        args.get("text").cloned().unwrap_or(Value::Null),
-    );
-    normalized.insert(
-        "enter".to_string(),
-        args.get("enter").cloned().unwrap_or(Value::Null),
-    );
-    normalized.insert(
-        "precondition".to_string(),
-        args.get("precondition").cloned().unwrap_or(Value::Null),
-    );
-    serde_json::to_string(&Value::Object(normalized)).unwrap_or_default()
-}
-
+#[cfg(test)]
 pub(crate) fn check_or_record_idempotency(
     state: &AppState,
     session: &str,
@@ -279,6 +269,7 @@ pub(crate) fn check_or_record_idempotency(
     Ok(IdempotencyDecision::Recorded)
 }
 
+#[cfg(test)]
 fn commands_log_path(state: &AppState) -> std::path::PathBuf {
     state
         .workspace
@@ -287,6 +278,7 @@ fn commands_log_path(state: &AppState) -> std::path::PathBuf {
         .join("commands.ndjson")
 }
 
+#[cfg(test)]
 fn commands_index_path(state: &AppState) -> std::path::PathBuf {
     state
         .workspace
@@ -295,6 +287,7 @@ fn commands_index_path(state: &AppState) -> std::path::PathBuf {
         .join("commands.index.json")
 }
 
+#[cfg(test)]
 fn append_command_registry_line(
     path: &std::path::Path,
     record: &serde_json::Value,
@@ -311,6 +304,7 @@ fn append_command_registry_line(
     writeln!(file, "{text}").map_err(|err| err.to_string())
 }
 
+#[cfg(test)]
 fn rebuild_commands_index_from_log(path: &std::path::Path) -> serde_json::Value {
     let Ok(text) = fs::read_to_string(path) else {
         return json!({});
@@ -366,7 +360,10 @@ mod tests {
         assert!(matches!(first, IdempotencyDecision::Recorded));
 
         let second = check_or_record_idempotency(&state, "worker-a", "cmd-1", "payload-a").unwrap();
-        assert!(matches!(second, IdempotencyDecision::Deduped(_)));
+        let IdempotencyDecision::Deduped(previous) = second else {
+            panic!("expected dedupe");
+        };
+        assert_eq!(previous["fingerprint"], "payload-a");
 
         let reused =
             check_or_record_idempotency(&state, "worker-a", "cmd-1", "payload-b").unwrap_err();
@@ -383,7 +380,10 @@ mod tests {
         fs::remove_file(commands_index_path(&state)).unwrap();
         let rebuilt =
             check_or_record_idempotency(&state, "worker-a", "cmd-1", "payload-a").unwrap();
-        assert!(matches!(rebuilt, IdempotencyDecision::Deduped(_)));
+        let IdempotencyDecision::Deduped(previous) = rebuilt else {
+            panic!("expected rebuilt dedupe");
+        };
+        assert_eq!(previous["fingerprint"], "payload-a");
 
         let log_text = fs::read_to_string(commands_log_path(&state)).unwrap();
         assert!(log_text.contains(r#""status":"accepted""#));
