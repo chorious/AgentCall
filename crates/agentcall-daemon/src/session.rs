@@ -227,7 +227,19 @@ pub(crate) fn spawn_reader(
                         },
                     );
                 }
-                Err(_) => break,
+                Err(err) => {
+                    append_agent_event(
+                        &state,
+                        "session.reader_failed",
+                        "PTY reader failed.",
+                        serde_json::json!({
+                            "session_id": session.name,
+                            "name": session.name,
+                            "error": err.to_string(),
+                        }),
+                    );
+                    break;
+                }
             }
         }
     });

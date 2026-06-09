@@ -1,5 +1,6 @@
 use crate::ownership::attach_or_validate_owner_lease;
-use crate::state::AppState;
+use crate::projection::read_session_projection;
+use crate::state::{AppState, append_agent_event};
 #[cfg(test)]
 use crate::state::{read_json_file, write_json_file};
 use crate::store::IdempotencyDecisionV1;
@@ -89,6 +90,7 @@ pub(crate) fn prepare_session_send_command(
     let idempotency_key = idempotency_key.unwrap_or("read-only");
     let enriched_args = attach_or_validate_owner_lease(state, session, args)?;
     let command = build_session_send_command(session, action, idempotency_key, &enriched_args);
+    validate_projection_precondition(state, &command)?;
     match state.store.register_command_idempotently(&command)? {
         IdempotencyDecisionV1::Recorded(_) => Ok(PreparedCommand::Submit(command)),
         IdempotencyDecisionV1::Deduped(previous) => Ok(PreparedCommand::Deduped(json!({
@@ -105,6 +107,42 @@ pub(crate) fn prepare_session_send_command(
             "rejected_idempotency_key_reuse_with_different_payload: key={idempotency_key}"
         )),
     }
+}
+
+fn validate_projection_precondition(
+    state: &AppState,
+    command: &CommandEnvelopeV1,
+) -> Result<(), String> {
+    let Some(provided_seq) = command
+        .precondition
+        .as_ref()
+        .and_then(|precondition| precondition.projection_last_session_seq)
+    else {
+        return Ok(());
+    };
+    let current_seq = read_session_projection(state, &command.session_id)
+        .map(|projection| projection.projection_last_session_seq)
+        .unwrap_or(0);
+    if provided_seq == current_seq {
+        return Ok(());
+    }
+    append_agent_event(
+        state,
+        "command.rejected_precondition",
+        "Session command rejected because projection precondition is stale.",
+        json!({
+            "session_id": command.session_id,
+            "command_id": command.command_id,
+            "idempotency_key": command.idempotency_key,
+            "owner_id": command.owner_id,
+            "expected_projection_last_session_seq": current_seq,
+            "provided_projection_last_session_seq": provided_seq,
+            "reason": "rejected_precondition"
+        }),
+    );
+    Err(format!(
+        "rejected_precondition: projection_last_session_seq expected={current_seq} got={provided_seq}"
+    ))
 }
 
 pub(crate) fn classify_session_send_action(action: &str) -> SessionSendSafety {
@@ -328,6 +366,7 @@ fn rebuild_commands_index_from_log(path: &std::path::Path) -> serde_json::Value 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::projection::stale_projection_for_session_name;
     use crate::util::now_ms;
     use std::fs;
 
@@ -433,5 +472,59 @@ mod tests {
         assert_eq!(value["command_type"], "SendInput");
         assert_eq!(value["owner_lease_id"], "lease-1");
         assert_eq!(value["precondition"]["projection_last_session_seq"], 42);
+    }
+
+    #[test]
+    fn session_send_precondition_seq_mismatch_rejected() {
+        let state = test_state("precondition-mismatch");
+        let mut projection = stale_projection_for_session_name("worker-a");
+        projection.projection_stale = false;
+        projection.projection_last_session_seq = 7;
+        state
+            .projections
+            .lock()
+            .unwrap()
+            .insert("worker-a".to_string(), projection);
+        let err = match prepare_session_send_command(
+            &state,
+            "worker-a",
+            "send",
+            &serde_json::json!({
+                "text": "continue",
+                "idempotency_key": "stale-send",
+                "precondition": {"projection_last_session_seq": 6}
+            }),
+        ) {
+            Ok(_) => panic!("expected stale projection precondition to be rejected"),
+            Err(err) => err,
+        };
+        assert!(err.contains("rejected_precondition"));
+        let _ = fs::remove_dir_all(&state.workspace);
+    }
+
+    #[test]
+    fn precondition_match_allows_command() {
+        let state = test_state("precondition-match");
+        let mut projection = stale_projection_for_session_name("worker-a");
+        projection.projection_stale = false;
+        projection.projection_last_session_seq = 7;
+        state
+            .projections
+            .lock()
+            .unwrap()
+            .insert("worker-a".to_string(), projection);
+        let prepared = prepare_session_send_command(
+            &state,
+            "worker-a",
+            "send",
+            &serde_json::json!({
+                "text": "continue",
+                "idempotency_key": "fresh-send",
+                "precondition": {"projection_last_session_seq": 7}
+            }),
+        )
+        .unwrap();
+        assert!(matches!(prepared, PreparedCommand::Submit(_)));
+        let _ = fs::remove_dir_all(&state.workspace);
     }
 }

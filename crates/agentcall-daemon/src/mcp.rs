@@ -1,12 +1,13 @@
 use crate::actor::submit_session_command;
 use crate::commands::{CommandType, PreparedCommand, prepare_session_send_command};
 use crate::confidence::attach_confidence_to_reports;
+use crate::hooks::runtime_bindings_state;
 use crate::projection::session_projection_summary;
 use crate::routes::{
     RouteRequest, checkpoint_session, handle_route, patch_route_record, route_for_wrapper_session,
 };
 use crate::session::get_session;
-use crate::state::{AppState, append_agent_event, read_events};
+use crate::state::{AppState, append_agent_event};
 use crate::store::EventQuery;
 use crate::summary::{
     board_owner_filter, board_state, clean_session_output, session_plan_artifact, session_summary,
@@ -460,18 +461,12 @@ fn looks_like_menu_prompt(clean_output: &str) -> bool {
 }
 
 fn session_has_seen_hook_event(state: &AppState, wrapper_session: &str, hook_event: &str) -> bool {
-    let expected_type = format!("hook.{hook_event}");
-    read_events(&state.workspace.join(".agentcall").join("events.ndjson"))
-        .iter()
-        .rev()
-        .any(|event| {
-            event.get("type").and_then(Value::as_str) == Some(expected_type.as_str())
-                && event
-                    .get("data")
-                    .and_then(|data| data.get("wrapper_session"))
-                    .and_then(Value::as_str)
-                    == Some(wrapper_session)
-        })
+    runtime_bindings_state(state)
+        .get(wrapper_session)
+        .and_then(|binding| binding.get("seen_hooks"))
+        .and_then(|seen| seen.get(hook_event))
+        .and_then(Value::as_bool)
+        == Some(true)
 }
 
 fn is_plan_then_auto_session(state: &AppState, session_name: &str) -> bool {

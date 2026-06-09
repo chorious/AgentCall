@@ -798,42 +798,20 @@ fn last_supervisor_instruction_injected_at(
     state: &AppState,
     wrapper_session: &str,
 ) -> Option<String> {
-    let events = read_events(&state.workspace.join(".agentcall").join("events.ndjson"));
-    events.iter().rev().find_map(|event| {
-        if event.get("type").and_then(serde_json::Value::as_str)
-            != Some("supervisor_instruction.injected")
-        {
-            return None;
-        }
-        let same_wrapper = event
-            .get("data")
-            .and_then(|data| data.get("wrapper_session"))
-            .and_then(serde_json::Value::as_str)
-            == Some(wrapper_session);
-        if same_wrapper {
-            event
-                .get("ts")
-                .and_then(serde_json::Value::as_str)
-                .map(str::to_string)
-        } else {
-            None
-        }
-    })
+    runtime_bindings_state(state)
+        .get(wrapper_session)
+        .and_then(|binding| binding.get("last_supervisor_instruction_injected_at"))
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_string)
 }
 
 fn session_has_seen_hook_event(state: &AppState, wrapper_session: &str, hook_event: &str) -> bool {
-    let expected_type = format!("hook.{hook_event}");
-    read_events(&state.workspace.join(".agentcall").join("events.ndjson"))
-        .iter()
-        .rev()
-        .any(|event| {
-            event.get("type").and_then(serde_json::Value::as_str) == Some(expected_type.as_str())
-                && event
-                    .get("data")
-                    .and_then(|data| data.get("wrapper_session"))
-                    .and_then(serde_json::Value::as_str)
-                    == Some(wrapper_session)
-        })
+    runtime_bindings_state(state)
+        .get(wrapper_session)
+        .and_then(|binding| binding.get("seen_hooks"))
+        .and_then(|seen| seen.get(hook_event))
+        .and_then(serde_json::Value::as_bool)
+        == Some(true)
 }
 
 pub(crate) fn session_plan_artifact(

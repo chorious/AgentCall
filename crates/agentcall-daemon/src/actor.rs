@@ -88,6 +88,13 @@ pub(crate) fn submit_session_command(
         .get(session_id)
         .cloned()
         .ok_or_else(|| {
+            append_actor_failure_event(
+                state,
+                session_id,
+                "session.orphaned",
+                "Session actor is missing; session is orphaned or not actor-managed.",
+                "missing_actor_handle",
+            );
             "missing session actor; session is orphaned or not actor-managed".to_string()
         })?;
     if handle.session_id != session_id {
@@ -168,7 +175,16 @@ fn execute_command(
                 .get("text")
                 .and_then(Value::as_str)
                 .map(str::to_string);
-            writer.write_raw(b"\x1b")?;
+            if let Err(err) = writer.write_raw(b"\x1b") {
+                append_actor_failure_event(
+                    state,
+                    session_id,
+                    "session.writer_closed",
+                    "PTY writer failed while sending interrupt.",
+                    &err,
+                );
+                return Err(err);
+            }
             append_agent_event(
                 state,
                 "pty.interrupt_sent",
@@ -272,7 +288,16 @@ fn actor_write_input(
     text: &str,
     enter: bool,
 ) -> Result<(), String> {
-    writer.write_input(text, enter)?;
+    if let Err(err) = writer.write_input(text, enter) {
+        append_actor_failure_event(
+            state,
+            session_id,
+            "session.writer_closed",
+            "PTY writer failed while sending input.",
+            &err,
+        );
+        return Err(err);
+    }
     append_agent_event(
         state,
         "pty.input_sent",
@@ -282,11 +307,31 @@ fn actor_write_input(
     Ok(())
 }
 
+fn append_actor_failure_event(
+    state: &AppState,
+    session_id: &str,
+    event_type: &str,
+    message: &str,
+    error: &str,
+) {
+    append_agent_event(
+        state,
+        event_type,
+        message,
+        json!({
+            "session_id": session_id,
+            "name": session_id,
+            "error": error,
+        }),
+    );
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::commands::{CommandEnvelopeV1, CommandType};
     use crate::config::LocalConfig;
+    use std::io;
 
     #[test]
     fn submit_session_command_uses_registered_actor_handle() {
@@ -333,6 +378,35 @@ mod tests {
         let (send_event_type, _, send_awaiting) = command_terminal_event(&CommandType::SendInput);
         assert_eq!(send_event_type, "command.completed");
         assert!(!send_awaiting);
+    }
+
+    #[test]
+    fn writer_error_marks_projection_failed() {
+        struct FailingWriter;
+        impl Write for FailingWriter {
+            fn write(&mut self, _buf: &[u8]) -> io::Result<usize> {
+                Err(io::Error::new(io::ErrorKind::BrokenPipe, "writer closed"))
+            }
+
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let state = AppState::new(
+            std::env::temp_dir().join(format!(
+                "agentcall-actor-writer-error-{}",
+                std::process::id()
+            )),
+            LocalConfig::default(),
+            None,
+        );
+        let mut writer = PtyWriter::new(Box::new(FailingWriter));
+        let result = execute_command(&state, "worker-a", &test_command(), &mut writer);
+        assert!(result.unwrap_err().contains("writer closed"));
+        let projection = crate::projection::read_session_projection(&state, "worker-a").unwrap();
+        assert_eq!(projection.liveness_status, "failed_or_orphaned");
+        assert_eq!(projection.attention_status, "failed");
     }
 
     fn test_command() -> CommandEnvelopeV1 {

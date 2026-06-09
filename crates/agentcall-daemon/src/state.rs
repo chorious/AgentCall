@@ -14,7 +14,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
-const ROTATING_LOG_MAX_BYTES: u64 = 4 * 1024 * 1024;
+const ROTATING_LOG_MAX_BYTES: u64 = 1024 * 1024;
 const READ_TAIL_BYTES: u64 = 2 * 1024 * 1024;
 const RECENT_EVENT_LIMIT: usize = 80;
 const TOOL_OUTPUT_INLINE_LIMIT: usize = 4096;

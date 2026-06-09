@@ -2,6 +2,7 @@ use crate::routes::{patch_route_record_locked, route_for_wrapper_session};
 use crate::state::{
     AppState, append_agent_event, append_agent_event_locked, read_json_file, write_json_file,
 };
+use crate::store::ReportIndexRecord;
 use serde::Deserialize;
 use std::fs;
 use std::path::Path;
@@ -338,6 +339,7 @@ fn context_injection(
                     "delivery": "hook.additionalContext"
                 }),
             )?;
+            mark_supervisor_instruction_injected_locked(state_dir, wrapper)?;
             context.push_str("\n# AgentCall Supervisor Update\n\n");
             context.push_str(
                 "The supervisor sent these instructions while you were busy. Apply them before continuing. If they conflict with current work, stop and report the conflict clearly.\n\n",
@@ -356,6 +358,19 @@ fn context_injection(
         }
     }
     Ok(context)
+}
+
+fn mark_supervisor_instruction_injected_locked(
+    state_dir: &Path,
+    wrapper_session: &str,
+) -> Result<(), String> {
+    let path = state_dir.join("runtime_binding.json");
+    let mut bindings = read_json_file(&path, serde_json::json!({}));
+    if let Some(binding) = bindings.get_mut(wrapper_session) {
+        binding["last_supervisor_instruction_injected_at"] =
+            serde_json::json!(chrono::Utc::now().to_rfc3339());
+    }
+    write_json_file(&path, &bindings)
 }
 
 fn count_reports(agent_dir: &Path) -> usize {
@@ -531,7 +546,20 @@ pub(crate) fn upsert_runtime_binding_locked(
     } else {
         "known_session"
     };
-    bindings[&wrapper_session] = serde_json::json!({
+    let previous = bindings
+        .get(&wrapper_session)
+        .cloned()
+        .unwrap_or_else(|| serde_json::json!({}));
+    let mut seen_hooks = previous
+        .get("seen_hooks")
+        .cloned()
+        .unwrap_or_else(|| serde_json::json!({}));
+    if !seen_hooks.is_object() {
+        seen_hooks = serde_json::json!({});
+    }
+    let now = chrono::Utc::now().to_rfc3339();
+    seen_hooks[event] = serde_json::json!(true);
+    let mut binding = serde_json::json!({
         "wrapper_session": wrapper_session.clone(),
         "claude_session_id": claude_session_id,
         "transcript_path": transcript_path,
@@ -539,9 +567,18 @@ pub(crate) fn upsert_runtime_binding_locked(
         "last_hook_event": event,
         "last_hook_status": status,
         "last_tool": tool_name,
-        "last_seen": chrono::Utc::now().to_rfc3339(),
+        "last_seen": now,
+        "seen_hooks": seen_hooks,
         "binding_source": binding_source,
     });
+    if matches!(event, "PostToolBatch" | "UserPromptSubmit" | "PreToolUse" | "PostToolUse") {
+        binding[&format!("last_{}_at", event.to_ascii_lowercase())] =
+            binding["last_seen"].clone();
+    }
+    if let Some(value) = previous.get("last_supervisor_instruction_injected_at") {
+        binding["last_supervisor_instruction_injected_at"] = value.clone();
+    }
+    bindings[&wrapper_session] = binding;
     write_json_file(&path, &bindings)?;
     Ok((Some(wrapper_session), binding_source.to_string()))
 }
@@ -588,9 +625,14 @@ pub(crate) fn apply_hook_policy_locked(
             payload,
             wrapper_session,
         ),
-        "PostToolUse" => {
-            post_tool_use_observe_locked(state, state_dir, session_id, tool_name, payload)
-        }
+        "PostToolUse" => post_tool_use_observe_locked(
+            state,
+            state_dir,
+            session_id,
+            tool_name,
+            payload,
+            wrapper_session,
+        ),
         "Stop" | "SubagentStop" | "SessionEnd" => {
             release_claims_locked(state, state_dir, session_id)
         }
@@ -698,11 +740,12 @@ pub(crate) fn pre_tool_use_claim_locked(
 }
 
 pub(crate) fn post_tool_use_observe_locked(
-    _state: &AppState,
+    state: &AppState,
     state_dir: &Path,
     session_id: &str,
     tool_name: Option<&str>,
     payload: &serde_json::Value,
+    wrapper_session: Option<&str>,
 ) -> Result<serde_json::Value, String> {
     let tool_name = tool_name.unwrap_or("");
     let files = extract_tool_files(payload);
@@ -733,6 +776,47 @@ pub(crate) fn post_tool_use_observe_locked(
         }
     }
     write_json_file(&path, &claims)?;
+    let report_write =
+        wrapper_session.and_then(|wrapper| report_write_for_wrapper(state, wrapper, &files));
+    if let Some((wrapper, route_id, report_path)) = report_write {
+        let agent_dir = state_dir
+            .parent()
+            .unwrap_or_else(|| Path::new(".agentcall"));
+        patch_route_record_locked(
+            state,
+            agent_dir,
+            &route_id,
+            serde_json::json!({
+                "status": "report_ready",
+                "updated_at": crate::util::now_ms(),
+                "required_next_step": "accept_report_or_stop_worker",
+                "result": {
+                    "workflow_status": "report_ready",
+                    "report_ready": true,
+                    "report_path": report_path,
+                    "report_source": "hook_write"
+                }
+            }),
+        )?;
+        let _ = state.store.save_report_index(&ReportIndexRecord {
+            report_id: format!("report-{}", stable_hash_hex(report_path.as_bytes())),
+            session_id: Some(wrapper.clone()),
+            path: report_path.clone(),
+            status: "ready".to_string(),
+            updated_at: chrono::Utc::now().to_rfc3339(),
+        });
+        return Ok(serde_json::json!({
+            "allowed": true,
+            "reason": "write observed",
+            "files": files,
+            "conflicts": [],
+            "report_ready": true,
+            "report_path": report_path,
+            "report_source": "hook_write",
+            "wrapper_session": wrapper,
+            "route_id": route_id
+        }));
+    }
     Ok(
         serde_json::json!({"allowed": true, "reason": "write observed", "files": files, "conflicts": []}),
     )
@@ -977,6 +1061,12 @@ fn pty_path_policy_denial(
     payload: &serde_json::Value,
     policy: &PtyPathPolicy,
 ) -> Option<String> {
+    if tool_name == "TaskCreate" && policy.mode == "read_only" {
+        return Some(
+            "PTY path policy denies TaskCreate during read-only route; report missing context instead"
+                .to_string(),
+        );
+    }
     if is_write_tool(tool_name) {
         let files = extract_tool_files(payload);
         if files.is_empty() {
@@ -1109,6 +1199,59 @@ fn reset_policy_denials_for_wrapper_locked(
         object.remove(wrapper_session);
     }
     write_json_file(&path, &denials)
+}
+
+fn report_write_for_wrapper(
+    state: &AppState,
+    wrapper_session: &str,
+    files: &[String],
+) -> Option<(String, String, String)> {
+    let (route_id, route) = route_for_wrapper_session(state, wrapper_session)?;
+    let report_path = route_report_path(&route)?;
+    if files
+        .iter()
+        .any(|file| paths_equivalent_for_policy(&state.workspace, file, &report_path))
+    {
+        Some((wrapper_session.to_string(), route_id, report_path))
+    } else {
+        None
+    }
+}
+
+fn route_report_path(route: &serde_json::Value) -> Option<String> {
+    route
+        .get("result")
+        .and_then(|result| result.get("context_packet"))
+        .and_then(|packet| packet.get("report_path"))
+        .and_then(serde_json::Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .map(str::to_string)
+        .or_else(|| {
+            route.get("result")
+                .and_then(|result| result.get("report_path"))
+                .and_then(serde_json::Value::as_str)
+                .filter(|value| !value.trim().is_empty())
+                .map(str::to_string)
+        })
+}
+
+fn paths_equivalent_for_policy(workspace: &Path, left: &str, right: &str) -> bool {
+    normalized_route_path(workspace, left) == normalized_route_path(workspace, right)
+}
+
+fn normalized_route_path(workspace: &Path, path: &str) -> String {
+    let path = Path::new(path);
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        workspace.join(path)
+    };
+    absolute
+        .canonicalize()
+        .unwrap_or(absolute)
+        .to_string_lossy()
+        .replace('\\', "/")
+        .to_ascii_lowercase()
 }
 
 fn inject_policy_guidance_locked(
@@ -1478,6 +1621,59 @@ mod tests {
         .unwrap();
     }
 
+    fn install_pty_report_route(
+        state: &AppState,
+        wrapper_session: &str,
+        report_path: &str,
+        read_only: bool,
+    ) {
+        let path = state
+            .workspace
+            .join(".agentcall")
+            .join("state")
+            .join("routes.json");
+        let mode = if read_only {
+            "read_only"
+        } else {
+            "enforced_readonly_bash"
+        };
+        let scratch = format!(".agentcall/workspaces/{wrapper_session}");
+        let writable_paths = if read_only {
+            serde_json::json!([])
+        } else {
+            serde_json::json!([report_path, scratch])
+        };
+        write_json_file(
+            &path,
+            &serde_json::json!({
+                "route-report": {
+                    "route_id": "route-report",
+                    "recommended_runtime": "pty",
+                    "session_name": wrapper_session,
+                    "status": "started",
+                    "result": {
+                        "pty_workflow": "normal",
+                        "workflow_status": "running",
+                        "phase": "execute",
+                        "permission_mode": "auto",
+                        "context_packet": {
+                            "report_path": report_path,
+                            "allowed_paths": ["docs/reports"]
+                        },
+                        "containment": {
+                            "mode": mode,
+                            "allowed_paths": ["docs/reports"],
+                            "writable_paths": writable_paths,
+                            "scratch_path": if read_only { serde_json::Value::Null } else { serde_json::json!(scratch) },
+                            "bash_write_policy": "readonly_only"
+                        }
+                    }
+                }
+            }),
+        )
+        .unwrap();
+    }
+
     #[test]
     fn append_event_request_requires_idempotency_key() {
         let state = test_state("append-event-idempotency");
@@ -1718,6 +1914,75 @@ mod tests {
         )
         .unwrap();
         assert_eq!(result["decision"]["allowed"], true);
+    }
+
+    #[test]
+    fn pty_read_only_route_denies_task_create_drift() {
+        let state = test_state("pty-readonly-taskcreate-deny");
+        install_pty_report_route(&state, "pty-a", "docs/reports/review.md", true);
+        let result = ingest_hook(
+            &state,
+            HookIngestRequest {
+                event: "PreToolUse".to_string(),
+                payload: serde_json::json!({
+                    "session_id": "claude-a",
+                    "wrapper_session": "pty-a",
+                    "tool_name": "TaskCreate",
+                    "tool_input": {"description": "spawn reviewer"}
+                }),
+                runtime: Some("claude-code-session".to_string()),
+            },
+        )
+        .unwrap();
+        assert_eq!(result["decision"]["allowed"], false);
+        assert!(
+            result["decision"]["reason"]
+                .as_str()
+                .unwrap()
+                .contains("read-only route")
+        );
+    }
+
+    #[test]
+    fn post_tool_report_write_marks_route_and_projection_ready() {
+        let state = test_state("pty-report-ready");
+        install_pty_report_route(&state, "pty-a", "docs/reports/review.md", false);
+        let mut payload = write_payload("claude-a", "docs/reports/review.md");
+        payload["wrapper_session"] = serde_json::json!("pty-a");
+        let result = ingest_hook(
+            &state,
+            HookIngestRequest {
+                event: "PostToolUse".to_string(),
+                payload,
+                runtime: Some("claude-code-session".to_string()),
+            },
+        )
+        .unwrap();
+        assert_eq!(result["decision"]["report_ready"], true);
+        assert_eq!(result["decision"]["route_id"], "route-report");
+
+        let routes = read_json_file(
+            &state
+                .workspace
+                .join(".agentcall")
+                .join("state")
+                .join("routes.json"),
+            serde_json::json!({}),
+        );
+        assert_eq!(routes["route-report"]["status"], "report_ready");
+        assert_eq!(
+            routes["route-report"]["result"]["workflow_status"],
+            "report_ready"
+        );
+        assert_eq!(routes["route-report"]["result"]["report_ready"], true);
+
+        let projection = crate::projection::read_session_projection(&state, "pty-a").unwrap();
+        assert!(projection.report_ready);
+        assert_eq!(projection.attention_status, "report_ready");
+        assert_eq!(
+            projection.next_recommended_action,
+            "accept_report_or_stop_worker"
+        );
     }
 
     #[test]

@@ -207,6 +207,24 @@ pub(crate) fn apply_event_to_projection(
             projection.needs_attention = false;
             projection.last_progress_brief = Some(event.message.clone());
         }
+        "session.actor_failed"
+        | "session.writer_closed"
+        | "session.reader_failed"
+        | "session.orphaned" => {
+            projection.liveness_status = "failed_or_orphaned".to_string();
+            projection.attention_status = "failed".to_string();
+            projection.needs_attention = true;
+            projection.last_error_brief = Some(
+                event
+                    .payload
+                    .get("error")
+                    .and_then(Value::as_str)
+                    .unwrap_or(event.message.as_str())
+                    .to_string(),
+            );
+            projection.last_progress_brief = Some(event.message.clone());
+            projection.next_recommended_action = "stop_or_restart_worker".to_string();
+        }
         event_type if event_type.starts_with("hook.") => {
             reduce_hook_event(&mut projection, event);
             reason = "hook_event_reduced".to_string();
@@ -309,6 +327,29 @@ fn reduce_hook_event(projection: &mut SessionProjectionV1, event: &EventEnvelope
     if let Some(workspace) = event.payload.get("workspace").and_then(Value::as_str) {
         projection.workspace = workspace.to_string();
     }
+    if hook_event_marks_report_ready(event) {
+        projection.report_ready = true;
+        projection.files_written_count = projection.files_written_count.saturating_add(1).max(1);
+        projection.liveness_status = "idle".to_string();
+        projection.attention_status = "report_ready".to_string();
+        projection.needs_attention = true;
+        projection.next_recommended_action = "accept_report_or_stop_worker".to_string();
+        projection.last_progress_brief = Some("Worker wrote the requested report.".to_string());
+    }
+}
+
+fn hook_event_marks_report_ready(event: &EventEnvelopeV1) -> bool {
+    event
+        .payload
+        .get("report_ready")
+        .and_then(Value::as_bool)
+        == Some(true)
+        || event
+            .payload
+            .get("decision")
+            .and_then(|decision| decision.get("report_ready"))
+            .and_then(Value::as_bool)
+            == Some(true)
 }
 
 #[cfg(test)]
@@ -412,6 +453,45 @@ mod tests {
         assert_eq!(awaiting.projection.liveness_status, "working");
         assert_eq!(awaiting.projection.turn_status, "awaiting_observation");
         assert_eq!(awaiting.projection.attention_status, "none");
+    }
+
+    #[test]
+    fn reducer_marks_hook_written_report_ready() {
+        let event = EventEnvelopeV1 {
+            schema_version: 1,
+            event_id: "evt-1".to_string(),
+            global_seq: 1,
+            session_seq: Some(11),
+            session_id: Some("worker-a".to_string()),
+            run_id: None,
+            owner_id: None,
+            ts: "2026-06-09T00:00:00Z".to_string(),
+            source: "hook".to_string(),
+            event_type: "hook.PostToolUse".to_string(),
+            severity: "info".to_string(),
+            command_id: None,
+            idempotency_key: None,
+            trace_id: None,
+            message: "Claude Code hook received: PostToolUse".to_string(),
+            payload: serde_json::json!({
+                "status": "working",
+                "decision": {
+                    "reason": "write observed",
+                    "report_ready": true,
+                    "report_path": "reports/review.md"
+                }
+            }),
+        };
+        let update = apply_event_to_projection(None, &event);
+        assert!(update.projection.report_ready);
+        assert_eq!(update.projection.files_written_count, 1);
+        assert_eq!(update.projection.liveness_status, "idle");
+        assert_eq!(update.projection.attention_status, "report_ready");
+        assert!(update.projection.needs_attention);
+        assert_eq!(
+            update.projection.next_recommended_action,
+            "accept_report_or_stop_worker"
+        );
     }
 
     #[test]
