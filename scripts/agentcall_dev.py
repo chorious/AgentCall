@@ -78,6 +78,12 @@ def main() -> int:
     )
     real_worker.add_argument("--daemon-bin", default=None, help="Path to agentcall-daemon executable.")
     real_worker.add_argument("--keep-workspace", action="store_true", help="Keep temporary smoke workspace.")
+    real_worker.add_argument(
+        "--store-backend",
+        choices=["json", "sqlite"],
+        default="json",
+        help="Temporary daemon RuntimeStore backend.",
+    )
     real_worker.set_defaults(func=cmd_smoke_real_worker)
 
     paths = sub.add_parser("paths", help="Print resolved important local paths.")
@@ -207,6 +213,7 @@ def cmd_smoke_real_worker(root: Path, args: argparse.Namespace) -> int:
         cmd.extend(["--daemon-bin", args.daemon_bin])
     if args.keep_workspace:
         cmd.append("--keep-workspace")
+    cmd.extend(["--store-backend", args.store_backend])
     run_checked(cmd, root, "real worker PTY smoke", timeout=90)
     return 0
 

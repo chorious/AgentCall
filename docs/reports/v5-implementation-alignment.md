@@ -94,8 +94,11 @@ Current confidence: broad first pass is implemented. The main remaining risk is 
 
 2026-06-09 update:
 
-- Real-worker smoke currently covers JSON store path only.
-- SQLite backend restart/smoke parity remains open.
+- Real-worker smoke now supports both `json` and `sqlite` store backends:
+  - `python scripts\agentcall_dev.py smoke real-worker --store-backend json`
+  - `python scripts\agentcall_dev.py smoke real-worker --store-backend sqlite`
+- SQLite live route/session/projection parity is covered by smoke.
+- Daemon restart recovery parity remains open.
 
 ## Verification Already Run
 
@@ -127,6 +130,9 @@ python scripts\agentcall_arch_audit.py
 
 python scripts\agentcall_dev.py smoke real-worker
 [OK] real worker PTY smoke
+
+python scripts\agentcall_dev.py smoke real-worker --store-backend sqlite
+[OK] real worker PTY smoke
 ```
 
 ## Remaining Work Plan
@@ -148,7 +154,7 @@ python scripts\agentcall_dev.py smoke real-worker
 
 ### P1: Store Backend Hardening
 
-- Run the same smoke with `store_backend=json` and `store_backend=sqlite`.
+- Run the same smoke with `store_backend=json` and `store_backend=sqlite`. **Done for live route/session/projection path.**
 - Confirm daemon restart preserves:
   - events
   - projections

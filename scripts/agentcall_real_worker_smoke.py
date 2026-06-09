@@ -35,6 +35,12 @@ def main() -> int:
         action="store_true",
         help="Do not delete the temporary smoke workspace.",
     )
+    parser.add_argument(
+        "--store-backend",
+        choices=["json", "sqlite"],
+        default="json",
+        help="RuntimeStore backend for the temporary daemon.",
+    )
     args = parser.parse_args()
     root = Path(args.root).resolve()
     daemon_bin = Path(args.daemon_bin) if args.daemon_bin else root / "target" / "debug" / executable_name("agentcall-daemon")
@@ -43,7 +49,7 @@ def main() -> int:
     daemon_log = workspace / "daemon.log"
     try:
         ensure_daemon_binary(daemon_bin)
-        write_local_config(workspace)
+        write_local_config(workspace, args.store_backend)
         port = args.port or free_port()
         proc = start_daemon(daemon_bin, workspace, port, daemon_log)
         base_url = f"http://127.0.0.1:{port}"
@@ -68,6 +74,7 @@ def main() -> int:
             "status": "ok",
             "workspace": str(workspace),
             "base_url": base_url,
+            "store_backend": args.store_backend,
             "session_name": session_name,
             "route_id": route.get("route_id"),
             "checks": [
@@ -121,14 +128,14 @@ def ensure_daemon_binary(path: Path) -> None:
         )
 
 
-def write_local_config(workspace: Path) -> None:
+def write_local_config(workspace: Path, store_backend: str) -> None:
     config_dir = workspace / "config"
     config_dir.mkdir(parents=True, exist_ok=True)
     (config_dir / "agentcall.local.json").write_text(
         json.dumps(
             {
                 "claude_workspace": str(workspace),
-                "store_backend": "json",
+                "store_backend": store_backend,
                 "max_sessions": 3,
                 "per_owner_max_sessions": 2,
                 "experimental_sdk_runtime": False,
