@@ -144,6 +144,66 @@ impl RuntimeStore for JsonRuntimeStore {
         )
     }
 
+    fn upsert_owner_lease(&self, lease: &OwnerLease) -> Result<(), String> {
+        upsert_index_record(
+            &self
+                .agent_dir()
+                .join("state")
+                .join("owner_leases.index.json"),
+            &lease.session_id,
+            json!({
+                "lease": lease,
+                "status": format!("{:?}", lease.status),
+                "updated_at": chrono::Utc::now().to_rfc3339(),
+            }),
+        )
+    }
+
+    fn release_owner_lease(&self, session_id: &str, reason: &str) -> Result<(), String> {
+        patch_index_record(
+            &self
+                .agent_dir()
+                .join("state")
+                .join("owner_leases.index.json"),
+            session_id,
+            json!({
+                "status": "Released",
+                "released_at": chrono::Utc::now().to_rfc3339(),
+                "release_reason": reason,
+            }),
+        )
+    }
+
+    fn upsert_workspace_lease(&self, lease: &WorkspaceLease) -> Result<(), String> {
+        upsert_index_record(
+            &self
+                .agent_dir()
+                .join("state")
+                .join("workspace_leases.index.json"),
+            &lease.session_id,
+            json!({
+                "lease": lease,
+                "status": "Active",
+                "updated_at": chrono::Utc::now().to_rfc3339(),
+            }),
+        )
+    }
+
+    fn release_workspace_lease(&self, session_id: &str, reason: &str) -> Result<(), String> {
+        patch_index_record(
+            &self
+                .agent_dir()
+                .join("state")
+                .join("workspace_leases.index.json"),
+            session_id,
+            json!({
+                "status": "Released",
+                "released_at": chrono::Utc::now().to_rfc3339(),
+                "release_reason": reason,
+            }),
+        )
+    }
+
     fn renew_owner_lease(&self, lease_id: &str) -> Result<(), String> {
         append_ndjson(
             &self.agent_dir().join("state").join("lease-renewals.ndjson"),
@@ -322,6 +382,24 @@ fn upsert_index_record(path: &Path, key: &str, record: Value) -> Result<(), Stri
     let mut index = read_json_file(path, json!({}));
     if !index.is_object() {
         index = json!({});
+    }
+    index[key] = record;
+    write_json_file(path, &index)
+}
+
+fn patch_index_record(path: &Path, key: &str, patch: Value) -> Result<(), String> {
+    let mut index = read_json_file(path, json!({}));
+    if !index.is_object() {
+        index = json!({});
+    }
+    let mut record = index.get(key).cloned().unwrap_or_else(|| json!({}));
+    if !record.is_object() {
+        record = json!({});
+    }
+    if let (Some(target), Some(patch)) = (record.as_object_mut(), patch.as_object()) {
+        for (key, value) in patch {
+            target.insert(key.clone(), value.clone());
+        }
     }
     index[key] = record;
     write_json_file(path, &index)

@@ -58,6 +58,7 @@ def main() -> int:
         route = start_route(base_url, root, workspace, session_name)
         assert_eq(route.get("status"), "started_prompt_dispatched_without_hook_ack", "route status")
         assert_eq(route.get("session_name"), session_name, "route session_name")
+        verify_active_leases(workspace, args.store_backend, session_name)
         wait_for_clean_output(base_url, session_name, "AGENTCALL_FAKE_INPUT", "initial route prompt")
         send_input(base_url, session_name, "AGENTCALL_SMOKE_PING")
         wait_for_clean_output(base_url, session_name, "AGENTCALL_SMOKE_PONG", "actor send input")
@@ -83,12 +84,13 @@ def main() -> int:
             "route_id": route.get("route_id"),
             "checks": [
                 "MCP route started a real PTY runtime",
+                "RuntimeStore recorded active owner/workspace leases",
                 "route initial prompt reached fake worker",
                 "MCP session_send used actor command path",
                 "MCP session default returned projection summary without raw terminal scan",
                 "stop returned awaiting observation",
                 "compact attention board returned projection-only payload",
-                "daemon restart recovered projection/events/command record from durable state",
+                "daemon restart recovered projection/events/command/lease records from durable state",
             ],
         }, ensure_ascii=False, indent=2))
         return 0
@@ -263,6 +265,67 @@ def verify_restart_recovery(
         raise SmokeError("restart board recovery: expected persisted projection in compact board")
 
     assert_command_record(workspace, store_backend, f"smoke-send-{session_name}-AGENTCALL_SMOKE_PING")
+    assert_released_leases(workspace, store_backend, session_name)
+
+
+def verify_active_leases(workspace: Path, store_backend: str, session_name: str) -> None:
+    if store_backend == "sqlite":
+        import sqlite3
+
+        db_path = workspace / ".agentcall" / "state" / "runtime.db"
+        with sqlite3.connect(db_path) as conn:
+            owner = conn.execute(
+                "SELECT status FROM owner_leases WHERE session_id = ?",
+                (session_name,),
+            ).fetchone()
+            workspace_row = conn.execute(
+                "SELECT lease_id FROM workspace_leases WHERE session_id = ?",
+                (session_name,),
+            ).fetchone()
+        if owner is None or owner[0] != "Active":
+            raise SmokeError(f"sqlite lease recovery: expected active owner lease, got {owner!r}")
+        if workspace_row is None:
+            raise SmokeError("sqlite lease recovery: expected active workspace lease")
+        return
+
+    owner_index = read_json_file(workspace / ".agentcall" / "state" / "owner_leases.index.json")
+    workspace_index = read_json_file(
+        workspace / ".agentcall" / "state" / "workspace_leases.index.json"
+    )
+    if owner_index.get(session_name, {}).get("status") != "Active":
+        raise SmokeError("json lease recovery: expected active owner lease")
+    if workspace_index.get(session_name, {}).get("status") != "Active":
+        raise SmokeError("json lease recovery: expected active workspace lease")
+
+
+def assert_released_leases(workspace: Path, store_backend: str, session_name: str) -> None:
+    if store_backend == "sqlite":
+        import sqlite3
+
+        db_path = workspace / ".agentcall" / "state" / "runtime.db"
+        with sqlite3.connect(db_path) as conn:
+            owner = conn.execute(
+                "SELECT status FROM owner_leases WHERE session_id = ?",
+                (session_name,),
+            ).fetchone()
+            workspace_row = conn.execute(
+                "SELECT lease_id FROM workspace_leases WHERE session_id = ?",
+                (session_name,),
+            ).fetchone()
+        if owner is None or owner[0] != "Released":
+            raise SmokeError(f"sqlite lease recovery: expected released owner lease, got {owner!r}")
+        if workspace_row is not None:
+            raise SmokeError("sqlite lease recovery: expected workspace lease to be released")
+        return
+
+    owner_index = read_json_file(workspace / ".agentcall" / "state" / "owner_leases.index.json")
+    workspace_index = read_json_file(
+        workspace / ".agentcall" / "state" / "workspace_leases.index.json"
+    )
+    if owner_index.get(session_name, {}).get("status") != "Released":
+        raise SmokeError("json lease recovery: expected released owner lease")
+    if workspace_index.get(session_name, {}).get("status") != "Released":
+        raise SmokeError("json lease recovery: expected released workspace lease")
 
 
 def assert_command_record(workspace: Path, store_backend: str, idempotency_key: str) -> None:
@@ -287,6 +350,15 @@ def assert_command_record(workspace: Path, store_backend: str, idempotency_key: 
     value = json.loads(index_path.read_text(encoding="utf-8"))
     if f"codex:{idempotency_key}" not in value:
         raise SmokeError("json command recovery: expected command idempotency record")
+
+
+def read_json_file(path: Path) -> dict[str, Any]:
+    if not path.exists():
+        raise SmokeError(f"missing JSON state file: {path}")
+    value = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(value, dict):
+        raise SmokeError(f"expected object JSON state file: {path}")
+    return value
 
 
 def mcp_call(base_url: str, name: str, arguments: dict[str, Any]) -> dict[str, Any]:

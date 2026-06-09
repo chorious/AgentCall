@@ -72,6 +72,7 @@ pub(crate) fn ensure_owner_lease(
     };
     leases.insert(session_id.to_string(), lease.clone());
     persist_owner_leases(state, &leases)?;
+    state.store.upsert_owner_lease(&lease)?;
     Ok(lease)
 }
 
@@ -143,6 +144,7 @@ pub(crate) fn release_owner_lease(
     lease.status = LeaseStatus::Released;
     lease.renewed_at = chrono::Utc::now().to_rfc3339();
     persist_owner_leases(state, &leases)?;
+    state.store.release_owner_lease(session_id, reason)?;
     crate::state::append_agent_event(
         state,
         "owner_lease.released",
@@ -189,6 +191,7 @@ pub(crate) fn acquire_workspace_lease(
     };
     leases.insert(session_id.to_string(), lease.clone());
     persist_workspace_leases(state, &leases)?;
+    state.store.upsert_workspace_lease(&lease)?;
     Ok(lease)
 }
 
@@ -202,6 +205,7 @@ pub(crate) fn release_workspace_lease(
         return Ok(None);
     };
     persist_workspace_leases(state, &leases)?;
+    state.store.release_workspace_lease(session_id, reason)?;
     crate::state::append_agent_event(
         state,
         "workspace_lease.released",

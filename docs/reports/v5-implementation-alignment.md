@@ -102,6 +102,7 @@ Current confidence: broad first pass is implemented. The main remaining risk is 
   - compact attention board projection,
   - session event query,
   - command idempotency record.
+  - owner/workspace lease active and released state.
 
 ## Verification Already Run
 
@@ -163,7 +164,7 @@ python scripts\agentcall_dev.py smoke real-worker --store-backend sqlite
   - projections **covered by real-worker smoke**
   - idempotency records **covered by real-worker smoke**
   - command records **covered by real-worker smoke**
-  - leases
+  - leases **covered by real-worker smoke**
 - Add corruption/rebuild tests for command index and projection snapshot.
 
 ### P1: Scheduler and Lease Validation

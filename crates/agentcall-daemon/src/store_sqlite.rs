@@ -213,6 +213,34 @@ impl RuntimeStore for SqliteRuntimeStore {
         .map_err(|err| err.to_string())
     }
 
+    fn upsert_owner_lease(&self, lease: &OwnerLease) -> Result<(), String> {
+        upsert_owner_lease(&self.connect()?, lease)
+    }
+
+    fn release_owner_lease(&self, session_id: &str, _reason: &str) -> Result<(), String> {
+        let conn = self.connect()?;
+        conn.execute(
+            "UPDATE owner_leases SET status = 'Released', renewed_at = ?1 WHERE session_id = ?2",
+            params![chrono::Utc::now().to_rfc3339(), session_id],
+        )
+        .map(|_| ())
+        .map_err(|err| err.to_string())
+    }
+
+    fn upsert_workspace_lease(&self, lease: &WorkspaceLease) -> Result<(), String> {
+        upsert_workspace_lease(&self.connect()?, lease)
+    }
+
+    fn release_workspace_lease(&self, session_id: &str, _reason: &str) -> Result<(), String> {
+        let conn = self.connect()?;
+        conn.execute(
+            "DELETE FROM workspace_leases WHERE session_id = ?1",
+            params![session_id],
+        )
+        .map(|_| ())
+        .map_err(|err| err.to_string())
+    }
+
     fn renew_owner_lease(&self, lease_id: &str) -> Result<(), String> {
         let conn = self.connect()?;
         let now = chrono::Utc::now().to_rfc3339();

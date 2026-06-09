@@ -97,6 +97,10 @@ pub(crate) trait RuntimeStore: Send + Sync {
     fn get_idempotency(&self, owner: &str, key: &str) -> Result<Option<CommandRecord>, String>;
     fn save_report_index(&self, report: &ReportIndexRecord) -> Result<(), String>;
     fn save_artifact_index(&self, artifact: &ArtifactIndexRecord) -> Result<(), String>;
+    fn upsert_owner_lease(&self, lease: &OwnerLease) -> Result<(), String>;
+    fn release_owner_lease(&self, session_id: &str, reason: &str) -> Result<(), String>;
+    fn upsert_workspace_lease(&self, lease: &WorkspaceLease) -> Result<(), String>;
+    fn release_workspace_lease(&self, session_id: &str, reason: &str) -> Result<(), String>;
     fn renew_owner_lease(&self, lease_id: &str) -> Result<(), String>;
     fn record_file_read(&self, session_id: &str, path: &str) -> Result<(), String>;
     fn record_file_write(&self, session_id: &str, path: &str) -> Result<(), String>;
@@ -131,6 +135,10 @@ pub(crate) trait RuntimeStore: Send + Sync {
 enum StoreWriteRequest {
     SaveReportIndex(ReportIndexRecord, mpsc::Sender<Result<(), String>>),
     SaveArtifactIndex(ArtifactIndexRecord, mpsc::Sender<Result<(), String>>),
+    UpsertOwnerLease(OwnerLease, mpsc::Sender<Result<(), String>>),
+    ReleaseOwnerLease(String, String, mpsc::Sender<Result<(), String>>),
+    UpsertWorkspaceLease(WorkspaceLease, mpsc::Sender<Result<(), String>>),
+    ReleaseWorkspaceLease(String, String, mpsc::Sender<Result<(), String>>),
     RenewOwnerLease(String, mpsc::Sender<Result<(), String>>),
     RecordFileRead(String, String, mpsc::Sender<Result<(), String>>),
     RecordFileWrite(String, String, mpsc::Sender<Result<(), String>>),
@@ -212,6 +220,50 @@ impl RuntimeStore for StoreWriterRuntimeStore {
         let (tx, rx) = mpsc::channel();
         self.tx
             .send(StoreWriteRequest::SaveArtifactIndex(artifact.clone(), tx))
+            .map_err(|err| format!("store_writer_closed: {err}"))?;
+        rx.recv()
+            .map_err(|err| format!("store_writer_response_closed: {err}"))?
+    }
+
+    fn upsert_owner_lease(&self, lease: &OwnerLease) -> Result<(), String> {
+        let (tx, rx) = mpsc::channel();
+        self.tx
+            .send(StoreWriteRequest::UpsertOwnerLease(lease.clone(), tx))
+            .map_err(|err| format!("store_writer_closed: {err}"))?;
+        rx.recv()
+            .map_err(|err| format!("store_writer_response_closed: {err}"))?
+    }
+
+    fn release_owner_lease(&self, session_id: &str, reason: &str) -> Result<(), String> {
+        let (tx, rx) = mpsc::channel();
+        self.tx
+            .send(StoreWriteRequest::ReleaseOwnerLease(
+                session_id.to_string(),
+                reason.to_string(),
+                tx,
+            ))
+            .map_err(|err| format!("store_writer_closed: {err}"))?;
+        rx.recv()
+            .map_err(|err| format!("store_writer_response_closed: {err}"))?
+    }
+
+    fn upsert_workspace_lease(&self, lease: &WorkspaceLease) -> Result<(), String> {
+        let (tx, rx) = mpsc::channel();
+        self.tx
+            .send(StoreWriteRequest::UpsertWorkspaceLease(lease.clone(), tx))
+            .map_err(|err| format!("store_writer_closed: {err}"))?;
+        rx.recv()
+            .map_err(|err| format!("store_writer_response_closed: {err}"))?
+    }
+
+    fn release_workspace_lease(&self, session_id: &str, reason: &str) -> Result<(), String> {
+        let (tx, rx) = mpsc::channel();
+        self.tx
+            .send(StoreWriteRequest::ReleaseWorkspaceLease(
+                session_id.to_string(),
+                reason.to_string(),
+                tx,
+            ))
             .map_err(|err| format!("store_writer_closed: {err}"))?;
         rx.recv()
             .map_err(|err| format!("store_writer_response_closed: {err}"))?
@@ -333,6 +385,18 @@ fn store_writer_loop(inner: Arc<dyn RuntimeStore>, rx: mpsc::Receiver<StoreWrite
             }
             StoreWriteRequest::SaveArtifactIndex(artifact, reply) => {
                 let _ = reply.send(inner.save_artifact_index(&artifact));
+            }
+            StoreWriteRequest::UpsertOwnerLease(lease, reply) => {
+                let _ = reply.send(inner.upsert_owner_lease(&lease));
+            }
+            StoreWriteRequest::ReleaseOwnerLease(session_id, reason, reply) => {
+                let _ = reply.send(inner.release_owner_lease(&session_id, &reason));
+            }
+            StoreWriteRequest::UpsertWorkspaceLease(lease, reply) => {
+                let _ = reply.send(inner.upsert_workspace_lease(&lease));
+            }
+            StoreWriteRequest::ReleaseWorkspaceLease(session_id, reason, reply) => {
+                let _ = reply.send(inner.release_workspace_lease(&session_id, &reason));
             }
             StoreWriteRequest::RenewOwnerLease(lease_id, reply) => {
                 let _ = reply.send(inner.renew_owner_lease(&lease_id));
