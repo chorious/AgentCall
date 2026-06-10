@@ -218,4 +218,6 @@ This proved the first-version SOP path:
 AgentCall task -> AgentAPI HTTP -> Claude PTY -> report.md -> review.md
 ```
 
-For the active v2 direction, see `docs/v2.0-architecture.md`.
+This is historical reference material. For the archived v2 direction, see
+`docs/arch/plan/v2.0-architecture.md`; for the current architecture, see
+`docs/architecture.md`.

@@ -1,5 +1,18 @@
 # CHANGELOG
 
+## v5.3.0 - Worker Projection Gates Checkpoint
+
+- README、docs 索引、About 和 plugin manifest 更新到 v5.3 checkpoint 口径。
+- 新增 `AGENTS.md`，给 Codex / Claude Code worker / 其他 agent 提供项目协作、验证和归档规则。
+- `projection_last_session_seq` precondition 现在会在命令进入 actor 前校验，stale command 会被拒绝并记录 `command.rejected_precondition`。
+- Hook 写入 route `report_path` 会更新 route/session projection 到 `report_ready`，降低 worker 已交付但 Codex 仍继续等待的问题。
+- read-only route 默认拒绝 `TaskCreate`，避免审查 worker 漂移成实现 worker。
+- PTY writer/reader 错误会写入 projection-visible failure event。
+- Summary/MCP 热路径改用 runtime binding hot flags，减少对大 events log 的线性扫描。
+- Hook recent logs 单文件上限降到 1MB。
+- v0.x/v1.x/v2.x 历史计划归档到 `docs/arch/plan`，v5 worker review reports 收敛到 `docs/reports`。
+- 当前仍是 checkpoint：actor panic guard、control/output channel isolation、stop/kill 语义拆分等 open gates 见 `docs/reports/v5.3-closure-status.md`。
+
 ## v4.3.0 - Recent-first Logs And Stale Session Cleanup
 
 - 事件写入切到 `.agentcall/events/recent.ndjson`，并按大小轮转到 archive；board/session 默认只读 recent hot log。
