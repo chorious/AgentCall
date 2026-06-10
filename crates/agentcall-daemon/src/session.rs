@@ -392,9 +392,11 @@ pub(crate) fn resize_session(
     Ok(())
 }
 
-pub(crate) fn stop_session(state: &AppState, name: &str) -> Result<(), String> {
+pub(crate) fn request_stop_session(
+    state: &AppState,
+    name: &str,
+) -> Result<serde_json::Value, String> {
     let session = get_session(state, name).ok_or_else(|| "session not found".to_string())?;
-    let process_kill = session.process.lock().unwrap().kill_tree();
     let kill_result = session.killer.lock().unwrap().kill();
     if let Err(err) = kill_result {
         if err.raw_os_error() != Some(0) {
@@ -411,37 +413,53 @@ pub(crate) fn stop_session(state: &AppState, name: &str) -> Result<(), String> {
             "session_id": name,
             "name": name,
             "child_pid": session.child_pid,
+            "signal": "portable_pty_child_kill",
+            "lease_release": "pending_process_exit",
+        }),
+    );
+    Ok(serde_json::json!({
+        "kind": "graceful_stop",
+        "signal": "portable_pty_child_kill",
+        "lease_release": "pending_process_exit"
+    }))
+}
+
+pub(crate) fn kill_session(state: &AppState, name: &str) -> Result<serde_json::Value, String> {
+    let session = get_session(state, name).ok_or_else(|| "session not found".to_string())?;
+    let process_kill = session.process.lock().unwrap().kill_tree();
+    let kill_result = session.killer.lock().unwrap().kill();
+    if let Err(err) = kill_result {
+        if err.raw_os_error() != Some(0) {
+            return Err(err.to_string());
+        }
+    }
+    *session.status.lock().unwrap() = "killing".to_string();
+    session.updated_at.store(now_ms(), Ordering::Relaxed);
+    append_agent_event(
+        state,
+        "pty.kill_requested",
+        "PTY process tree kill requested.",
+        serde_json::json!({
+            "session_id": name,
+            "name": name,
+            "child_pid": session.child_pid,
             "process_controller": process_kill.controller,
             "cleanup_guarantee": process_kill.cleanup_guarantee,
             "fallback_used": process_kill.fallback_used,
             "process_error": process_kill.error,
+            "lease_release": "pending_process_exit",
         }),
     );
-    if let Err(err) = cleanup_wrapper_session(state, name, "stop_requested") {
-        append_agent_event(
-            state,
-            "session.cleanup_failed",
-            "Session runtime cleanup failed.",
-            serde_json::json!({"name": name, "reason": "stop_requested", "error": err}),
-        );
-    }
-    if let Err(err) = release_owner_lease(state, name, "stop_requested") {
-        append_agent_event(
-            state,
-            "owner_lease.release_failed",
-            "Owner lease release failed.",
-            serde_json::json!({"name": name, "reason": "stop_requested", "error": err}),
-        );
-    }
-    if let Err(err) = release_workspace_lease(state, name, "stop_requested") {
-        append_agent_event(
-            state,
-            "workspace_lease.release_failed",
-            "Workspace lease release failed.",
-            serde_json::json!({"name": name, "reason": "stop_requested", "error": err}),
-        );
-    }
-    Ok(())
+    Ok(serde_json::json!({
+        "kind": "hard_kill",
+        "signal": "process_tree_kill",
+        "requested": process_kill.requested,
+        "controller": process_kill.controller,
+        "cleanup_guarantee": process_kill.cleanup_guarantee,
+        "fallback_used": process_kill.fallback_used,
+        "error": process_kill.error,
+        "lease_release": "pending_process_exit"
+    }))
 }
 
 #[cfg(test)]
@@ -488,6 +506,34 @@ mod tests {
         let requested = PathBuf::from("E:/GameProject/GGMYS");
         let cwd = resolve_session_cwd(&state, &["cmd".to_string()], Some(&requested)).unwrap();
         assert_eq!(cwd, requested);
+    }
+
+    #[test]
+    fn stop_and_kill_lifecycle_requests_keep_lease_release_in_waiter() {
+        let source = include_str!("session.rs");
+        let stop_start = source
+            .find("pub(crate) fn request_stop_session")
+            .expect("request_stop_session exists");
+        let kill_start = source
+            .find("pub(crate) fn kill_session")
+            .expect("kill_session exists");
+        let waiter_start = source
+            .find("pub(crate) fn spawn_waiter")
+            .expect("spawn_waiter exists");
+        let stop_body = &source[stop_start..kill_start];
+        let kill_body = &source[kill_start..source.find("#[cfg(test)]").unwrap()];
+        let waiter_body = &source[waiter_start..stop_start];
+
+        assert!(!stop_body.contains("kill_tree("));
+        assert!(!stop_body.contains("release_owner_lease("));
+        assert!(!stop_body.contains("release_workspace_lease("));
+        assert!(!stop_body.contains("cleanup_wrapper_session("));
+        assert!(kill_body.contains("kill_tree("));
+        assert!(!kill_body.contains("release_owner_lease("));
+        assert!(!kill_body.contains("release_workspace_lease("));
+        assert!(waiter_body.contains("release_owner_lease("));
+        assert!(waiter_body.contains("release_workspace_lease("));
+        assert!(waiter_body.contains("cleanup_wrapper_session("));
     }
 }
 

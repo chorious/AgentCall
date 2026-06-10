@@ -8,14 +8,24 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 const PROTOCOL_VERSION: &str = "2024-11-05";
 const SERVER_NAME: &str = "agentcall-mcp";
 const SERVER_VERSION: &str = "3.0.0";
+pub(crate) const MAX_MCP_INPUT_LINE_BYTES: usize = 1024 * 1024;
 const TOOL_TEXT_CAP_BYTES: usize = 128 * 1024;
 const TOOL_TEXT_PREVIEW_BYTES: usize = 16 * 1024;
 
 pub(crate) fn serve(config: Config) -> io::Result<()> {
     let stdin = io::stdin();
+    let mut reader = stdin.lock();
     let mut stdout = io::stdout();
-    for line in stdin.lock().lines() {
-        let line = line?;
+    while let Some(line_result) = read_bounded_line(&mut reader)? {
+        let line = match line_result {
+            Ok(line) => line,
+            Err(message) => {
+                let response = error_response(json!(null), -32600, &message);
+                writeln!(stdout, "{}", serde_json::to_string(&response).unwrap())?;
+                stdout.flush()?;
+                continue;
+            }
+        };
         if line.trim().is_empty() {
             continue;
         }
@@ -34,6 +44,69 @@ pub(crate) fn serve(config: Config) -> io::Result<()> {
         }
     }
     Ok(())
+}
+
+fn read_bounded_line<R: BufRead>(reader: &mut R) -> io::Result<Option<Result<String, String>>> {
+    let mut buf = Vec::new();
+    loop {
+        let (take_len, found_newline, bytes) = {
+            let available = reader.fill_buf()?;
+            if available.is_empty() {
+                if buf.is_empty() {
+                    return Ok(None);
+                }
+                break;
+            }
+            let found_newline = available.iter().position(|byte| *byte == b'\n');
+            let take_len = found_newline.map(|pos| pos + 1).unwrap_or(available.len());
+            let bytes = available[..take_len].to_vec();
+            (take_len, found_newline.is_some(), bytes)
+        };
+        if buf.len().saturating_add(take_len) > MAX_MCP_INPUT_LINE_BYTES {
+            reader.consume(take_len);
+            if !found_newline {
+                drain_line(reader)?;
+            }
+            return Ok(Some(Err(format!(
+                "MCP input line exceeded {} bytes; request rejected before JSON parsing and transport remains open",
+                MAX_MCP_INPUT_LINE_BYTES
+            ))));
+        }
+        buf.extend_from_slice(&bytes);
+        reader.consume(take_len);
+        if found_newline {
+            break;
+        }
+    }
+    if matches!(buf.last(), Some(b'\n')) {
+        buf.pop();
+        if matches!(buf.last(), Some(b'\r')) {
+            buf.pop();
+        }
+    }
+    let line = String::from_utf8(buf)
+        .unwrap_or_else(|err| String::from_utf8_lossy(err.as_bytes()).into_owned());
+    Ok(Some(Ok(line)))
+}
+
+fn drain_line<R: BufRead>(reader: &mut R) -> io::Result<()> {
+    loop {
+        let (consume_len, found_newline) = {
+            let available = reader.fill_buf()?;
+            if available.is_empty() {
+                return Ok(());
+            }
+            if let Some(pos) = available.iter().position(|byte| *byte == b'\n') {
+                (pos + 1, true)
+            } else {
+                (available.len(), false)
+            }
+        };
+        reader.consume(consume_len);
+        if found_newline {
+            return Ok(());
+        }
+    }
 }
 
 fn handle_message(config: &Config, request: Value) -> Option<Value> {
@@ -212,5 +285,19 @@ mod tests {
         assert_eq!(parsed["truncated"], true);
         assert!(parsed["original_bytes"].as_u64().unwrap() > TOOL_TEXT_CAP_BYTES as u64);
         assert!(parsed["preview"].as_str().unwrap().len() <= TOOL_TEXT_PREVIEW_BYTES);
+    }
+
+    #[test]
+    fn bounded_reader_rejects_oversized_line_and_keeps_next_request() {
+        let mut input = Vec::new();
+        input.extend_from_slice(&vec![b'x'; MAX_MCP_INPUT_LINE_BYTES + 1]);
+        input.extend_from_slice(b"\n{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"ping\"}\n");
+        let mut cursor = io::Cursor::new(input);
+
+        let first = read_bounded_line(&mut cursor).unwrap().unwrap();
+        assert!(first.unwrap_err().contains("exceeded"));
+
+        let second = read_bounded_line(&mut cursor).unwrap().unwrap().unwrap();
+        assert!(second.contains("\"method\":\"ping\""));
     }
 }

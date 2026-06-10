@@ -14,6 +14,7 @@ import pytest
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
+TEST_DAEMON_TOKEN = "agentcall-test-token"
 
 
 def free_port() -> int:
@@ -44,7 +45,11 @@ def wait_for_daemon(base_url: str) -> None:
     last_error: Exception | None = None
     while time.time() < deadline:
         try:
-            with urllib.request.urlopen(f"{base_url}/api/runtime/health", timeout=1) as response:
+            request = urllib.request.Request(
+                f"{base_url}/api/runtime/health",
+                headers={"X-AgentCall-Token": TEST_DAEMON_TOKEN},
+            )
+            with urllib.request.urlopen(request, timeout=1) as response:
                 if response.status == 200:
                     return
         except Exception as exc:  # pragma: no cover - diagnostic only
@@ -54,13 +59,15 @@ def wait_for_daemon(base_url: str) -> None:
 
 
 def read_json_url(url: str) -> object:
-    with urllib.request.urlopen(url, timeout=5) as response:
+    request = urllib.request.Request(url, headers={"X-AgentCall-Token": TEST_DAEMON_TOKEN})
+    with urllib.request.urlopen(request, timeout=5) as response:
         return json.loads(response.read().decode("utf-8"))
 
 
 def run_hook_process(root: Path, base_url: str, event: str, payload: dict) -> subprocess.CompletedProcess[str]:
     env = os.environ.copy()
     env["AGENTCALL_DAEMON_URL"] = base_url
+    env["AGENTCALL_DAEMON_TOKEN"] = TEST_DAEMON_TOKEN
     env["PYTHONPATH"] = str(REPO_ROOT / "src") + os.pathsep + env.get("PYTHONPATH", "")
     return subprocess.run(
         [
@@ -96,6 +103,7 @@ def test_hook_script_daemon_first_concurrent_same_file(tmp_path, daemon_binary_p
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         text=True,
+        env={**os.environ.copy(), "AGENTCALL_DAEMON_TOKEN": TEST_DAEMON_TOKEN},
     )
     try:
         wait_for_daemon(base_url)
@@ -109,6 +117,7 @@ def test_hook_script_daemon_first_concurrent_same_file(tmp_path, daemon_binary_p
             }
             env = os.environ.copy()
             env["AGENTCALL_DAEMON_URL"] = base_url
+            env["AGENTCALL_DAEMON_TOKEN"] = TEST_DAEMON_TOKEN
             env["PYTHONPATH"] = str(REPO_ROOT / "src") + os.pathsep + env.get("PYTHONPATH", "")
             processes.append(
                 subprocess.Popen(
@@ -182,6 +191,7 @@ def test_hook_script_daemon_first_read_does_not_claim(tmp_path, daemon_binary_pa
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         text=True,
+        env={**os.environ.copy(), "AGENTCALL_DAEMON_TOKEN": TEST_DAEMON_TOKEN},
     )
     try:
         wait_for_daemon(base_url)

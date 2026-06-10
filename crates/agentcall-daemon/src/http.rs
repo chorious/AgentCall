@@ -143,6 +143,11 @@ pub(crate) fn route(request: Request, state: Arc<AppState>) -> Response {
     if request.method == "__payload_too_large" {
         return error_response(413, "payload too large");
     }
+    if path.starts_with("/api/") {
+        if let Err(response) = authorize_api_request(&request, &state) {
+            return response;
+        }
+    }
     match (request.method.as_str(), path) {
         ("GET", "/") => static_file("web/index.html"),
         ("GET", "/board") => static_file("web/board.html"),
@@ -219,6 +224,95 @@ pub(crate) fn route(request: Request, state: Arc<AppState>) -> Response {
         },
         _ => dynamic_route(request, state),
     }
+}
+
+fn authorize_api_request(request: &Request, state: &AppState) -> Result<(), Response> {
+    if !host_header_is_loopback(request) {
+        return Err(error_response(403, "host not allowed"));
+    }
+    if !origin_header_is_loopback(request) {
+        return Err(error_response(403, "origin not allowed"));
+    }
+    if state.config.dev_open_loopback.unwrap_or(false) {
+        return Ok(());
+    }
+    let expected = configured_daemon_token(state).ok_or_else(|| {
+        error_response(
+            401,
+            "daemon token is required; set daemon_token in config/agentcall.local.json or AGENTCALL_DAEMON_TOKEN",
+        )
+    })?;
+    let supplied = request_token(request);
+    if supplied.as_deref() == Some(expected.as_str()) {
+        Ok(())
+    } else {
+        Err(error_response(401, "invalid or missing daemon token"))
+    }
+}
+
+fn configured_daemon_token(state: &AppState) -> Option<String> {
+    std::env::var("AGENTCALL_DAEMON_TOKEN")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .or_else(|| {
+            state
+                .config
+                .daemon_token
+                .clone()
+                .filter(|value| !value.trim().is_empty())
+        })
+}
+
+fn request_token(request: &Request) -> Option<String> {
+    request
+        .headers
+        .get("x-agentcall-token")
+        .cloned()
+        .or_else(|| {
+            request
+                .headers
+                .get("authorization")
+                .and_then(|value| value.strip_prefix("Bearer "))
+                .map(str::to_string)
+        })
+        .or_else(|| query_params(&request.path).get("token").cloned())
+        .filter(|value| !value.trim().is_empty())
+}
+
+fn host_header_is_loopback(request: &Request) -> bool {
+    request
+        .headers
+        .get("host")
+        .map(|value| endpoint_host_is_loopback(value))
+        .unwrap_or(true)
+}
+
+fn origin_header_is_loopback(request: &Request) -> bool {
+    request
+        .headers
+        .get("origin")
+        .map(|value| value == "null" || endpoint_host_is_loopback(value))
+        .unwrap_or(true)
+}
+
+fn endpoint_host_is_loopback(value: &str) -> bool {
+    let value = value.trim().to_ascii_lowercase();
+    let without_scheme = value
+        .strip_prefix("http://")
+        .or_else(|| value.strip_prefix("https://"))
+        .unwrap_or(&value);
+    if without_scheme == "::1" {
+        return true;
+    }
+    let host = without_scheme
+        .trim_start_matches('[')
+        .split(']')
+        .next()
+        .unwrap_or(without_scheme)
+        .split(':')
+        .next()
+        .unwrap_or(without_scheme);
+    matches!(host, "localhost" | "127.0.0.1" | "::1")
 }
 
 pub(crate) fn dynamic_route(request: Request, state: Arc<AppState>) -> Response {
@@ -677,13 +771,15 @@ pub(crate) fn write_fixed(
     let reason = match status {
         200 => "OK",
         400 => "Bad Request",
+        401 => "Unauthorized",
+        403 => "Forbidden",
         413 => "Payload Too Large",
         404 => "Not Found",
         _ => "Error",
     };
     stream.write_all(
         format!(
-            "HTTP/1.1 {status} {reason}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\nAccess-Control-Allow-Origin: *\r\n\r\n",
+            "HTTP/1.1 {status} {reason}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
             body.len()
         )
         .as_bytes(),
@@ -748,4 +844,106 @@ pub(crate) fn query_params(path: &str) -> HashMap<String, String> {
             }
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::LocalConfig;
+
+    fn test_state(name: &str, config: LocalConfig) -> Arc<AppState> {
+        let root = std::env::temp_dir().join(format!(
+            "agentcall-http-{name}-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        Arc::new(AppState::new(root, config, None))
+    }
+
+    fn request(method: &str, path: &str) -> Request {
+        let mut headers = HashMap::new();
+        headers.insert("host".to_string(), "127.0.0.1:3293".to_string());
+        Request {
+            method: method.to_string(),
+            path: path.to_string(),
+            headers,
+            body: vec![],
+        }
+    }
+
+    fn fixed_status(response: Response) -> u16 {
+        match response {
+            Response::Fixed { status, .. } => status,
+            _ => panic!("expected fixed response"),
+        }
+    }
+
+    #[test]
+    fn api_requires_token_when_loopback_dev_mode_is_disabled() {
+        let state = test_state(
+            "requires-token",
+            LocalConfig {
+                daemon_token: Some("secret".to_string()),
+                dev_open_loopback: Some(false),
+                ..LocalConfig::default()
+            },
+        );
+        let response = route(request("GET", "/api/runtime/health"), Arc::clone(&state));
+        assert_eq!(fixed_status(response), 401);
+
+        let mut authed = request("GET", "/api/runtime/health");
+        authed
+            .headers
+            .insert("x-agentcall-token".to_string(), "secret".to_string());
+        let response = route(authed, Arc::clone(&state));
+        assert_eq!(fixed_status(response), 200);
+        let _ = std::fs::remove_dir_all(&state.workspace);
+    }
+
+    #[test]
+    fn api_rejects_when_token_is_not_configured() {
+        let state = test_state(
+            "missing-token",
+            LocalConfig {
+                dev_open_loopback: Some(false),
+                ..LocalConfig::default()
+            },
+        );
+        let response = route(request("GET", "/api/runtime/health"), Arc::clone(&state));
+        assert_eq!(fixed_status(response), 401);
+        let _ = std::fs::remove_dir_all(&state.workspace);
+    }
+
+    #[test]
+    fn dev_open_loopback_allows_local_api_without_token() {
+        let state = test_state(
+            "dev-open",
+            LocalConfig {
+                dev_open_loopback: Some(true),
+                ..LocalConfig::default()
+            },
+        );
+        let response = route(request("GET", "/api/runtime/health"), Arc::clone(&state));
+        assert_eq!(fixed_status(response), 200);
+        let _ = std::fs::remove_dir_all(&state.workspace);
+    }
+
+    #[test]
+    fn api_rejects_non_loopback_origin_even_with_token() {
+        let state = test_state(
+            "bad-origin",
+            LocalConfig {
+                daemon_token: Some("secret".to_string()),
+                ..LocalConfig::default()
+            },
+        );
+        let mut req = request("GET", "/api/runtime/health");
+        req.headers
+            .insert("x-agentcall-token".to_string(), "secret".to_string());
+        req.headers
+            .insert("origin".to_string(), "https://example.com".to_string());
+        let response = route(req, Arc::clone(&state));
+        assert_eq!(fixed_status(response), 403);
+        let _ = std::fs::remove_dir_all(&state.workspace);
+    }
 }

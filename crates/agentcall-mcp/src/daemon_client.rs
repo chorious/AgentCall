@@ -53,14 +53,19 @@ fn daemon_request(
     let body_text = body
         .map(|value| serde_json::to_string(&value).unwrap_or_else(|_| "{}".to_string()))
         .unwrap_or_default();
+    let token_header = config
+        .daemon_token
+        .as_ref()
+        .map(|token| format!("X-AgentCall-Token: {token}\r\n"))
+        .unwrap_or_default();
     let request = if method == "POST" {
         format!(
-            "POST {path} HTTP/1.1\r\nHost: {host}:{port}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            "POST {path} HTTP/1.1\r\nHost: {host}:{port}\r\n{token_header}Content-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
             body_text.len(),
             body_text
         )
     } else {
-        format!("GET {path} HTTP/1.1\r\nHost: {host}:{port}\r\nConnection: close\r\n\r\n")
+        format!("GET {path} HTTP/1.1\r\nHost: {host}:{port}\r\n{token_header}Connection: close\r\n\r\n")
     };
     stream
         .write_all(request.as_bytes())

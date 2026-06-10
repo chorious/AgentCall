@@ -15,6 +15,15 @@ AgentCall lets Codex supervise Claude Code PTY utility workers through a local R
 - Default state source for Codex: compact board/session projection, not raw terminal output.
 - Historical ACP/SDK plans are archived; do not revive them unless the user explicitly asks.
 
+## Frozen v5.4 Plan
+
+- Authoritative plan: `docs/v5.4-code-plan.md`.
+- The old v5.4.1/v5.4.2/v5.4.3 split drafts are superseded by the single v5.4 mainline plan.
+- Until every v5.4 acceptance criterion is complete, agents must not edit, split, rename, or replace the v5.4 plan.
+- If implementation finds new evidence, write it to `docs/reports/` or an implementation report, then fix code/tests within the frozen plan.
+- If new evidence conflicts with the frozen plan, report a blocker instead of rewriting the plan.
+- Plan changes are user-owned during the freeze; agents may only modify the plan after the user explicitly lifts the freeze.
+
 ## Important Paths
 
 - `crates/agentcall-daemon/`: daemon, HTTP API, PTY runtime, hooks, routes, projections.
@@ -113,13 +122,11 @@ git diff --check
 - Put old reviews under `docs/arch/review/`.
 - Root directory should stay focused on source entrypoints, README, CHANGELOG, config template, and build manifests.
 
-## Current v5.3 Open Gates
+## Current v5.4 Status
 
-See `docs/reports/v5.3-closure-status.md`. As of this checkpoint, these remain open:
+See `docs/reports/v5.4-implementation-closure.md`.
 
-- actor panic guard;
-- control/output channel isolation;
-- stop/interrupt priority queues;
-- graceful stop vs hard kill split;
-- orphan detection after daemon restart;
-- report accept releasing worker leases.
+- v5.4 compact MCP/session views, route short transactions, destructive preconditions, binding trust, path diagnosis, local token boundary, and path traversal checks are implemented.
+- `/api/*` requires daemon token unless `dev_open_loopback=true` is explicitly set in local config.
+- `config/agentcall.local.json` is local-only; do not commit daemon tokens.
+- Keep `docs/v5.4-code-plan.md` frozen as the authoritative plan unless the user explicitly lifts the freeze.

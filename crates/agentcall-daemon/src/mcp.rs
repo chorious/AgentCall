@@ -1,7 +1,8 @@
 use crate::actor::submit_session_command;
 use crate::commands::{CommandType, PreparedCommand, prepare_session_send_command};
 use crate::confidence::attach_confidence_to_reports;
-use crate::hooks::runtime_bindings_state;
+use crate::events::EventEnvelopeV1;
+use crate::hooks::{policy_denials_state, runtime_bindings_state};
 use crate::projection::session_projection_summary;
 use crate::routes::{
     RouteRequest, checkpoint_session, handle_route, patch_route_record, route_for_wrapper_session,
@@ -12,9 +13,16 @@ use crate::store::EventQuery;
 use crate::summary::{
     board_owner_filter, board_state, clean_session_output, session_plan_artifact, session_summary,
 };
+use crate::util::now_ms;
 use serde::Deserialize;
 use serde_json::{Value, json};
 use std::sync::Arc;
+
+const SUMMARY_VIEW_MAX_BYTES: usize = 8 * 1024;
+const TUI_VIEW_MAX_BYTES: usize = 20 * 1024;
+const EVENTS_VIEW_MAX_BYTES: usize = 48 * 1024;
+const DEBUG_VIEW_MAX_BYTES: usize = 128 * 1024;
+const STRING_PREVIEW_BYTES: usize = 160;
 
 #[derive(Deserialize)]
 pub(crate) struct McpCallRequest {
@@ -75,12 +83,14 @@ pub(crate) fn mcp_tools() -> Vec<Value> {
         }),
         json!({
             "name": "agentcall_session",
-            "description": "Return one daemon PTY session llm_summary, with optional clean output tail. Prefer summary patience_hint, last_progress_age_seconds, and attention_status over impatient raw-terminal polling.",
+            "description": "Return one daemon PTY session view. Default view=summary is compact and projection-first; use view=tui for dashboard data, view=events for compact events, and view=debug/raw only for explicit inspection.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "root": {"type": "string"},
                     "name": {"type": "string"},
+                    "view": {"type": "string", "enum": ["summary", "tui", "events", "debug", "raw"], "default": "summary"},
+                    "detail": {"type": "string", "enum": ["compact", "debug", "raw"], "default": "compact"},
                     "include": {"type": "array", "items": {"type": "string", "enum": ["summary", "clean_tail", "plan", "events", "artifacts", "policy", "metrics", "debug"]}, "default": ["summary"]},
                     "cursor": {"type": "integer", "minimum": 0},
                     "limit": {"type": "integer", "minimum": 1, "maximum": 200, "default": 50},
@@ -98,7 +108,7 @@ pub(crate) fn mcp_tools() -> Vec<Value> {
                 "properties": {
                     "root": {"type": "string"},
                     "name": {"type": "string"},
-                    "action": {"type": "string", "enum": ["send", "continue", "stop", "request_report", "revise_plan", "approve_plan", "start_auto", "select_option", "interrupt"], "default": "send"},
+                    "action": {"type": "string", "enum": ["send", "continue", "stop", "kill", "request_report", "revise_plan", "approve_plan", "start_auto", "select_option", "interrupt"], "default": "send"},
                     "text": {"type": "string"},
                     "enter": {"type": "boolean", "default": true},
                     "idempotency_key": {"type": "string"},
@@ -152,7 +162,7 @@ pub(crate) fn mcp_call(state: &Arc<AppState>, req: McpCallRequest) -> Result<Val
         json!({
             "tool": req.name,
             "status": status,
-            "arguments": args,
+            "arguments": redact_mcp_arguments(&args),
             "runtime": "daemon_mcp_bridge",
             "error": message,
         }),
@@ -182,44 +192,303 @@ fn mcp_route(state: &Arc<AppState>, args: Value) -> Result<Value, String> {
 
 fn mcp_session(state: &AppState, args: &Value) -> Result<Value, String> {
     let name = required_str(args, "name")?;
-    let summary = session_projection_summary(state, name);
     let include = string_array(args, "include");
-    let include_clean_tail = include.iter().any(|item| item == "clean_tail");
-    let include_plan = include.iter().any(|item| item == "plan");
-    let include_events = include.iter().any(|item| item == "events");
-    if include_clean_tail || include_plan || include_events {
-        let mut response = json!({
-            "summary": summary,
-        });
-        let session = if include_clean_tail || include_plan {
-            Some(get_session(state, name).ok_or_else(|| {
-                "session is not live; clean_tail/plan require an in-memory PTY session".to_string()
-            })?)
-        } else {
-            None
-        };
-        if include_clean_tail {
-            let session = session.as_ref().unwrap();
-            response["clean_tail"] = json!({
-                    "session": name,
-                    "clean_output": clean_session_output(&session),
-                    "decode_health": session.decode_health.lock().unwrap().clone()
-            });
-        }
-        if include_plan {
-            let session = session.as_ref().unwrap();
-            response["plan"] = session_plan_artifact(state, &session, true);
-        }
-        if include_events {
-            response["events"] = session_events(state, name, args)?;
-        }
-        Ok(response)
-    } else {
-        Ok(summary)
+    let view = args
+        .get("view")
+        .and_then(Value::as_str)
+        .unwrap_or_else(|| legacy_session_view(&include));
+    match view {
+        "summary" => Ok(session_summary_view(state, name)),
+        "tui" => session_tui_view(state, name, args),
+        "events" => session_events(state, name, args, false),
+        "debug" => session_debug_view(state, name, args, &include),
+        "raw" => session_events(state, name, args, true),
+        other => Err(format!("unknown session view: {other}")),
     }
 }
 
-fn session_events(state: &AppState, name: &str, args: &Value) -> Result<Value, String> {
+fn legacy_session_view(include: &[String]) -> &'static str {
+    if include
+        .iter()
+        .any(|item| matches!(item.as_str(), "clean_tail" | "plan" | "debug"))
+    {
+        "debug"
+    } else if include.iter().any(|item| item == "events") {
+        "events"
+    } else {
+        "summary"
+    }
+}
+
+fn session_summary_view(state: &AppState, name: &str) -> Value {
+    let projection = session_projection_summary(state, name);
+    let attention_status = projection
+        .get("attention_status")
+        .and_then(Value::as_str)
+        .unwrap_or("low_confidence");
+    let last_progress_brief = projection
+        .get("last_progress_brief")
+        .cloned()
+        .unwrap_or(Value::Null);
+    let value = json!({
+        "schema_version": 1,
+        "view": "summary",
+        "session": projection.get("session").cloned().unwrap_or_else(|| json!(name)),
+        "runtime": projection.get("runtime").cloned().unwrap_or_else(|| json!("unknown")),
+        "owner": projection.get("owner").cloned().unwrap_or(Value::Null),
+        "liveness": projection.get("liveness_status").cloned().unwrap_or_else(|| json!("unknown")),
+        "attention": attention_status,
+        "needs_attention": projection.get("needs_attention").cloned().unwrap_or_else(|| json!(attention_status != "none")),
+        "attention_reason": attention_reason_from_projection(&projection),
+        "last_progress": {
+            "brief": last_progress_brief,
+            "event_id": Value::Null,
+            "global_seq": projection.get("projection_last_global_seq").cloned().unwrap_or_else(|| json!(0)),
+            "session_seq": projection.get("projection_last_session_seq").cloned().unwrap_or_else(|| json!(0)),
+            "observed_at": projection.get("projection_last_updated_at").cloned().unwrap_or(Value::Null)
+        },
+        "next_action": projection.get("next_recommended_action").cloned().unwrap_or_else(|| json!("inspect_session")),
+        "report_ready": projection.get("report_ready").cloned().unwrap_or_else(|| json!(false)),
+        "projection_seq": projection.get("projection_last_session_seq").cloned().unwrap_or_else(|| json!(0)),
+        "projection_stale": projection.get("projection_stale").cloned().unwrap_or_else(|| json!(true)),
+        "workspace": projection.get("workspace").cloned().unwrap_or(Value::Null),
+        "claude_cwd": projection.get("claude_cwd").cloned().unwrap_or(Value::Null),
+        "warnings": projection.get("warnings").cloned().unwrap_or_else(|| json!([]))
+    });
+    attach_budget(
+        value,
+        "summary",
+        SUMMARY_VIEW_MAX_BYTES,
+        json!({
+            "raw_events": true,
+            "tool_outputs": true,
+            "tool_inputs": true,
+            "terminal_tail": true
+        }),
+    )
+}
+
+fn session_tui_view(state: &AppState, name: &str, args: &Value) -> Result<Value, String> {
+    let projection = session_projection_summary(state, name);
+    let attention = projection
+        .get("attention_status")
+        .and_then(Value::as_str)
+        .unwrap_or("low_confidence");
+    let liveness = projection
+        .get("liveness_status")
+        .and_then(Value::as_str)
+        .unwrap_or("unknown");
+    let events = recent_compact_events(state, name, args, 12)?;
+    let policy_block = policy_denials_state(state)
+        .get(name)
+        .cloned()
+        .unwrap_or(Value::Null);
+    let route = route_for_wrapper_session(state, name).map(|(_route_id, route)| route);
+    let bindings = runtime_bindings_state(state);
+    let binding = bindings.get(name);
+    let containment = route
+        .as_ref()
+        .and_then(|route| route.get("result"))
+        .and_then(|result| result.get("containment"))
+        .cloned()
+        .unwrap_or_else(|| json!({}));
+    let route_status = route
+        .as_ref()
+        .map(effective_route_status)
+        .unwrap_or(Value::Null);
+    let prompt_status = route
+        .as_ref()
+        .map(route_prompt_status)
+        .unwrap_or(Value::Null);
+    let current_blocker = current_blocker_from_projection(&projection, &policy_block);
+    let value = json!({
+        "schema_version": 1,
+        "view": "tui",
+        "session": name,
+        "header": {
+            "title": name,
+            "runtime": projection.get("runtime").cloned().unwrap_or_else(|| json!("unknown")),
+            "liveness": liveness,
+            "attention": attention,
+            "phase": route.as_ref().and_then(|route| route.pointer("/result/phase")).cloned().unwrap_or_else(|| json!("execute")),
+            "age": {
+                "last_event_seconds": projection.get("last_progress_age_seconds").cloned().unwrap_or_else(|| json!(0)),
+                "last_progress_seconds": projection.get("last_progress_age_seconds").cloned().unwrap_or_else(|| json!(0))
+            }
+        },
+        "status": {
+            "liveness": liveness,
+            "attention": attention,
+            "needs_attention": projection.get("needs_attention").cloned().unwrap_or_else(|| json!(attention != "none")),
+            "turn_status": projection.get("turn_status").cloned().unwrap_or_else(|| json!("unknown")),
+            "patience": projection.get("patience_status").cloned().unwrap_or_else(|| json!("unknown")),
+            "report_ready": projection.get("report_ready").cloned().unwrap_or_else(|| json!(false)),
+            "route_status": route_status,
+            "prompt": prompt_status,
+            "binding": {
+                "trusted": binding_is_trusted_value(binding),
+                "source": binding.and_then(|binding| binding.get("binding_source")).cloned().unwrap_or_else(|| json!("unbound")),
+                "last_hook": binding.and_then(|binding| binding.get("last_hook_event")).cloned().unwrap_or(Value::Null),
+                "seen_hooks": binding.and_then(|binding| binding.get("seen_hooks")).cloned().unwrap_or_else(|| json!({}))
+            }
+        },
+        "paths": {
+            "process_cwd": projection.get("claude_cwd").cloned().unwrap_or(Value::Null),
+            "target_workspace": projection.get("workspace").cloned().unwrap_or(Value::Null),
+            "scratch_root": containment.get("scratch_root").or_else(|| containment.get("scratch_path")).cloned().unwrap_or(Value::Null),
+            "report_path": route.as_ref().and_then(|route| route.pointer("/result/context_packet/report_path")).cloned().unwrap_or(Value::Null),
+            "writable_roots": containment.get("writable_roots").or_else(|| containment.get("writable_paths")).cloned().unwrap_or_else(|| json!([])),
+            "containment": containment
+        },
+        "activity": events.get("events").cloned().unwrap_or_else(|| json!([])),
+        "current_blocker": current_blocker,
+        "next_action": {
+            "kind": projection.get("next_recommended_action").cloned().unwrap_or_else(|| json!("inspect_session")),
+            "safe_to_wait": attention == "none",
+            "recommended_tool": if attention == "none" { "agentcall_session" } else { "agentcall_session_send" },
+            "recommended_args": if attention == "none" {
+                json!({"view": "summary"})
+            } else {
+                json!({"action": "interrupt"})
+            }
+        },
+        "counters": {
+            "files_written": projection.get("files_written_count").cloned().unwrap_or_else(|| json!(0)),
+            "activity_items": events.get("event_count").cloned().unwrap_or_else(|| json!(0))
+        },
+        "cursors": {
+            "event": events.get("next_cursor").cloned().unwrap_or_else(|| json!(0)),
+            "session": projection.get("projection_last_session_seq").cloned().unwrap_or_else(|| json!(0))
+        },
+        "debug_refs": {
+            "events_view": {"view": "events", "cursor": events.get("cursor").cloned().unwrap_or_else(|| json!(0))},
+            "raw_view": {"view": "raw"}
+        }
+    });
+    Ok(attach_budget(
+        value,
+        "tui",
+        TUI_VIEW_MAX_BYTES,
+        json!({
+            "raw_events": true,
+            "tool_outputs": true,
+            "tool_inputs": true,
+            "terminal_tail": true
+        }),
+    ))
+}
+
+fn effective_route_status(route: &Value) -> Value {
+    let status = route
+        .get("status")
+        .and_then(Value::as_str)
+        .unwrap_or("unknown");
+    if status == "started_pending_prompt_ack" && route_prompt_ack_missing(route) {
+        return json!("prompt_ack_missing");
+    }
+    json!(status)
+}
+
+fn route_prompt_status(route: &Value) -> Value {
+    let prompt = route
+        .pointer("/result/prompt")
+        .or_else(|| route.pointer("/result/prompt_gate"));
+    let acknowledged = prompt
+        .and_then(|prompt| prompt.get("acknowledged"))
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let ack_expected = prompt
+        .and_then(|prompt| prompt.get("ack_expected"))
+        .or_else(|| prompt.and_then(|prompt| prompt.get("expected_hook")))
+        .cloned()
+        .unwrap_or(Value::Null);
+    json!({
+        "acknowledged": acknowledged,
+        "ack_expected": ack_expected,
+        "ack_missing": route_prompt_ack_missing(route),
+        "deadline_hint_seconds": prompt
+            .and_then(|prompt| prompt.get("ack_deadline_hint_seconds"))
+            .and_then(Value::as_u64)
+            .unwrap_or(0)
+    })
+}
+
+fn route_prompt_ack_missing(route: &Value) -> bool {
+    let status = route.get("status").and_then(Value::as_str).unwrap_or("");
+    if status != "started_pending_prompt_ack" {
+        return false;
+    }
+    let prompt = route
+        .pointer("/result/prompt")
+        .or_else(|| route.pointer("/result/prompt_gate"));
+    if prompt
+        .and_then(|prompt| prompt.get("acknowledged"))
+        .and_then(Value::as_bool)
+        == Some(true)
+    {
+        return false;
+    }
+    let deadline_seconds = prompt
+        .and_then(|prompt| prompt.get("ack_deadline_hint_seconds"))
+        .and_then(Value::as_u64)
+        .unwrap_or(15);
+    let Some(created_at) = route.get("created_at").and_then(Value::as_u64) else {
+        return false;
+    };
+    now_ms().saturating_sub(created_at) > deadline_seconds.saturating_mul(1000)
+}
+
+fn session_debug_view(
+    state: &AppState,
+    name: &str,
+    args: &Value,
+    include: &[String],
+) -> Result<Value, String> {
+    let wants_clean_tail = include.iter().any(|item| item == "clean_tail")
+        || args.get("detail").and_then(Value::as_str) == Some("debug");
+    let wants_plan = include.iter().any(|item| item == "plan");
+    let wants_events = include.iter().any(|item| item == "events");
+    let mut response = json!({
+        "schema_version": 1,
+        "view": "debug",
+        "summary": session_summary_view(state, name),
+    });
+    let session = if wants_clean_tail || wants_plan {
+        Some(get_session(state, name).ok_or_else(|| {
+            "session is not live; clean_tail/plan require an in-memory PTY session".to_string()
+        })?)
+    } else {
+        None
+    };
+    if wants_clean_tail {
+        let session = session.as_ref().unwrap();
+        response["clean_tail"] = json!({
+                "session": name,
+                "clean_output": clean_session_output(session),
+                "decode_health": session.decode_health.lock().unwrap().clone()
+        });
+    }
+    if wants_plan {
+        let session = session.as_ref().unwrap();
+        response["plan"] = session_plan_artifact(state, session, true);
+    }
+    if wants_events {
+        response["events"] = session_events(state, name, args, false)?;
+    }
+    Ok(attach_budget(
+        response,
+        "debug",
+        DEBUG_VIEW_MAX_BYTES,
+        json!({}),
+    ))
+}
+
+fn session_events(
+    state: &AppState,
+    name: &str,
+    args: &Value,
+    include_raw: bool,
+) -> Result<Value, String> {
     let limit = args
         .get("limit")
         .and_then(Value::as_u64)
@@ -239,27 +508,484 @@ fn session_events(state: &AppState, name: &str, args: &Value) -> Result<Value, S
         .unwrap_or_else(|| cursor.unwrap_or(0));
     let values: Vec<Value> = events
         .iter()
-        .map(|event| {
-            json!({
-                "event_id": event.event_id,
-                "global_seq": event.global_seq,
-                "session_seq": event.session_seq,
-                "event_type": event.event_type,
-                "severity": event.severity,
-                "ts": event.ts,
-                "message": event.message,
-                "data": event.payload,
-            })
-        })
+        .map(|event| compact_event(event, include_raw))
         .collect();
-    Ok(json!({
+    let value = json!({
+        "schema_version": 1,
+        "view": if include_raw { "raw" } else { "events" },
         "session": name,
         "cursor": cursor.unwrap_or(0),
         "next_cursor": next_cursor,
         "limit": limit,
         "event_count": values.len(),
         "events": values,
-    }))
+    });
+    Ok(attach_budget(
+        value,
+        if include_raw { "raw" } else { "events" },
+        if include_raw {
+            DEBUG_VIEW_MAX_BYTES
+        } else {
+            EVENTS_VIEW_MAX_BYTES
+        },
+        json!({
+            "raw_events": !include_raw,
+            "tool_outputs": !include_raw,
+            "tool_inputs": !include_raw,
+            "terminal_tail": true
+        }),
+    ))
+}
+
+fn recent_compact_events(
+    state: &AppState,
+    name: &str,
+    args: &Value,
+    default_limit: usize,
+) -> Result<Value, String> {
+    let mut args = args.clone();
+    args["limit"] = json!(
+        args.get("limit")
+            .and_then(Value::as_u64)
+            .unwrap_or(default_limit as u64)
+    );
+    session_events(state, name, &args, false)
+}
+
+fn attention_reason_from_projection(projection: &Value) -> Value {
+    projection
+        .get("last_error_brief")
+        .filter(|value| !value.is_null())
+        .cloned()
+        .or_else(|| projection.get("last_progress_brief").cloned())
+        .unwrap_or(Value::Null)
+}
+
+fn binding_is_trusted_value(binding: Option<&Value>) -> bool {
+    binding
+        .and_then(|binding| binding.get("binding_source"))
+        .and_then(Value::as_str)
+        .is_some_and(|source| matches!(source, "env" | "known_session"))
+}
+
+fn current_blocker_from_projection(projection: &Value, policy_block: &Value) -> Value {
+    if policy_block
+        .get("active")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+    {
+        return json!({
+            "kind": "policy",
+            "severity": "warning",
+            "reason": policy_block.get("reason").cloned().unwrap_or_else(|| json!("policy denial loop")),
+            "tool": policy_block.get("tool_name").cloned().unwrap_or(Value::Null),
+            "target": policy_block.get("target").cloned().unwrap_or(Value::Null),
+            "repeat_count": policy_block.get("repeat_count").cloned().unwrap_or_else(|| json!(1)),
+            "recommended_action": "fix_path_policy_or_interrupt",
+            "path_diagnosis": policy_block.get("path_diagnosis").cloned().unwrap_or(Value::Null)
+        });
+    }
+    let attention = projection
+        .get("attention_status")
+        .and_then(Value::as_str)
+        .unwrap_or("none");
+    if attention == "none" {
+        return Value::Null;
+    }
+    json!({
+        "kind": attention,
+        "severity": if matches!(attention, "failed" | "terminal") { "critical" } else { "warning" },
+        "reason": attention_reason_from_projection(projection),
+        "recommended_action": projection.get("next_recommended_action").cloned().unwrap_or_else(|| json!("inspect_session"))
+    })
+}
+
+fn compact_event(event: &EventEnvelopeV1, include_raw: bool) -> Value {
+    let tool = event.payload.get("tool_name").and_then(Value::as_str);
+    let kind = compact_event_kind(event, tool);
+    let actionability = compact_actionability(&kind, &event.severity);
+    let target = compact_event_target(event);
+    let mut value = json!({
+        "event_id": event.event_id,
+        "global_seq": event.global_seq,
+        "session_seq": event.session_seq,
+        "event_type": event.event_type,
+        "kind": kind,
+        "severity": event.severity,
+        "actionability": actionability,
+        "ts": event.ts,
+        "summary": compact_event_summary(event, tool, target.as_deref()),
+        "tool": tool,
+        "target": target,
+        "raw_ref": event.event_id
+    });
+    if let Some((stdout_lines, stderr_lines)) = tool_output_line_counts(&event.payload) {
+        value["output"] = json!({
+            "stdout_lines": stdout_lines,
+            "stderr_lines": stderr_lines,
+            "artifact_ref": format!("{}:tool_response", event.event_id)
+        });
+    }
+    if include_raw {
+        value["data"] = event.payload.clone();
+    }
+    value
+}
+
+fn compact_event_kind(event: &EventEnvelopeV1, tool: Option<&str>) -> String {
+    let decision_allowed = event
+        .payload
+        .get("decision")
+        .and_then(|decision| decision.get("allowed"))
+        .and_then(Value::as_bool);
+    if decision_allowed == Some(false) || event.event_type.contains("denied") {
+        return match tool.unwrap_or("") {
+            "Write" | "Edit" | "MultiEdit" => "denied_write",
+            "Bash" => "denied_bash",
+            _ => "policy_denial",
+        }
+        .to_string();
+    }
+    match event.event_type.as_str() {
+        "hook.UserPromptSubmit" => "prompt_submitted",
+        "hook.PreToolUse" => "tool_start",
+        "hook.PostToolUse" | "hook.PostToolBatch" => "tool_output",
+        "pty.session_started" | "session.started" | "process.started" => "session_started",
+        "process.exited" | "pty.session_ended" => "session_ended",
+        "session.actor_failed"
+        | "session.writer_failed"
+        | "session.writer_closed"
+        | "session.reader_failed" => "session_failed",
+        event_type if event_type.contains("report") => "report_ready",
+        _ => "event",
+    }
+    .to_string()
+}
+
+fn compact_actionability(kind: &str, severity: &str) -> &'static str {
+    match kind {
+        "session_failed" => "terminal",
+        "denied_write" | "denied_bash" | "policy_denial" | "report_ready" => "requires_supervisor",
+        "tool_start" | "tool_output" | "prompt_submitted" => "observe",
+        _ if matches!(severity, "critical" | "error") => "terminal",
+        _ if severity == "warning" => "requires_supervisor",
+        _ => "none",
+    }
+}
+
+fn compact_event_target(event: &EventEnvelopeV1) -> Option<String> {
+    let candidates = [
+        "/tool_input/file_path",
+        "/tool_input/path",
+        "/tool_input/target",
+        "/decision/path",
+        "/decision/target",
+        "/path",
+        "/target",
+    ];
+    for pointer in candidates {
+        if let Some(value) = event.payload.pointer(pointer).and_then(Value::as_str) {
+            return Some(truncate_utf8_owned(value, STRING_PREVIEW_BYTES));
+        }
+    }
+    if let Some(command) = event
+        .payload
+        .pointer("/tool_input/command")
+        .and_then(Value::as_str)
+    {
+        return Some(truncate_utf8_owned(command, STRING_PREVIEW_BYTES));
+    }
+    event
+        .payload
+        .pointer("/decision/files/0")
+        .and_then(Value::as_str)
+        .map(|value| truncate_utf8_owned(value, STRING_PREVIEW_BYTES))
+}
+
+fn compact_event_summary(
+    event: &EventEnvelopeV1,
+    tool: Option<&str>,
+    target: Option<&str>,
+) -> String {
+    let kind = compact_event_kind(event, tool);
+    match kind.as_str() {
+        "denied_write" => format!(
+            "Write denied{}",
+            target.map(|value| format!(": {value}")).unwrap_or_default()
+        ),
+        "denied_bash" => "Bash denied by policy".to_string(),
+        "prompt_submitted" => {
+            let chars = event
+                .payload
+                .get("prompt")
+                .or_else(|| event.payload.get("text"))
+                .and_then(Value::as_str)
+                .map(|text| text.chars().count())
+                .unwrap_or(0);
+            format!("Prompt submitted, {chars} chars")
+        }
+        "tool_output" => format!("{} completed", tool.unwrap_or("Tool")),
+        "tool_start" => format!("{} started", tool.unwrap_or("Tool")),
+        _ => truncate_utf8_owned(&event.message, STRING_PREVIEW_BYTES),
+    }
+}
+
+fn tool_output_line_counts(payload: &Value) -> Option<(usize, usize)> {
+    let response = payload
+        .get("tool_response")
+        .or_else(|| payload.get("response"))
+        .or_else(|| payload.get("output"))?;
+    let stdout = response
+        .get("stdout")
+        .or_else(|| response.get("content"))
+        .and_then(Value::as_str)
+        .map(str::lines)
+        .map(Iterator::count)
+        .unwrap_or(0);
+    let stderr = response
+        .get("stderr")
+        .and_then(Value::as_str)
+        .map(str::lines)
+        .map(Iterator::count)
+        .unwrap_or(0);
+    Some((stdout, stderr))
+}
+
+const BUDGET_METADATA_RESERVE_BYTES: usize = 768;
+
+fn attach_budget(mut value: Value, view: &str, max_bytes: usize, mut omitted: Value) -> Value {
+    let original_bytes = json_size(&value);
+    let compact_view = matches!(view, "summary" | "tui" | "events");
+    let mut trimmed_for_budget = false;
+    if compact_view && original_bytes > max_bytes {
+        trimmed_for_budget = enforce_json_budget(
+            &mut value,
+            max_bytes.saturating_sub(BUDGET_METADATA_RESERVE_BYTES),
+            &mut omitted,
+        );
+    }
+    insert_budget(
+        &mut value,
+        view,
+        max_bytes,
+        original_bytes,
+        trimmed_for_budget,
+        omitted.clone(),
+    );
+    if compact_view && json_size(&value) > max_bytes {
+        if let Some(object) = value.as_object_mut() {
+            object.remove("budget");
+        }
+        trimmed_for_budget |= enforce_json_budget(
+            &mut value,
+            max_bytes.saturating_sub(BUDGET_METADATA_RESERVE_BYTES * 2),
+            &mut omitted,
+        );
+        insert_budget(
+            &mut value,
+            view,
+            max_bytes,
+            original_bytes,
+            trimmed_for_budget,
+            omitted,
+        );
+    }
+    if compact_view && json_size(&value) > max_bytes {
+        value = json!({
+            "schema_version": 1,
+            "view": view,
+            "budget_notice": "compact view exceeded hard cap after trimming; use view=debug/raw for full diagnostics"
+        });
+        insert_budget(
+            &mut value,
+            view,
+            max_bytes,
+            original_bytes,
+            true,
+            json!({"compact_payload": true}),
+        );
+    }
+    value
+}
+
+fn insert_budget(
+    value: &mut Value,
+    view: &str,
+    max_bytes: usize,
+    original_bytes: usize,
+    trimmed_for_budget: bool,
+    omitted: Value,
+) {
+    let estimated_bytes = json_size(value);
+    if let Some(object) = value.as_object_mut() {
+        object.insert(
+            "budget".to_string(),
+            json!({
+                "view": view,
+                "max_bytes": max_bytes,
+                "original_bytes": original_bytes,
+                "estimated_bytes": estimated_bytes,
+                "response_bytes": Value::Null,
+                "truncated": trimmed_for_budget || original_bytes > estimated_bytes,
+                "hard_cap_enforced": matches!(view, "summary" | "tui" | "events"),
+                "omitted": omitted
+            }),
+        );
+        let response_bytes = json_size(&Value::Object(object.clone()));
+        if let Some(budget) = object.get_mut("budget") {
+            budget["response_bytes"] = json!(response_bytes);
+            budget["truncated"] = json!(
+                budget
+                    .get("truncated")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false)
+                    || response_bytes > max_bytes
+            );
+        }
+    }
+}
+
+fn json_size(value: &Value) -> usize {
+    serde_json::to_string(value)
+        .map(|text| text.len())
+        .unwrap_or(0)
+}
+
+fn enforce_json_budget(value: &mut Value, cap_bytes: usize, omitted: &mut Value) -> bool {
+    let mut changed = false;
+    let mut guard = 0;
+    while json_size(value) > cap_bytes && guard < 4096 {
+        guard += 1;
+        if trim_first_array_item(value) {
+            increment_omitted_counter(omitted, "budget_trimmed_items");
+            changed = true;
+            continue;
+        }
+        if trim_first_long_string(value) {
+            increment_omitted_counter(omitted, "budget_trimmed_strings");
+            changed = true;
+            continue;
+        }
+        break;
+    }
+    changed
+}
+
+fn trim_first_array_item(value: &mut Value) -> bool {
+    match value {
+        Value::Object(map) => {
+            for (key, child) in map.iter_mut() {
+                if key == "budget" {
+                    continue;
+                }
+                if let Value::Array(items) = child {
+                    if !items.is_empty() {
+                        items.pop();
+                        return true;
+                    }
+                }
+                if trim_first_array_item(child) {
+                    return true;
+                }
+            }
+            false
+        }
+        Value::Array(items) => {
+            if !items.is_empty() {
+                items.pop();
+                return true;
+            }
+            false
+        }
+        _ => false,
+    }
+}
+
+fn trim_first_long_string(value: &mut Value) -> bool {
+    match value {
+        Value::Object(map) => {
+            for (key, child) in map.iter_mut() {
+                if key == "budget" {
+                    continue;
+                }
+                if trim_first_long_string(child) {
+                    return true;
+                }
+            }
+            false
+        }
+        Value::Array(items) => {
+            for child in items {
+                if trim_first_long_string(child) {
+                    return true;
+                }
+            }
+            false
+        }
+        Value::String(text) if text.len() > STRING_PREVIEW_BYTES => {
+            *text = format!(
+                "{}...[budget trimmed]",
+                truncate_utf8_owned(text, STRING_PREVIEW_BYTES)
+            );
+            true
+        }
+        _ => false,
+    }
+}
+
+fn increment_omitted_counter(omitted: &mut Value, key: &str) {
+    if !omitted.is_object() {
+        *omitted = json!({});
+    }
+    let next = omitted.get(key).and_then(Value::as_u64).unwrap_or(0) + 1;
+    omitted[key] = json!(next);
+}
+
+fn redact_mcp_arguments(value: &Value) -> Value {
+    redact_value(value, None)
+}
+
+fn redact_value(value: &Value, key: Option<&str>) -> Value {
+    match value {
+        Value::Object(map) => {
+            let mut redacted = serde_json::Map::new();
+            for (child_key, child_value) in map {
+                redacted.insert(
+                    child_key.clone(),
+                    redact_value(child_value, Some(child_key)),
+                );
+            }
+            Value::Object(redacted)
+        }
+        Value::Array(items) => {
+            Value::Array(items.iter().map(|item| redact_value(item, key)).collect())
+        }
+        Value::String(text) if should_redact_string(key, text) => json!({
+            "redacted": true,
+            "chars": text.chars().count(),
+            "preview": truncate_utf8_owned(text, STRING_PREVIEW_BYTES)
+        }),
+        _ => value.clone(),
+    }
+}
+
+fn should_redact_string(key: Option<&str>, text: &str) -> bool {
+    let key = key.unwrap_or("").to_ascii_lowercase();
+    matches!(
+        key.as_str(),
+        "objective" | "text" | "prompt" | "content" | "tool_input" | "command"
+    ) || text.len() > 1024
+}
+
+fn truncate_utf8_owned(text: &str, cap_bytes: usize) -> String {
+    if text.len() <= cap_bytes {
+        return text.to_string();
+    }
+    let mut end = cap_bytes;
+    while end > 0 && !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    text[..end].to_string()
 }
 
 fn mcp_session_send(state: &AppState, args: &Value) -> Result<Value, String> {
@@ -269,10 +995,7 @@ fn mcp_session_send(state: &AppState, args: &Value) -> Result<Value, String> {
         PreparedCommand::Submit(command) => command,
         PreparedCommand::Deduped(value) => return Ok(value),
     };
-    if action == "stop" {
-        return submit_session_command(state, name, command);
-    }
-    if action == "interrupt" {
+    if action == "stop" || action == "kill" || action == "interrupt" {
         return submit_session_command(state, name, command);
     }
     if action == "approve_plan" || action == "start_auto" {
@@ -638,6 +1361,7 @@ mod tests {
             &state,
             "worker-a",
             &json!({"cursor": 0, "limit": 10, "event_types": ["hook.Notification"]}),
+            false,
         )
         .unwrap();
         assert_eq!(events["event_count"], 1);
@@ -661,17 +1385,267 @@ mod tests {
         );
 
         let summary = mcp_session(&state, &json!({"name": "worker-a"})).unwrap();
-        assert_eq!(summary["projection_only"], true);
+        assert_eq!(summary["view"], "summary");
         assert_eq!(summary["projection_stale"], false);
-        assert_eq!(summary["attention_status"], "needs_permission");
+        assert_eq!(summary["attention"], "needs_permission");
+        assert!(summary.get("clean_tail").is_none());
+        assert!(summary.get("events").is_none());
+        assert_eq!(summary["budget"]["view"], "summary");
+
+        let summary_ignores_debug_include = mcp_session(
+            &state,
+            &json!({"name": "worker-a", "view": "summary", "include": ["clean_tail", "events"]}),
+        )
+        .unwrap();
+        assert_eq!(summary_ignores_debug_include["view"], "summary");
+        assert!(summary_ignores_debug_include.get("clean_tail").is_none());
+        assert!(summary_ignores_debug_include.get("events").is_none());
 
         let err = mcp_session(
             &state,
-            &json!({"name": "worker-a", "include": ["clean_tail"]}),
+            &json!({"name": "worker-a", "view": "debug", "include": ["clean_tail"]}),
         )
         .unwrap_err();
         assert!(err.contains("session is not live"));
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn session_events_are_compact_unless_raw_view_requested() {
+        let root = std::env::temp_dir().join(format!(
+            "agentcall-mcp-session-events-compact-{}",
+            std::process::id()
+        ));
+        let state = AppState::test(root.clone());
+        append_agent_event(
+            &state,
+            "hook.UserPromptSubmit",
+            "prompt",
+            json!({
+                "wrapper_session": "worker-a",
+                "prompt": "please do a long and private task".repeat(20)
+            }),
+        );
+        append_agent_event(
+            &state,
+            "hook.PreToolUse",
+            "write denied",
+            json!({
+                "wrapper_session": "worker-a",
+                "tool_name": "Write",
+                "tool_input": {
+                    "file_path": "src/lib.rs",
+                    "content": "secret source content".repeat(20)
+                },
+                "decision": {"allowed": false, "reason": "denied"}
+            }),
+        );
+
+        let events = mcp_session(&state, &json!({"name": "worker-a", "view": "events"})).unwrap();
+        assert_eq!(events["view"], "events");
+        assert_eq!(events["events"][1]["kind"], "denied_write");
+        assert_eq!(events["events"][1]["actionability"], "requires_supervisor");
+        assert!(events["events"][0].get("data").is_none());
+        assert!(events["events"][1].get("data").is_none());
+        let rendered = serde_json::to_string(&events).unwrap();
+        assert!(!rendered.contains("secret source content"));
+        assert!(!rendered.contains("private task"));
+
+        let raw = mcp_session(&state, &json!({"name": "worker-a", "view": "raw"})).unwrap();
+        assert_eq!(raw["view"], "raw");
+        assert!(raw["events"][0].get("data").is_some());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn compact_events_view_enforces_hard_budget() {
+        let root = std::env::temp_dir().join(format!(
+            "agentcall-mcp-session-events-budget-{}",
+            std::process::id()
+        ));
+        let state = AppState::test(root.clone());
+        for idx in 0..240 {
+            append_agent_event(
+                &state,
+                "hook.PostToolUse",
+                "tool output ".repeat(80).as_str(),
+                json!({
+                    "wrapper_session": "worker-a",
+                    "tool_name": "Read",
+                    "tool_response": {
+                        "stdout": format!("line {idx}\n").repeat(80)
+                    }
+                }),
+            );
+        }
+
+        let events = mcp_session(
+            &state,
+            &json!({"name": "worker-a", "view": "events", "limit": 200}),
+        )
+        .unwrap();
+        let rendered = serde_json::to_string(&events).unwrap();
+        assert!(
+            rendered.len() <= EVENTS_VIEW_MAX_BYTES,
+            "events view exceeded hard cap: {}",
+            rendered.len()
+        );
+        assert_eq!(events["budget"]["hard_cap_enforced"], true);
+        assert_eq!(events["budget"]["truncated"], true);
+        assert!(
+            events["budget"]["omitted"]["budget_trimmed_items"]
+                .as_u64()
+                .unwrap()
+                > 0
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn tui_view_ignores_legacy_raw_includes() {
+        let root = std::env::temp_dir().join(format!(
+            "agentcall-mcp-session-tui-contract-{}",
+            std::process::id()
+        ));
+        let state = AppState::test(root.clone());
+        append_agent_event(
+            &state,
+            "hook.PreToolUse",
+            "write denied",
+            json!({
+                "wrapper_session": "worker-a",
+                "tool_name": "Write",
+                "tool_input": {
+                    "file_path": "src/lib.rs",
+                    "content": "secret source content".repeat(20)
+                },
+                "decision": {"allowed": false, "reason": "denied"}
+            }),
+        );
+
+        let tui = mcp_session(
+            &state,
+            &json!({"name": "worker-a", "view": "tui", "include": ["clean_tail", "events"]}),
+        )
+        .unwrap();
+        assert_eq!(tui["view"], "tui");
+        assert!(tui.get("clean_tail").is_none());
+        assert!(tui.get("events").is_none());
+        assert!(tui.get("data").is_none());
+        let rendered = serde_json::to_string(&tui).unwrap();
+        assert!(!rendered.contains("secret source content"));
+        assert_eq!(tui["current_blocker"]["kind"], "blocked_by_policy");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn tui_view_enforces_hard_budget_when_route_paths_are_noisy() {
+        let root = std::env::temp_dir().join(format!(
+            "agentcall-mcp-session-tui-budget-{}",
+            std::process::id()
+        ));
+        let state = AppState::test(root.clone());
+        let state_dir = root.join(".agentcall").join("state");
+        std::fs::create_dir_all(&state_dir).unwrap();
+        let writable_roots: Vec<Value> = (0..800)
+            .map(|idx| {
+                json!({
+                    "kind": "allowed_path",
+                    "display": format!("very/long/generated/path/{idx}/{}", "x".repeat(80)),
+                    "abs": format!("E:/Project/AgentCall/very/long/generated/path/{idx}/{}", "x".repeat(80))
+                })
+            })
+            .collect();
+        crate::state::write_json_file(
+            &state_dir.join("routes.json"),
+            &json!({
+                "route-pty": {
+                    "route_id": "route-pty",
+                    "recommended_runtime": "pty",
+                    "session_name": "worker-a",
+                    "status": "prompt_submitted",
+                    "result": {
+                        "phase": "execute",
+                        "containment": {
+                            "allowed_paths": ["src"],
+                            "writable_paths": ["src"],
+                            "writable_roots": writable_roots,
+                            "roots": {
+                                "process_cwd": "D:/guKimi",
+                                "target_workspace": "E:/Project/AgentCall",
+                                "scratch_root": "D:/guKimi/.agentcall/workspaces/worker-a"
+                            }
+                        }
+                    }
+                }
+            }),
+        )
+        .unwrap();
+
+        let tui = mcp_session(&state, &json!({"name": "worker-a", "view": "tui"})).unwrap();
+        let rendered = serde_json::to_string(&tui).unwrap();
+        assert!(
+            rendered.len() <= TUI_VIEW_MAX_BYTES,
+            "tui view exceeded hard cap: {}",
+            rendered.len()
+        );
+        assert_eq!(tui["budget"]["hard_cap_enforced"], true);
+        assert_eq!(tui["budget"]["truncated"], true);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn tui_view_projects_prompt_ack_missing_after_deadline() {
+        let root = std::env::temp_dir().join(format!(
+            "agentcall-mcp-prompt-ack-missing-{}",
+            std::process::id()
+        ));
+        let state = AppState::test(root.clone());
+        let state_dir = root.join(".agentcall").join("state");
+        std::fs::create_dir_all(&state_dir).unwrap();
+        crate::state::write_json_file(
+            &state_dir.join("routes.json"),
+            &json!({
+                "route-pty": {
+                    "route_id": "route-pty",
+                    "recommended_runtime": "pty",
+                    "session_name": "worker-a",
+                    "status": "started_pending_prompt_ack",
+                    "created_at": now_ms().saturating_sub(20_000),
+                    "result": {
+                        "phase": "execute",
+                        "prompt": {
+                            "acknowledged": false,
+                            "ack_expected": "hook.UserPromptSubmit",
+                            "ack_deadline_hint_seconds": 15
+                        }
+                    }
+                }
+            }),
+        )
+        .unwrap();
+
+        let tui = mcp_session(&state, &json!({"name": "worker-a", "view": "tui"})).unwrap();
+        assert_eq!(tui["status"]["route_status"], "prompt_ack_missing");
+        assert_eq!(tui["status"]["prompt"]["ack_missing"], true);
+        assert_eq!(
+            tui["status"]["prompt"]["ack_expected"],
+            "hook.UserPromptSubmit"
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn mcp_tool_called_redacts_long_or_sensitive_arguments() {
+        let redacted = redact_mcp_arguments(&json!({
+            "objective": "x".repeat(400),
+            "workspace": "E:/Project/AgentCall",
+            "nested": {"content": "secret".repeat(100)}
+        }));
+        assert_eq!(redacted["workspace"], "E:/Project/AgentCall");
+        assert_eq!(redacted["objective"]["redacted"], true);
+        assert_eq!(redacted["nested"]["content"]["redacted"], true);
+        assert!(redacted["objective"]["preview"].as_str().unwrap().len() <= STRING_PREVIEW_BYTES);
     }
 
     #[test]

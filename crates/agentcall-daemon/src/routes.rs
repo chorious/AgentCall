@@ -8,15 +8,13 @@ use crate::runtime::{AgentRuntime, StartSpec};
 use crate::runtime_pty::ClaudeCodePtyRuntime;
 use crate::runtime_sdk::{ClaudeCodeSdkRuntime, sdk_runtime_enabled};
 use crate::scheduler::enforce_start_capacity;
-use crate::session::is_claude_command;
+use crate::session::{configured_claude_workspace, is_claude_command};
 use crate::state::{AppState, append_agent_event_locked, read_json_file, write_json_file};
 use crate::store::{RouteDecisionV1, SessionRecord};
 use crate::util::{now_ms, safe_name};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::sync::Arc;
-use std::thread;
-use std::time::{Duration, Instant};
 
 #[derive(Deserialize)]
 pub(crate) struct RouteRequest {
@@ -259,6 +257,9 @@ pub(crate) fn create_context(state: &Arc<AppState>, req: ContextRequest) -> Resu
     {
         return Err("task_id, call_id, and objective are required".to_string());
     }
+    if !safe_name(&req.task_id) || !safe_name(&req.call_id) {
+        return Err("task_id and call_id must be safe path segments".to_string());
+    }
     let packet = json!({
         "task_id": req.task_id,
         "call_id": req.call_id,
@@ -314,6 +315,7 @@ pub(crate) fn index_transcript(
     req: TranscriptIndexRequest,
 ) -> Result<Value, String> {
     let path = std::path::PathBuf::from(&req.path);
+    let path = canonical_transcript_path(state, &path)?;
     let text = std::fs::read_to_string(&path).map_err(|err| err.to_string())?;
     let mut messages = 0u64;
     let mut tool_uses = 0u64;
@@ -360,6 +362,35 @@ pub(crate) fn index_transcript(
         json!({"session_id": summary["session_id"], "transcript_path": summary["transcript_path"], "runtime": "daemon"}),
     )?;
     Ok(summary)
+}
+
+fn canonical_transcript_path(
+    state: &AppState,
+    path: &std::path::Path,
+) -> Result<std::path::PathBuf, String> {
+    let canonical = path
+        .canonicalize()
+        .map_err(|err| format!("invalid transcript path: {err}"))?;
+    if allowed_transcript_roots(state)
+        .into_iter()
+        .any(|root| canonical.starts_with(root))
+    {
+        return Ok(canonical);
+    }
+    Err("transcript path escapes workspace or configured allowed roots".to_string())
+}
+
+fn allowed_transcript_roots(state: &AppState) -> Vec<std::path::PathBuf> {
+    let mut roots = vec![];
+    if let Ok(root) = state.workspace.canonicalize() {
+        roots.push(root);
+    }
+    if let Some(claude_workspace) = &state.config.claude_workspace {
+        if let Ok(root) = claude_workspace.canonicalize() {
+            roots.push(root);
+        }
+    }
+    roots
 }
 
 struct RouteDecision {
@@ -536,6 +567,7 @@ fn start_pty_route(
         "scheduler": schedule.to_value(),
         "owner_lease": leases.owner_lease,
         "workspace_lease": leases.workspace_lease,
+        "prompt": prompt_gate,
         "prompt_gate": prompt_gate,
         "binding_gate": {
             "required": true,
@@ -564,22 +596,41 @@ fn pty_containment(state: &AppState, req: &RouteRequest, session_name: &str) -> 
     let read_only = req.read_only.unwrap_or(false);
     let explicit_allowed = req.allowed_paths.clone().unwrap_or_default();
     let scratch_path = format!(".agentcall/workspaces/{session_name}");
+    let process_cwd =
+        configured_claude_workspace(state).unwrap_or_else(|_| state.workspace.clone());
+    let target_workspace = route_target_workspace(state, req);
+    let scratch_abs = process_cwd.join(&scratch_path);
     let mut writable_paths = vec![];
+    let mut writable_roots = vec![];
     if !read_only {
         writable_paths.push(scratch_path.clone());
+        writable_roots.push(json!({
+            "kind": "scratch",
+            "display": scratch_path.clone(),
+            "abs": scratch_abs.display().to_string()
+        }));
         if let Some(report_path) = req
             .report_path
             .as_ref()
             .filter(|value| !value.trim().is_empty())
         {
             writable_paths.push(report_path.clone());
+            writable_roots.push(json!({
+                "kind": "report",
+                "display": report_path,
+                "abs": materialize_route_path(&target_workspace, report_path).display().to_string()
+            }));
         }
         for path in &explicit_allowed {
             if !path.trim().is_empty() && !writable_paths.iter().any(|item| item == path) {
                 writable_paths.push(path.clone());
+                writable_roots.push(json!({
+                    "kind": "allowed_path",
+                    "display": path,
+                    "abs": materialize_route_path(&target_workspace, path).display().to_string()
+                }));
             }
         }
-        let scratch_abs = state.workspace.join(&scratch_path);
         let _ = std::fs::create_dir_all(&scratch_abs);
         let _ = std::fs::write(
             scratch_abs.join("README.md"),
@@ -594,8 +645,25 @@ fn pty_containment(state: &AppState, req: &RouteRequest, session_name: &str) -> 
         "allowed_paths": explicit_allowed,
         "writable_paths": writable_paths,
         "scratch_path": if read_only { Value::Null } else { json!(scratch_path) },
+        "roots": {
+            "process_cwd": process_cwd.display().to_string(),
+            "claude_workspace": process_cwd.display().to_string(),
+            "target_workspace": target_workspace.display().to_string(),
+            "scratch_root": if read_only { Value::Null } else { json!(scratch_abs.display().to_string()) }
+        },
+        "writable_roots": writable_roots,
+        "scratch_root": if read_only { Value::Null } else { json!(scratch_abs.display().to_string()) },
         "bash_write_policy": "readonly_only"
     })
+}
+
+fn materialize_route_path(root: &std::path::Path, path: &str) -> std::path::PathBuf {
+    let candidate = std::path::PathBuf::from(path);
+    if candidate.is_absolute() {
+        candidate
+    } else {
+        root.join(candidate)
+    }
 }
 
 pub(crate) fn route_for_wrapper_session(
@@ -738,76 +806,48 @@ fn merge_result_field(result: &mut Value, key: &str, value: Value) {
     }
 }
 
-fn wait_for_user_prompt_submit(
-    state: &Arc<AppState>,
-    wrapper_session: &str,
-    wait: Duration,
-) -> bool {
-    let started = Instant::now();
-    while started.elapsed() < wait {
-        let bindings = read_json_file(
-            &state
-                .workspace
-                .join(".agentcall")
-                .join("state")
-                .join("runtime_binding.json"),
-            json!({}),
-        );
-        if bindings
-            .get(wrapper_session)
-            .and_then(|binding| binding.get("last_hook_event"))
-            .and_then(Value::as_str)
-            == Some("UserPromptSubmit")
-        {
-            return true;
-        }
-        thread::sleep(Duration::from_millis(250));
-    }
-    false
-}
-
 fn submit_pty_prompt_with_ack(
     state: &Arc<AppState>,
     wrapper_session: &str,
     prompt: String,
 ) -> Value {
-    let mut last_error = None;
-    for attempt in 1..=2u64 {
-        let args = json!({
-            "text": prompt.clone(),
-            "enter": true,
-            "idempotency_key": format!("route-prompt-{wrapper_session}-{attempt}"),
-            "owner_id": "codex"
-        });
-        let command = build_session_send_command(
-            wrapper_session,
-            "send",
-            args.get("idempotency_key")
-                .and_then(Value::as_str)
-                .unwrap_or("route-prompt"),
-            &args,
-        );
-        match submit_session_command(state, wrapper_session, command) {
-            Ok(_) => {
-                if wait_for_user_prompt_submit(state, wrapper_session, Duration::from_secs(8)) {
-                    return json!({
-                        "status": "started_and_prompt_submitted",
-                        "expected_hook": "UserPromptSubmit",
-                        "attempts": attempt,
-                        "acknowledged": true
-                    });
-                }
-            }
-            Err(err) => last_error = Some(err),
-        }
+    let idempotency_key = format!("route-prompt-{wrapper_session}");
+    let args = json!({
+        "text": prompt,
+        "enter": true,
+        "idempotency_key": idempotency_key.clone(),
+        "owner_id": "codex"
+    });
+    let command = build_session_send_command(wrapper_session, "send", &idempotency_key, &args);
+    let command_id = command.command_id.clone();
+    match submit_session_command(state, wrapper_session, command) {
+        Ok(actor_result) => json!({
+            "status": "started_pending_prompt_ack",
+            "command_status": "dispatched",
+            "command_id": command_id,
+            "idempotency_key": idempotency_key,
+            "dispatched": true,
+            "acknowledged": false,
+            "ack_expected": "hook.UserPromptSubmit",
+            "expected_hook": "UserPromptSubmit",
+            "ack_deadline_hint_seconds": 15,
+            "next_observation": "agentcall_session(view=summary)",
+            "actor_result": actor_result
+        }),
+        Err(err) => json!({
+            "status": "started_pending_prompt_dispatch",
+            "command_status": "dispatch_failed",
+            "command_id": command_id,
+            "idempotency_key": idempotency_key,
+            "dispatched": false,
+            "acknowledged": false,
+            "ack_expected": "hook.UserPromptSubmit",
+            "expected_hook": "UserPromptSubmit",
+            "ack_deadline_hint_seconds": 15,
+            "next_observation": "agentcall_session(view=summary)",
+            "last_error": err
+        }),
     }
-    json!({
-        "status": "started_pending_prompt_ack",
-        "expected_hook": "UserPromptSubmit",
-        "attempts": 2,
-        "acknowledged": false,
-        "last_error": last_error
-    })
 }
 
 fn submit_pty_prompt_without_hook_ack(
@@ -829,9 +869,14 @@ fn submit_pty_prompt_without_hook_ack(
             .unwrap_or("route-prompt"),
         &args,
     );
+    let command_id = command.command_id.clone();
     match submit_session_command(state, wrapper_session, command) {
         Ok(result) => json!({
             "status": "started_prompt_dispatched_without_hook_ack",
+            "command_status": "dispatched",
+            "command_id": command_id,
+            "idempotency_key": args.get("idempotency_key").and_then(Value::as_str),
+            "dispatched": true,
             "expected_hook": Value::Null,
             "acknowledged": false,
             "actor_result": result,
@@ -839,6 +884,10 @@ fn submit_pty_prompt_without_hook_ack(
         }),
         Err(err) => json!({
             "status": "started_pending_prompt_dispatch",
+            "command_status": "dispatch_failed",
+            "command_id": command_id,
+            "idempotency_key": args.get("idempotency_key").and_then(Value::as_str),
+            "dispatched": false,
             "expected_hook": Value::Null,
             "acknowledged": false,
             "last_error": err
@@ -1174,6 +1223,29 @@ mod tests {
     }
 
     #[test]
+    fn route_prompt_gate_dispatches_once_without_waiting_for_hook_ack() {
+        let workspace = test_workspace("route-prompt-gate");
+        let state = Arc::new(AppState::test(workspace));
+
+        let gate = submit_pty_prompt_with_ack(&state, "missing-worker", "do work".to_string());
+
+        assert_eq!(gate["status"], "started_pending_prompt_dispatch");
+        assert_eq!(gate["command_status"], "dispatch_failed");
+        assert_eq!(gate["idempotency_key"], "route-prompt-missing-worker");
+        assert_eq!(gate["dispatched"], false);
+        assert_eq!(gate["ack_expected"], "hook.UserPromptSubmit");
+        assert_eq!(gate["ack_deadline_hint_seconds"], 15);
+        assert_eq!(gate["next_observation"], "agentcall_session(view=summary)");
+        assert!(gate.get("attempts").is_none());
+        assert!(
+            gate["last_error"]
+                .as_str()
+                .unwrap()
+                .contains("missing session actor")
+        );
+    }
+
+    #[test]
     fn plan_then_auto_forces_plan_even_when_caller_requests_auto() {
         let req = RouteRequest {
             objective: "review only".to_string(),
@@ -1290,6 +1362,21 @@ mod tests {
             containment["scratch_path"],
             ".agentcall/workspaces/containment-a"
         );
+        assert_eq!(
+            containment["roots"]["process_cwd"],
+            workspace.display().to_string()
+        );
+        assert_eq!(
+            containment["roots"]["target_workspace"],
+            workspace.display().to_string()
+        );
+        assert_eq!(
+            containment["roots"]["scratch_root"],
+            workspace
+                .join(".agentcall/workspaces/containment-a")
+                .display()
+                .to_string()
+        );
         let writable = containment["writable_paths"].as_array().unwrap();
         assert!(
             writable
@@ -1298,6 +1385,19 @@ mod tests {
         );
         assert!(writable.iter().any(|value| value == "docs/report.md"));
         assert!(writable.iter().any(|value| value == "src"));
+        let writable_roots = containment["writable_roots"].as_array().unwrap();
+        assert!(writable_roots.iter().any(|root| {
+            root["kind"] == "scratch"
+                && root["abs"]
+                    == workspace
+                        .join(".agentcall/workspaces/containment-a")
+                        .display()
+                        .to_string()
+        }));
+        assert!(writable_roots.iter().any(|root| {
+            root["kind"] == "report"
+                && root["abs"] == workspace.join("docs/report.md").display().to_string()
+        }));
         assert!(
             workspace
                 .join(".agentcall/workspaces/containment-a/README.md")
@@ -1336,7 +1436,9 @@ mod tests {
         let containment = pty_containment(&state, &req, "containment-ro");
         assert_eq!(containment["mode"], "read_only");
         assert!(containment["writable_paths"].as_array().unwrap().is_empty());
+        assert!(containment["writable_roots"].as_array().unwrap().is_empty());
         assert!(containment["scratch_path"].is_null());
+        assert!(containment["roots"]["scratch_root"].is_null());
     }
 
     #[test]
@@ -1365,6 +1467,51 @@ mod tests {
         assert_eq!(summary["messages"], 2);
         assert_eq!(summary["tool_uses"], 1);
         assert_eq!(summary["tool_results"], 1);
+    }
+
+    #[test]
+    fn context_rejects_path_traversal_ids() {
+        let workspace = test_workspace("context-traversal");
+        let state = Arc::new(AppState::test(workspace));
+        let err = create_context(
+            &state,
+            ContextRequest {
+                task_id: "../escape".to_string(),
+                call_id: "call-a".to_string(),
+                objective: "do work".to_string(),
+                phase: None,
+                role: None,
+                runtime: None,
+                workspace: None,
+                allowed_paths: None,
+                acceptance_criteria: None,
+                persist: Some(true),
+                report_path: None,
+            },
+        )
+        .unwrap_err();
+        assert!(err.contains("safe path segments"));
+    }
+
+    #[test]
+    fn transcript_index_rejects_path_outside_allowed_roots() {
+        let workspace = test_workspace("transcript-traversal");
+        let outside = test_workspace("transcript-outside");
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        let transcript = outside.join("transcript.jsonl");
+        std::fs::write(&transcript, r#"{"role":"user","content":"go"}"#).unwrap();
+        let state = Arc::new(AppState::test(workspace));
+        let err = index_transcript(
+            &state,
+            TranscriptIndexRequest {
+                path: transcript.display().to_string(),
+                session_id: Some("sess".to_string()),
+            },
+        )
+        .unwrap_err();
+        assert!(err.contains("escapes workspace"));
+        let _ = std::fs::remove_dir_all(outside);
     }
 
     fn test_workspace(name: &str) -> std::path::PathBuf {

@@ -8,6 +8,8 @@ pub(crate) struct LocalConfig {
     pub(crate) max_sessions: Option<usize>,
     pub(crate) per_owner_max_sessions: Option<usize>,
     pub(crate) experimental_sdk_runtime: Option<bool>,
+    pub(crate) daemon_token: Option<String>,
+    pub(crate) dev_open_loopback: Option<bool>,
 }
 
 impl LocalConfig {

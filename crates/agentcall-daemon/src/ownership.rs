@@ -170,6 +170,13 @@ pub(crate) fn attach_or_validate_owner_lease(
         .get("owner_id")
         .and_then(Value::as_str)
         .filter(|value| !value.trim().is_empty())
+        .or_else(|| {
+            enriched
+                .get("precondition")
+                .and_then(|value| value.get("owner_id"))
+                .and_then(Value::as_str)
+                .filter(|value| !value.trim().is_empty())
+        })
         .unwrap_or("codex")
         .to_string();
     let lease = ensure_owner_lease(state, session_id, &owner_id)?;
@@ -211,6 +218,62 @@ pub(crate) fn attach_or_validate_owner_lease(
             .or_insert_with(|| json!(lease.lease_generation));
     }
     Ok(enriched)
+}
+
+pub(crate) fn validate_owner_lease_precondition(
+    state: &AppState,
+    session_id: &str,
+    owner_id: &str,
+    owner_lease_id: &str,
+    lease_generation: u64,
+) -> Result<(), String> {
+    prune_expired_leases(state)?;
+    let leases = state.owner_leases.lock().unwrap();
+    let Some(lease) = leases.get(session_id) else {
+        return Err(format!(
+            "rejected_stale_lease: session={session_id} has no active owner lease"
+        ));
+    };
+    if lease.owner_id != owner_id {
+        return Err(format!(
+            "rejected_owner_mismatch: session={session_id} expected_owner={} got={owner_id}",
+            lease.owner_id
+        ));
+    }
+    match lease.status {
+        LeaseStatus::Active => {}
+        LeaseStatus::Expired => {
+            return Err(format!(
+                "rejected_expired_lease: session={session_id} lease={} is expired",
+                lease.lease_id
+            ));
+        }
+        LeaseStatus::Released => {
+            return Err(format!(
+                "rejected_stale_lease: session={session_id} lease={} is released",
+                lease.lease_id
+            ));
+        }
+    }
+    if !owner_lease_is_active(lease, chrono::Utc::now()) {
+        return Err(format!(
+            "rejected_expired_lease: session={session_id} lease={} is expired",
+            lease.lease_id
+        ));
+    }
+    if lease.lease_id != owner_lease_id {
+        return Err(format!(
+            "rejected_stale_lease: session={session_id} expected={} got={owner_lease_id}",
+            lease.lease_id
+        ));
+    }
+    if lease.lease_generation != lease_generation {
+        return Err(format!(
+            "rejected_stale_lease_generation: session={session_id} expected={} got={lease_generation}",
+            lease.lease_generation
+        ));
+    }
+    Ok(())
 }
 
 pub(crate) fn reserve_route_leases(
@@ -583,6 +646,44 @@ mod tests {
         )
         .unwrap_err();
         assert!(err.contains("rejected_stale_lease_generation"));
+    }
+
+    #[test]
+    fn expired_owner_lease_precondition_is_rejected() {
+        let state = test_state("expired-owner-precondition");
+        let mut lease = build_owner_lease("worker-a", "codex");
+        lease.expires_at = (chrono::Utc::now() - chrono::Duration::seconds(1)).to_rfc3339();
+        let lease_id = lease.lease_id.clone();
+        let generation = lease.lease_generation;
+        state
+            .owner_leases
+            .lock()
+            .unwrap()
+            .insert("worker-a".to_string(), lease);
+
+        let err =
+            validate_owner_lease_precondition(&state, "worker-a", "codex", &lease_id, generation)
+                .unwrap_err();
+        assert!(err.contains("rejected_expired_lease"));
+    }
+
+    #[test]
+    fn released_owner_lease_precondition_is_rejected() {
+        let state = test_state("released-owner-precondition");
+        let mut lease = build_owner_lease("worker-a", "codex");
+        lease.status = LeaseStatus::Released;
+        let lease_id = lease.lease_id.clone();
+        let generation = lease.lease_generation;
+        state
+            .owner_leases
+            .lock()
+            .unwrap()
+            .insert("worker-a".to_string(), lease);
+
+        let err =
+            validate_owner_lease_precondition(&state, "worker-a", "codex", &lease_id, generation)
+                .unwrap_err();
+        assert!(err.contains("rejected_stale_lease"));
     }
 
     #[test]

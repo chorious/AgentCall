@@ -91,12 +91,14 @@ fn route_tool() -> Value {
 fn session_tool() -> Value {
     json!({
         "name": "agentcall_session",
-        "description": "Return one daemon PTY session llm_summary, with optional clean output tail. Prefer summary patience_hint, last_progress_age_seconds, and attention_status over impatient raw-terminal polling.",
+        "description": "Return one daemon PTY session view. Default view=summary is compact and projection-first; use view=tui for dashboard data, view=events for compact events, and view=debug/raw only for explicit inspection.",
         "inputSchema": {
             "type": "object",
             "properties": {
                 "root": {"type": "string"},
                 "name": {"type": "string"},
+                "view": {"type": "string", "enum": ["summary", "tui", "events", "debug", "raw"], "default": "summary"},
+                "detail": {"type": "string", "enum": ["compact", "debug", "raw"], "default": "compact"},
                 "include": {"type": "array", "items": {"type": "string", "enum": ["summary", "clean_tail", "plan", "events", "artifacts", "policy", "metrics", "debug"]}, "default": ["summary"]},
                 "cursor": {"type": "integer", "minimum": 0},
                 "limit": {"type": "integer", "minimum": 1, "maximum": 200, "default": 50},
@@ -117,7 +119,7 @@ fn session_send_tool() -> Value {
             "properties": {
                 "root": {"type": "string"},
                 "name": {"type": "string"},
-                "action": {"type": "string", "enum": ["send", "continue", "stop", "request_report", "revise_plan", "approve_plan", "start_auto", "select_option", "interrupt"], "default": "send"},
+                "action": {"type": "string", "enum": ["send", "continue", "stop", "kill", "request_report", "revise_plan", "approve_plan", "start_auto", "select_option", "interrupt"], "default": "send"},
                 "text": {"type": "string"},
                 "enter": {"type": "boolean", "default": true},
                 "idempotency_key": {"type": "string"},
@@ -207,6 +209,19 @@ mod tests {
         assert!(include_enum.iter().any(|item| item == "debug"));
         assert!(include_enum.iter().any(|item| item == "policy"));
         let properties = &tool["inputSchema"]["properties"];
+        assert_eq!(properties["view"]["default"], "summary");
+        assert!(
+            properties["view"]["enum"]
+                .as_array()
+                .unwrap()
+                .contains(&json!("tui"))
+        );
+        assert!(
+            properties["view"]["enum"]
+                .as_array()
+                .unwrap()
+                .contains(&json!("events"))
+        );
         assert!(properties.get("cursor").is_some());
         assert!(properties.get("event_types").is_some());
     }
@@ -217,5 +232,7 @@ mod tests {
         let properties = &tool["inputSchema"]["properties"];
         assert!(properties.get("idempotency_key").is_some());
         assert!(properties.get("precondition").is_some());
+        let actions = properties["action"]["enum"].as_array().unwrap();
+        assert!(actions.contains(&json!("kill")));
     }
 }

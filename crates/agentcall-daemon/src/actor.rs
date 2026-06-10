@@ -1,6 +1,6 @@
 use crate::commands::{CommandEnvelopeV1, CommandType};
 use crate::hooks::queue_supervisor_instruction;
-use crate::session::{Session, stop_session};
+use crate::session::{Session, kill_session, request_stop_session};
 use crate::state::{AppState, append_agent_event, complete_command_event};
 use crate::store::CommandStatus;
 use serde_json::{Value, json};
@@ -47,6 +47,8 @@ pub(crate) struct ActorHandle {
 pub(crate) enum ActorControlCommand {
     Submit(CommandEnvelopeV1, Sender<Result<Value, String>>),
     RawWrite(Vec<u8>),
+    #[cfg(test)]
+    PanicForTest,
     #[allow(dead_code)]
     RefreshProjection,
 }
@@ -67,13 +69,30 @@ pub(crate) fn spawn_session_actor(
         .unwrap()
         .insert(session.name.clone(), handle);
     thread::spawn(move || {
-        session_actor_loop(
-            state,
-            session.name.clone(),
-            PtyWriter::new(writer),
-            receiver,
-        )
+        run_session_actor_with_panic_guard(state, session.name.clone(), writer, receiver)
     });
+}
+
+fn run_session_actor_with_panic_guard(
+    state: Arc<AppState>,
+    session_id: String,
+    writer: Box<dyn Write + Send>,
+    receiver: Receiver<ActorControlCommand>,
+) {
+    let actor_state = Arc::clone(&state);
+    let actor_session_id = session_id.clone();
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        session_actor_loop(state, session_id, PtyWriter::new(writer), receiver)
+    }));
+    if result.is_err() {
+        append_actor_failure_event(
+            &actor_state,
+            &actor_session_id,
+            "session.actor_failed",
+            "Session actor panicked.",
+            "actor panic",
+        );
+    }
 }
 
 pub(crate) fn submit_session_command(
@@ -125,17 +144,71 @@ fn session_actor_loop(
     mut writer: PtyWriter,
     receiver: Receiver<ActorControlCommand>,
 ) {
-    for command in receiver {
-        match command {
-            ActorControlCommand::Submit(envelope, reply) => {
-                let result = execute_command(&state, &session_id, &envelope, &mut writer);
-                let _ = reply.send(result);
+    let mut backlog = Vec::new();
+    loop {
+        if backlog.is_empty() {
+            match receiver.recv() {
+                Ok(command) => backlog.push(command),
+                Err(_) => break,
             }
-            ActorControlCommand::RawWrite(bytes) => {
-                let _ = writer.write_raw(&bytes);
-            }
-            ActorControlCommand::RefreshProjection => {}
         }
+        while let Ok(command) = receiver.try_recv() {
+            backlog.push(command);
+            if backlog.len() >= 256 {
+                break;
+            }
+        }
+        let Some(command) = pop_highest_priority(&mut backlog) else {
+            continue;
+        };
+        handle_actor_control_command(&state, &session_id, &mut writer, command);
+    }
+}
+
+fn pop_highest_priority(backlog: &mut Vec<ActorControlCommand>) -> Option<ActorControlCommand> {
+    let (index, _) = backlog
+        .iter()
+        .enumerate()
+        .min_by_key(|(_, command)| actor_command_priority(command))?;
+    Some(backlog.remove(index))
+}
+
+fn actor_command_priority(command: &ActorControlCommand) -> u8 {
+    match command {
+        ActorControlCommand::Submit(envelope, _) => command_type_priority(&envelope.command_type),
+        ActorControlCommand::RawWrite(_) | ActorControlCommand::RefreshProjection => 4,
+        #[cfg(test)]
+        ActorControlCommand::PanicForTest => 0,
+    }
+}
+
+fn command_type_priority(command_type: &CommandType) -> u8 {
+    match command_type {
+        CommandType::KillSession => 0,
+        CommandType::StopSession | CommandType::InterruptTurn | CommandType::CancelCommand => 1,
+        CommandType::SelectOption => 2,
+        CommandType::SendInput | CommandType::RequestReport => 3,
+        CommandType::QueueSupervisorInstruction | CommandType::RefreshProjection => 4,
+    }
+}
+
+fn handle_actor_control_command(
+    state: &AppState,
+    session_id: &str,
+    writer: &mut PtyWriter,
+    command: ActorControlCommand,
+) {
+    match command {
+        ActorControlCommand::Submit(envelope, reply) => {
+            let result = execute_command(state, session_id, &envelope, writer);
+            let _ = reply.send(result);
+        }
+        ActorControlCommand::RawWrite(bytes) => {
+            let _ = writer.write_raw(&bytes);
+        }
+        #[cfg(test)]
+        ActorControlCommand::PanicForTest => panic!("actor panic test"),
+        ActorControlCommand::RefreshProjection => {}
     }
 }
 
@@ -161,12 +234,27 @@ fn execute_command(
     );
     let result = match command.command_type {
         CommandType::StopSession | CommandType::KillSession => {
-            stop_session(state, session_id)?;
+            let (action, effect, process_tree_signal) = match command.command_type {
+                CommandType::KillSession => {
+                    let kill = kill_session(state, session_id)?;
+                    ("kill", "kill_requested", kill)
+                }
+                _ => {
+                    let stop = request_stop_session(state, session_id)?;
+                    ("stop", "stop_requested", stop)
+                }
+            };
             json!({
                 "ok": true,
+                "action": action,
                 "status": "stop_signal_sent",
+                "command_status": "dispatched",
+                "effect": effect,
+                "process_tree_signal": process_tree_signal,
+                "lease_release": "pending_process_exit",
                 "awaiting_observation": true,
-                "next_required_observation": "process_exited_or_session_ended"
+                "next_required_observation": "process_exited_or_session_ended",
+                "next_observation": "agentcall_session(view=summary)"
             })
         }
         CommandType::InterruptTurn => {
@@ -179,7 +267,7 @@ fn execute_command(
                 append_actor_failure_event(
                     state,
                     session_id,
-                    "session.writer_closed",
+                    "session.writer_failed",
                     "PTY writer failed while sending interrupt.",
                     &err,
                 );
@@ -204,8 +292,11 @@ fn execute_command(
                 "ok": true,
                 "action": "interrupt",
                 "status": "interrupt_sent",
+                "command_status": "dispatched",
+                "effect": "interrupt_requested",
                 "awaiting_observation": true,
                 "next_required_observation": "hook_idle_or_ready_prompt",
+                "next_observation": "agentcall_session(view=summary)",
                 "warning": "Use interrupt only when the worker is drifting, doing the wrong thing, or must be reclaimed immediately."
             })
         }
@@ -292,7 +383,7 @@ fn actor_write_input(
         append_actor_failure_event(
             state,
             session_id,
-            "session.writer_closed",
+            "session.writer_failed",
             "PTY writer failed while sending input.",
             &err,
         );
@@ -369,11 +460,81 @@ mod tests {
     }
 
     #[test]
+    fn actor_panic_guard_projects_actor_failed() {
+        let state = Arc::new(AppState::new(
+            std::env::temp_dir().join(format!("agentcall-actor-panic-{}", std::process::id())),
+            LocalConfig::default(),
+            None,
+        ));
+        let (tx, rx) = mpsc::channel();
+        tx.send(ActorControlCommand::PanicForTest).unwrap();
+        drop(tx);
+
+        run_session_actor_with_panic_guard(
+            Arc::clone(&state),
+            "worker-a".to_string(),
+            Box::new(Vec::<u8>::new()),
+            rx,
+        );
+
+        let projection = crate::projection::read_session_projection(&state, "worker-a").unwrap();
+        assert_eq!(projection.liveness_status, "failed_or_orphaned");
+        assert_eq!(projection.attention_status, "failed");
+        assert!(projection.needs_attention);
+        let _ = std::fs::remove_dir_all(&state.workspace);
+    }
+
+    #[test]
+    fn actor_backlog_pops_control_commands_before_normal_input_and_raw_write() {
+        let (raw_tx, _raw_rx) = mpsc::channel();
+        let (send_tx, _send_rx) = mpsc::channel();
+        let (interrupt_tx, _interrupt_rx) = mpsc::channel();
+        let (kill_tx, _kill_rx) = mpsc::channel();
+        let mut backlog = vec![
+            ActorControlCommand::RawWrite(vec![1, 2, 3]),
+            ActorControlCommand::Submit(test_command_with_type(CommandType::SendInput), send_tx),
+            ActorControlCommand::Submit(
+                test_command_with_type(CommandType::InterruptTurn),
+                interrupt_tx,
+            ),
+            ActorControlCommand::Submit(test_command_with_type(CommandType::KillSession), kill_tx),
+            ActorControlCommand::Submit(
+                test_command_with_type(CommandType::QueueSupervisorInstruction),
+                raw_tx,
+            ),
+        ];
+
+        let Some(ActorControlCommand::Submit(first, _)) = pop_highest_priority(&mut backlog) else {
+            panic!("expected first command");
+        };
+        assert_eq!(first.command_type, CommandType::KillSession);
+
+        let Some(ActorControlCommand::Submit(second, _)) = pop_highest_priority(&mut backlog)
+        else {
+            panic!("expected second command");
+        };
+        assert_eq!(second.command_type, CommandType::InterruptTurn);
+
+        let Some(ActorControlCommand::Submit(third, _)) = pop_highest_priority(&mut backlog) else {
+            panic!("expected third command");
+        };
+        assert_eq!(third.command_type, CommandType::SendInput);
+    }
+
+    #[test]
     fn interrupt_sent_does_not_mark_command_completed() {
         let (event_type, _, awaiting_observation) =
             command_terminal_event(&CommandType::InterruptTurn);
         assert_eq!(event_type, "command.awaiting_observation");
         assert!(awaiting_observation);
+
+        let (stop_event_type, _, stop_awaiting) = command_terminal_event(&CommandType::StopSession);
+        assert_eq!(stop_event_type, "command.awaiting_observation");
+        assert!(stop_awaiting);
+
+        let (kill_event_type, _, kill_awaiting) = command_terminal_event(&CommandType::KillSession);
+        assert_eq!(kill_event_type, "command.awaiting_observation");
+        assert!(kill_awaiting);
 
         let (send_event_type, _, send_awaiting) = command_terminal_event(&CommandType::SendInput);
         assert_eq!(send_event_type, "command.completed");
@@ -410,6 +571,10 @@ mod tests {
     }
 
     fn test_command() -> CommandEnvelopeV1 {
+        test_command_with_type(CommandType::SendInput)
+    }
+
+    fn test_command_with_type(command_type: CommandType) -> CommandEnvelopeV1 {
         CommandEnvelopeV1 {
             schema_version: 1,
             command_id: "cmd-1".to_string(),
@@ -419,7 +584,7 @@ mod tests {
             owner_lease_id: "lease".to_string(),
             lease_generation: 1,
             idempotency_key: "idem".to_string(),
-            command_type: CommandType::SendInput,
+            command_type,
             payload: json!({"text": "hello"}),
             precondition: None,
             created_at: chrono::Utc::now().to_rfc3339(),

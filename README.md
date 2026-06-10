@@ -68,7 +68,9 @@ Set `claude_workspace`:
   "store_backend": "json",
   "max_sessions": 6,
   "per_owner_max_sessions": 6,
-  "experimental_sdk_runtime": false
+  "experimental_sdk_runtime": false,
+  "dev_open_loopback": false,
+  "daemon_token": "replace-with-local-token"
 }
 ```
 
@@ -117,9 +119,13 @@ Example:
 
 ```json
 {
-  "claude_workspace": "D:\\guKimi"
+  "claude_workspace": "D:\\guKimi",
+  "dev_open_loopback": false,
+  "daemon_token": "replace-with-local-token"
 }
 ```
+
+`daemon_token` is local-only and must not be committed. MCP and hook scripts read it from `AGENTCALL_DAEMON_TOKEN` or `config\agentcall.local.json`, then send it as `X-AgentCall-Token`.
 
 AgentCall starts Claude Code in `D:\guKimi` and expects hooks at:
 
@@ -184,6 +190,8 @@ Use `agentcall_daemon(action="status")` as the smoke test. `tool_search agentcal
 
 ## Public API / 常用 API
 
+Static pages such as `/board` can load without a token. `/api/*`, session WebSocket, and mutating endpoints require `X-AgentCall-Token` unless local config explicitly sets `dev_open_loopback=true`.
+
 ```text
 GET  /api/runtime/health
 GET  /api/board?view=compact&filter=attention
@@ -217,6 +225,6 @@ python C:\Users\MUSHI\.codex\skills\.system\plugin-creator\scripts\validate_plug
 - [Architecture](docs/architecture.md)
 - [About AgentCall](docs/about.md)
 - [AGENTS.md](AGENTS.md)
-- [v5.3 closure status](docs/reports/v5.3-closure-status.md)
-- [v5.3 code plan](docs/v5.3-code-plan.md)
+- [v5.4 implementation closure](docs/reports/v5.4-implementation-closure.md)
+- [v5.4 code plan](docs/v5.4-code-plan.md)
 - [MCP transport recovery](docs/mcp-transport-recovery.md)

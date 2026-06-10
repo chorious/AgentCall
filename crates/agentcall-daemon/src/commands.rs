@@ -1,4 +1,4 @@
-use crate::ownership::attach_or_validate_owner_lease;
+use crate::ownership::{attach_or_validate_owner_lease, validate_owner_lease_precondition};
 use crate::projection::read_session_projection;
 use crate::state::{AppState, append_agent_event};
 #[cfg(test)]
@@ -44,6 +44,7 @@ pub(crate) enum CommandType {
 pub(crate) struct CommandPrecondition {
     pub(crate) projection_last_session_seq: Option<u64>,
     pub(crate) turn_state: Option<String>,
+    pub(crate) owner_id: Option<String>,
     pub(crate) owner_lease_id: Option<String>,
     pub(crate) lease_generation: Option<u64>,
 }
@@ -82,10 +83,8 @@ pub(crate) fn prepare_session_send_command(
             "rejected_missing_idempotency_key: action={action} requires idempotency_key"
         ));
     }
-    if safety.requires_precondition && !args.get("precondition").is_some_and(Value::is_object) {
-        return Err(format!(
-            "rejected_missing_safety_fields: action={action} requires precondition"
-        ));
+    if safety.requires_precondition {
+        validate_required_destructive_precondition(state, session, action, args)?;
     }
     let idempotency_key = idempotency_key.unwrap_or("read-only");
     let enriched_args = attach_or_validate_owner_lease(state, session, args)?;
@@ -113,6 +112,32 @@ fn validate_projection_precondition(
     state: &AppState,
     command: &CommandEnvelopeV1,
 ) -> Result<(), String> {
+    if let Some(precondition) = command.precondition.as_ref() {
+        if let Some(expected_owner_id) = precondition.owner_id.as_deref() {
+            if expected_owner_id != command.owner_id {
+                return Err(format!(
+                    "rejected_owner_mismatch: expected owner_id={} got={}",
+                    command.owner_id, expected_owner_id
+                ));
+            }
+        }
+        if let Some(expected_lease_id) = precondition.owner_lease_id.as_deref() {
+            if expected_lease_id != command.owner_lease_id {
+                return Err(format!(
+                    "rejected_stale_lease: expected owner_lease_id={} got={}",
+                    command.owner_lease_id, expected_lease_id
+                ));
+            }
+        }
+        if let Some(expected_generation) = precondition.lease_generation {
+            if expected_generation != command.lease_generation {
+                return Err(format!(
+                    "rejected_stale_lease_generation: expected lease_generation={} got={}",
+                    command.lease_generation, expected_generation
+                ));
+            }
+        }
+    }
     let Some(provided_seq) = command
         .precondition
         .as_ref()
@@ -137,25 +162,84 @@ fn validate_projection_precondition(
             "owner_id": command.owner_id,
             "expected_projection_last_session_seq": current_seq,
             "provided_projection_last_session_seq": provided_seq,
-            "reason": "rejected_precondition"
+            "reason": "rejected_stale_projection"
         }),
     );
     Err(format!(
-        "rejected_precondition: projection_last_session_seq expected={current_seq} got={provided_seq}"
+        "rejected_stale_projection: projection_last_session_seq expected={current_seq} got={provided_seq}"
     ))
+}
+
+fn validate_required_destructive_precondition(
+    state: &AppState,
+    session: &str,
+    action: &str,
+    args: &Value,
+) -> Result<(), String> {
+    let Some(precondition) = args.get("precondition").and_then(Value::as_object) else {
+        return Err(format!(
+            "rejected_missing_precondition: action={action} requires precondition"
+        ));
+    };
+    let mut missing = Vec::new();
+    let projection_seq = precondition
+        .get("projection_last_session_seq")
+        .and_then(Value::as_u64)
+        .or_else(|| {
+            missing.push("projection_last_session_seq");
+            None
+        });
+    let owner_id = precondition
+        .get("owner_id")
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .or_else(|| {
+            missing.push("owner_id");
+            None
+        });
+    let owner_lease_id = precondition
+        .get("owner_lease_id")
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .or_else(|| {
+            missing.push("owner_lease_id");
+            None
+        });
+    let lease_generation = precondition
+        .get("lease_generation")
+        .and_then(Value::as_u64)
+        .or_else(|| {
+            missing.push("lease_generation");
+            None
+        });
+    if !missing.is_empty() {
+        return Err(format!(
+            "rejected_missing_precondition: action={action} missing={}",
+            missing.join(",")
+        ));
+    }
+    let _ = projection_seq;
+    validate_owner_lease_precondition(
+        state,
+        session,
+        owner_id.unwrap(),
+        owner_lease_id.unwrap(),
+        lease_generation.unwrap(),
+    )
 }
 
 pub(crate) fn classify_session_send_action(action: &str) -> SessionSendSafety {
     match action {
-        "stop" | "interrupt" => SessionSendSafety {
+        "stop" | "kill" | "interrupt" | "approve_plan" | "start_auto" => SessionSendSafety {
             requires_idempotency: true,
             requires_precondition: true,
         },
-        "send" | "continue" | "request_report" | "revise_plan" | "approve_plan" | "start_auto"
-        | "select_option" => SessionSendSafety {
-            requires_idempotency: true,
-            requires_precondition: false,
-        },
+        "send" | "continue" | "request_report" | "revise_plan" | "select_option" => {
+            SessionSendSafety {
+                requires_idempotency: true,
+                requires_precondition: false,
+            }
+        }
         _ => SessionSendSafety {
             requires_idempotency: true,
             requires_precondition: false,
@@ -166,6 +250,7 @@ pub(crate) fn classify_session_send_action(action: &str) -> SessionSendSafety {
 pub(crate) fn command_type_for_session_send(action: &str) -> CommandType {
     match action {
         "stop" => CommandType::StopSession,
+        "kill" => CommandType::KillSession,
         "interrupt" => CommandType::InterruptTurn,
         "select_option" => CommandType::SelectOption,
         "request_report" => CommandType::RequestReport,
@@ -387,6 +472,22 @@ mod tests {
         assert!(stop.requires_idempotency);
         assert!(stop.requires_precondition);
 
+        let kill = classify_session_send_action("kill");
+        assert!(kill.requires_idempotency);
+        assert!(kill.requires_precondition);
+
+        let interrupt = classify_session_send_action("interrupt");
+        assert!(interrupt.requires_idempotency);
+        assert!(interrupt.requires_precondition);
+
+        let approve_plan = classify_session_send_action("approve_plan");
+        assert!(approve_plan.requires_idempotency);
+        assert!(approve_plan.requires_precondition);
+
+        let start_auto = classify_session_send_action("start_auto");
+        assert!(start_auto.requires_idempotency);
+        assert!(start_auto.requires_precondition);
+
         let send = classify_session_send_action("send");
         assert!(send.requires_idempotency);
         assert!(!send.requires_precondition);
@@ -437,6 +538,10 @@ mod tests {
             CommandType::InterruptTurn
         );
         assert_eq!(
+            command_type_for_session_send("kill"),
+            CommandType::KillSession
+        );
+        assert_eq!(
             command_type_for_session_send("select_option"),
             CommandType::SelectOption
         );
@@ -462,6 +567,7 @@ mod tests {
             precondition: Some(CommandPrecondition {
                 projection_last_session_seq: Some(42),
                 turn_state: Some("Idle".to_string()),
+                owner_id: Some("codex-main".to_string()),
                 owner_lease_id: Some("lease-1".to_string()),
                 lease_generation: Some(3),
             }),
@@ -498,7 +604,101 @@ mod tests {
             Ok(_) => panic!("expected stale projection precondition to be rejected"),
             Err(err) => err,
         };
-        assert!(err.contains("rejected_precondition"));
+        assert!(err.contains("rejected_stale_projection"));
+        let _ = fs::remove_dir_all(&state.workspace);
+    }
+
+    #[test]
+    fn destructive_plan_transition_requires_precondition() {
+        let state = test_state("plan-transition-precondition");
+        let err = match prepare_session_send_command(
+            &state,
+            "worker-a",
+            "start_auto",
+            &serde_json::json!({
+                "text": "1",
+                "idempotency_key": "start-auto-without-precondition"
+            }),
+        ) {
+            Ok(_) => panic!("expected start_auto without precondition to be rejected"),
+            Err(err) => err,
+        };
+        assert!(err.contains("rejected_missing_precondition"));
+        let err = match prepare_session_send_command(
+            &state,
+            "worker-a",
+            "start_auto",
+            &serde_json::json!({
+                "text": "1",
+                "idempotency_key": "start-auto-empty-precondition",
+                "precondition": {}
+            }),
+        ) {
+            Ok(_) => panic!("expected start_auto with empty precondition to be rejected"),
+            Err(err) => err,
+        };
+        assert!(err.contains("projection_last_session_seq"));
+        assert!(err.contains("owner_id"));
+        assert!(err.contains("owner_lease_id"));
+        assert!(err.contains("lease_generation"));
+        let _ = fs::remove_dir_all(&state.workspace);
+    }
+
+    #[test]
+    fn destructive_command_requires_current_owner_lease_precondition() {
+        let state = test_state("destructive-current-lease");
+        let _ = attach_or_validate_owner_lease(&state, "worker-a", &json!({})).unwrap();
+        let mut projection = stale_projection_for_session_name("worker-a");
+        projection.projection_stale = false;
+        projection.projection_last_session_seq = 7;
+        state
+            .projections
+            .lock()
+            .unwrap()
+            .insert("worker-a".to_string(), projection);
+
+        let prepared = prepare_session_send_command(
+            &state,
+            "worker-a",
+            "kill",
+            &serde_json::json!({
+                "idempotency_key": "kill-current",
+                "owner_id": "codex",
+                "precondition": {
+                    "projection_last_session_seq": 7,
+                    "owner_id": "codex",
+                    "owner_lease_id": "lease-worker-a-1",
+                    "lease_generation": 1
+                }
+            }),
+        )
+        .unwrap();
+        assert!(matches!(prepared, PreparedCommand::Submit(_)));
+        let _ = fs::remove_dir_all(&state.workspace);
+    }
+
+    #[test]
+    fn destructive_command_rejects_owner_mismatch() {
+        let state = test_state("destructive-owner-mismatch");
+        let _ = attach_or_validate_owner_lease(&state, "worker-a", &json!({})).unwrap();
+        let err = match prepare_session_send_command(
+            &state,
+            "worker-a",
+            "kill",
+            &serde_json::json!({
+                "idempotency_key": "kill-owner-mismatch",
+                "precondition": {
+                    "projection_last_session_seq": 0,
+                    "owner_id": "other-codex",
+                    "owner_lease_id": "lease-worker-a-1",
+                    "lease_generation": 1
+                }
+            }),
+        ) {
+            Ok(_) => panic!("expected owner mismatch rejection"),
+            Err(err) => err,
+        };
+        assert!(err.contains("rejected_owner_mismatch"));
         let _ = fs::remove_dir_all(&state.workspace);
     }
 

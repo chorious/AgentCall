@@ -3,5 +3,7 @@
   "store_backend": "json",
   "max_sessions": 6,
   "per_owner_max_sessions": 6,
-  "experimental_sdk_runtime": false
+  "experimental_sdk_runtime": false,
+  "dev_open_loopback": false,
+  "daemon_token": null
 }

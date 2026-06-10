@@ -207,7 +207,15 @@ pub(crate) fn apply_event_to_projection(
             projection.needs_attention = false;
             projection.last_progress_brief = Some(event.message.clone());
         }
+        "pty.kill_requested" => {
+            projection.liveness_status = "killing".to_string();
+            projection.turn_status = "awaiting_observation".to_string();
+            projection.attention_status = "none".to_string();
+            projection.needs_attention = false;
+            projection.last_progress_brief = Some(event.message.clone());
+        }
         "session.actor_failed"
+        | "session.writer_failed"
         | "session.writer_closed"
         | "session.reader_failed"
         | "session.orphaned" => {
@@ -302,6 +310,29 @@ fn projection_items(items: Option<&Vec<Value>>) -> Vec<Value> {
 }
 
 fn reduce_hook_event(projection: &mut SessionProjectionV1, event: &EventEnvelopeV1) {
+    if event
+        .payload
+        .get("decision")
+        .and_then(|decision| decision.get("allowed"))
+        .and_then(Value::as_bool)
+        == Some(false)
+    {
+        projection.liveness_status = "blocked".to_string();
+        projection.attention_status = "blocked_by_policy".to_string();
+        projection.needs_attention = true;
+        projection.last_error_brief = Some(
+            event
+                .payload
+                .get("decision")
+                .and_then(|decision| decision.get("reason"))
+                .and_then(Value::as_str)
+                .unwrap_or(event.message.as_str())
+                .to_string(),
+        );
+        projection.last_progress_brief = Some(event.message.clone());
+        projection.next_recommended_action = "fix_path_policy_or_interrupt_worker".to_string();
+        return;
+    }
     let status = event
         .payload
         .get("status")
@@ -415,12 +446,35 @@ mod tests {
         assert_eq!(stopped.projection.turn_status, "awaiting_observation");
         assert_eq!(stopped.projection.attention_status, "none");
 
-        let ended = apply_event_to_projection(
+        let killed = apply_event_to_projection(
             Some(stopped.projection),
-            &test_projection_event(3, "worker-a", "pty.session_ended", "PTY session ended."),
+            &test_projection_event(3, "worker-a", "pty.kill_requested", "PTY kill requested."),
+        );
+        assert_eq!(killed.projection.liveness_status, "killing");
+        assert_eq!(killed.projection.turn_status, "awaiting_observation");
+        assert_eq!(killed.projection.attention_status, "none");
+
+        let ended = apply_event_to_projection(
+            Some(killed.projection),
+            &test_projection_event(4, "worker-a", "pty.session_ended", "PTY session ended."),
         );
         assert_eq!(ended.projection.liveness_status, "completed");
         assert_eq!(ended.projection.attention_status, "none");
+    }
+
+    #[test]
+    fn reducer_marks_writer_failed_as_terminal_attention() {
+        let failed = apply_event_to_projection(
+            None,
+            &test_projection_event(1, "worker-a", "session.writer_failed", "PTY writer failed."),
+        );
+        assert_eq!(failed.projection.liveness_status, "failed_or_orphaned");
+        assert_eq!(failed.projection.attention_status, "failed");
+        assert!(failed.projection.needs_attention);
+        assert_eq!(
+            failed.projection.next_recommended_action,
+            "stop_or_restart_worker"
+        );
     }
 
     #[test]
