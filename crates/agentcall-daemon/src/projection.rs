@@ -339,11 +339,7 @@ fn reduce_hook_event(projection: &mut SessionProjectionV1, event: &EventEnvelope
 }
 
 fn hook_event_marks_report_ready(event: &EventEnvelopeV1) -> bool {
-    event
-        .payload
-        .get("report_ready")
-        .and_then(Value::as_bool)
-        == Some(true)
+    event.payload.get("report_ready").and_then(Value::as_bool) == Some(true)
         || event
             .payload
             .get("decision")

@@ -272,6 +272,7 @@ pub(crate) fn spawn_waiter(state: Arc<AppState>, session: Arc<Session>) {
             serde_json::json!({"session_id": session.name, "name": session.name, "status": session.status.lock().unwrap().clone(), "cwd": session.cwd, "child_pid": session.child_pid}),
         );
         state.actors.lock().unwrap().remove(&session.name);
+        state.sessions.lock().unwrap().remove(&session.name);
         if let Err(err) = release_owner_lease(&state, &session.name, "session_exited") {
             append_agent_event(
                 &state,

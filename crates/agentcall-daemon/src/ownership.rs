@@ -47,11 +47,96 @@ pub(crate) struct RouteLeaseReservation {
     pub(crate) workspace_lease: WorkspaceLease,
 }
 
+pub(crate) fn prune_expired_leases(state: &AppState) -> Result<(), String> {
+    let now = chrono::Utc::now();
+    let mut expired_owner_leases = Vec::new();
+    {
+        let mut leases = state.owner_leases.lock().unwrap();
+        for lease in leases.values_mut() {
+            if lease.status == LeaseStatus::Active && lease_expired_at(&lease.expires_at, now) {
+                lease.status = LeaseStatus::Expired;
+                lease.renewed_at = now.to_rfc3339();
+                lease.recoverable = false;
+                expired_owner_leases.push(lease.clone());
+            }
+        }
+        if !expired_owner_leases.is_empty() {
+            persist_owner_leases(state, &leases)?;
+        }
+    }
+    for lease in expired_owner_leases {
+        let _ = state.store.upsert_owner_lease(&lease);
+        crate::state::append_agent_event(
+            state,
+            "owner_lease.expired",
+            "Owner lease expired.",
+            json!({
+                "session_id": lease.session_id,
+                "lease_id": lease.lease_id,
+                "owner_id": lease.owner_id,
+                "expires_at": lease.expires_at
+            }),
+        );
+    }
+
+    let mut expired_workspace_leases = Vec::new();
+    {
+        let mut leases = state.workspace_leases.lock().unwrap();
+        leases.retain(|session_id, lease| {
+            let active = workspace_lease_is_active(lease, now);
+            if !active {
+                expired_workspace_leases.push((session_id.clone(), lease.clone()));
+            }
+            active
+        });
+        if !expired_workspace_leases.is_empty() {
+            persist_workspace_leases(state, &leases)?;
+        }
+    }
+    for (session_id, lease) in expired_workspace_leases {
+        let _ = state.store.release_workspace_lease(&session_id, "expired");
+        crate::state::append_agent_event(
+            state,
+            "workspace_lease.expired",
+            "Workspace lease expired.",
+            json!({
+                "session_id": session_id,
+                "lease_id": lease.lease_id,
+                "workspace_key": lease.workspace_key,
+                "expires_at": lease.expires_at
+            }),
+        );
+    }
+    Ok(())
+}
+
+pub(crate) fn owner_lease_is_active(
+    lease: &OwnerLease,
+    now: chrono::DateTime<chrono::Utc>,
+) -> bool {
+    lease.status == LeaseStatus::Active && !lease_expired_at(&lease.expires_at, now)
+}
+
+pub(crate) fn workspace_lease_is_active(
+    lease: &WorkspaceLease,
+    now: chrono::DateTime<chrono::Utc>,
+) -> bool {
+    !lease_expired_at(&lease.expires_at, now)
+}
+
+fn lease_expired_at(expires_at: &str, now: chrono::DateTime<chrono::Utc>) -> bool {
+    let Ok(expires) = chrono::DateTime::parse_from_rfc3339(expires_at) else {
+        return true;
+    };
+    expires.with_timezone(&chrono::Utc) <= now
+}
+
 pub(crate) fn ensure_owner_lease(
     state: &AppState,
     session_id: &str,
     owner_id: &str,
 ) -> Result<OwnerLease, String> {
+    prune_expired_leases(state)?;
     let mut leases = state.owner_leases.lock().unwrap();
     if let Some(existing) = leases.get(session_id) {
         if existing.owner_id != owner_id {
@@ -60,7 +145,10 @@ pub(crate) fn ensure_owner_lease(
                 existing.owner_id
             ));
         }
-        return Ok(existing.clone());
+        if owner_lease_is_active(existing, chrono::Utc::now()) {
+            return Ok(existing.clone());
+        }
+        leases.remove(session_id);
     }
     let lease = build_owner_lease(session_id, owner_id);
     leases.insert(session_id.to_string(), lease.clone());
@@ -132,20 +220,28 @@ pub(crate) fn reserve_route_leases(
     workspace: &Path,
     read_only: bool,
 ) -> Result<RouteLeaseReservation, String> {
+    prune_expired_leases(state)?;
     let owner_lease = build_owner_lease(session_id, owner_id);
     let workspace_lease = build_workspace_lease(session_id, owner_id, workspace, read_only);
     {
+        let now = chrono::Utc::now();
         let owner_leases = state.owner_leases.lock().unwrap();
         if let Some(existing) = owner_leases.get(session_id) {
-            return Err(format!(
-                "rejected_existing_owner_lease: session={session_id} owner={}",
-                existing.owner_id
-            ));
+            if owner_lease_is_active(existing, now) {
+                return Err(format!(
+                    "rejected_existing_owner_lease: session={session_id} owner={}",
+                    existing.owner_id
+                ));
+            }
         }
     }
     {
+        let now = chrono::Utc::now();
         let workspace_leases = state.workspace_leases.lock().unwrap();
         for existing in workspace_leases.values() {
+            if !workspace_lease_is_active(existing, now) {
+                continue;
+            }
             if existing.workspace_key != workspace_lease.workspace_key
                 || existing.session_id == session_id
             {
@@ -221,14 +317,19 @@ pub(crate) fn acquire_workspace_lease(
     workspace: &Path,
     read_only: bool,
 ) -> Result<WorkspaceLease, String> {
+    prune_expired_leases(state)?;
     let mode = if read_only {
         WorkspaceLeaseMode::SharedReadonly
     } else {
         WorkspaceLeaseMode::Exclusive
     };
     let workspace_key = canonical_workspace_key(workspace);
+    let now = chrono::Utc::now();
     let mut leases = state.workspace_leases.lock().unwrap();
     for existing in leases.values() {
+        if !workspace_lease_is_active(existing, now) {
+            continue;
+        }
         if existing.workspace_key != workspace_key || existing.session_id == session_id {
             continue;
         }
@@ -383,6 +484,7 @@ pub(crate) fn load_owner_leases(state: &AppState) {
         return;
     };
     *state.owner_leases.lock().unwrap() = leases;
+    let _ = prune_expired_leases(state);
 }
 
 pub(crate) fn load_workspace_leases(state: &AppState) {
@@ -391,36 +493,48 @@ pub(crate) fn load_workspace_leases(state: &AppState) {
         return;
     };
     *state.workspace_leases.lock().unwrap() = leases;
+    let _ = prune_expired_leases(state);
 }
 
 pub(crate) fn owner_leases_summary(state: &AppState) -> serde_json::Value {
     let leases = state.owner_leases.lock().unwrap();
+    let now = chrono::Utc::now();
+    let active_sessions = leases
+        .values()
+        .filter(|lease| owner_lease_is_active(lease, now))
+        .map(|lease| lease.session_id.clone())
+        .collect::<Vec<_>>();
     let active = leases
         .values()
-        .filter(|lease| lease.status == LeaseStatus::Active)
+        .filter(|lease| owner_lease_is_active(lease, now))
         .count();
     json!({
         "active": active,
         "total": leases.len(),
-        "sessions": leases.keys().cloned().collect::<Vec<_>>()
+        "sessions": active_sessions
     })
 }
 
 pub(crate) fn workspace_leases_summary(state: &AppState) -> serde_json::Value {
     let leases = state.workspace_leases.lock().unwrap();
-    let exclusive = leases
+    let now = chrono::Utc::now();
+    let active_leases = leases
         .values()
+        .filter(|lease| workspace_lease_is_active(lease, now))
+        .collect::<Vec<_>>();
+    let exclusive = active_leases
+        .iter()
         .filter(|lease| lease.mode == WorkspaceLeaseMode::Exclusive)
         .count();
-    let shared_readonly = leases
-        .values()
+    let shared_readonly = active_leases
+        .iter()
         .filter(|lease| lease.mode == WorkspaceLeaseMode::SharedReadonly)
         .count();
     json!({
-        "active": leases.len(),
+        "active": active_leases.len(),
         "exclusive": exclusive,
         "shared_readonly": shared_readonly,
-        "workspaces": leases.values().map(|lease| json!({
+        "workspaces": active_leases.iter().map(|lease| json!({
             "session_id": lease.session_id,
             "workspace": lease.workspace,
             "workspace_key": lease.workspace_key,

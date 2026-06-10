@@ -571,9 +571,11 @@ pub(crate) fn upsert_runtime_binding_locked(
         "seen_hooks": seen_hooks,
         "binding_source": binding_source,
     });
-    if matches!(event, "PostToolBatch" | "UserPromptSubmit" | "PreToolUse" | "PostToolUse") {
-        binding[&format!("last_{}_at", event.to_ascii_lowercase())] =
-            binding["last_seen"].clone();
+    if matches!(
+        event,
+        "PostToolBatch" | "UserPromptSubmit" | "PreToolUse" | "PostToolUse"
+    ) {
+        binding[&format!("last_{}_at", event.to_ascii_lowercase())] = binding["last_seen"].clone();
     }
     if let Some(value) = previous.get("last_supervisor_instruction_injected_at") {
         binding["last_supervisor_instruction_injected_at"] = value.clone();
@@ -1227,7 +1229,8 @@ fn route_report_path(route: &serde_json::Value) -> Option<String> {
         .filter(|value| !value.trim().is_empty())
         .map(str::to_string)
         .or_else(|| {
-            route.get("result")
+            route
+                .get("result")
                 .and_then(|result| result.get("report_path"))
                 .and_then(serde_json::Value::as_str)
                 .filter(|value| !value.trim().is_empty())

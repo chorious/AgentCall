@@ -67,7 +67,7 @@ Set `claude_workspace`:
   "claude_workspace": "D:\\guKimi",
   "store_backend": "json",
   "max_sessions": 6,
-  "per_owner_max_sessions": 3,
+  "per_owner_max_sessions": 6,
   "experimental_sdk_runtime": false
 }
 ```

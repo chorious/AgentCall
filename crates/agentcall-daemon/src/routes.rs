@@ -201,27 +201,31 @@ pub(crate) fn checkpoint_session(state: &Arc<AppState>, session_id: &str) -> Res
     let agent_dir = state.workspace.join(".agentcall");
     let _guard = state.state_writer.lock().unwrap();
     let path = agent_dir.join("state").join("active_sessions.json");
-    let mut sessions = read_json_file(&path, json!([]));
-    let mut items = sessions.as_array().cloned().unwrap_or_default();
+    let mut sessions = read_json_file(&path, json!({}));
+    if !sessions.is_object() {
+        sessions = json!({});
+    }
     let now = chrono::Utc::now().to_rfc3339();
-    if let Some(existing) = items
-        .iter_mut()
-        .find(|item| item.get("session_id").and_then(Value::as_str) == Some(session_id))
-    {
-        if let Some(object) = existing.as_object_mut() {
+    let object = sessions.as_object_mut().unwrap();
+    match object.get_mut(session_id) {
+        Some(existing) if existing.is_object() => {
+            let object = existing.as_object_mut().unwrap();
             object.insert("status".to_string(), json!("checkpoint_requested"));
             object.insert("updated_at".to_string(), json!(now));
         }
-    } else {
-        items.push(json!({
-            "session_id": session_id,
-            "status": "checkpoint_requested",
-            "runtime": "daemon",
-            "created_at": now,
-            "updated_at": now,
-        }));
+        _ => {
+            object.insert(
+                session_id.to_string(),
+                json!({
+                    "session_id": session_id,
+                    "status": "checkpoint_requested",
+                    "runtime": "daemon",
+                    "created_at": now,
+                    "updated_at": now,
+                }),
+            );
+        }
     }
-    sessions = json!(items);
     write_json_file(&path, &sessions)?;
     append_agent_event_locked(
         state,
@@ -1136,6 +1140,37 @@ mod tests {
                 .join(".agentcall/tasks/task-route/calls/call-a/context.json")
                 .exists()
         );
+    }
+
+    #[test]
+    fn checkpoint_session_preserves_active_sessions_object_shape() {
+        let workspace = test_workspace("checkpoint-object");
+        let state = Arc::new(AppState::test(workspace.clone()));
+        let state_dir = workspace.join(".agentcall").join("state");
+        std::fs::create_dir_all(&state_dir).unwrap();
+        write_json_file(
+            &state_dir.join("active_sessions.json"),
+            &json!({
+                "worker-a": {
+                    "session_id": "worker-a",
+                    "status": "running",
+                    "runtime": "daemon"
+                },
+                "worker-b": {
+                    "session_id": "worker-b",
+                    "status": "running",
+                    "runtime": "daemon"
+                }
+            }),
+        )
+        .unwrap();
+
+        checkpoint_session(&state, "worker-a").unwrap();
+
+        let sessions = read_json_file(&state_dir.join("active_sessions.json"), json!({}));
+        assert!(sessions.is_object());
+        assert_eq!(sessions["worker-a"]["status"], "checkpoint_requested");
+        assert_eq!(sessions["worker-b"]["status"], "running");
     }
 
     #[test]
