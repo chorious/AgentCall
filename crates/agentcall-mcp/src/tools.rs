@@ -99,7 +99,7 @@ fn session_tool() -> Value {
                 "name": {"type": "string"},
                 "view": {"type": "string", "enum": ["summary", "tui", "events", "debug", "raw"], "default": "summary"},
                 "detail": {"type": "string", "enum": ["compact", "debug", "raw"], "default": "compact"},
-                "include": {"type": "array", "items": {"type": "string", "enum": ["summary", "clean_tail", "plan", "events", "artifacts", "policy", "metrics", "debug"]}, "default": ["summary"]},
+                "include": {"type": "array", "items": {"type": "string", "enum": ["summary", "clean_tail", "screen", "plan", "events", "artifacts", "policy", "metrics", "debug"]}, "default": ["summary"]},
                 "cursor": {"type": "integer", "minimum": 0},
                 "limit": {"type": "integer", "minimum": 1, "maximum": 200, "default": 50},
                 "event_types": {"type": "array", "items": {"type": "string"}}

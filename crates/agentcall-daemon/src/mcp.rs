@@ -11,7 +11,8 @@ use crate::session::get_session;
 use crate::state::{AppState, append_agent_event};
 use crate::store::EventQuery;
 use crate::summary::{
-    board_owner_filter, board_state, clean_session_output, session_plan_artifact, session_summary,
+    board_owner_filter, board_state, clean_session_output, deprecated_clean_tail_value,
+    session_plan_artifact, session_summary, terminal_snapshot_value,
 };
 use crate::util::now_ms;
 use serde::Deserialize;
@@ -91,7 +92,7 @@ pub(crate) fn mcp_tools() -> Vec<Value> {
                     "name": {"type": "string"},
                     "view": {"type": "string", "enum": ["summary", "tui", "events", "debug", "raw"], "default": "summary"},
                     "detail": {"type": "string", "enum": ["compact", "debug", "raw"], "default": "compact"},
-                    "include": {"type": "array", "items": {"type": "string", "enum": ["summary", "clean_tail", "plan", "events", "artifacts", "policy", "metrics", "debug"]}, "default": ["summary"]},
+                    "include": {"type": "array", "items": {"type": "string", "enum": ["summary", "clean_tail", "screen", "plan", "events", "artifacts", "policy", "metrics", "debug"]}, "default": ["summary"]},
                     "cursor": {"type": "integer", "minimum": 0},
                     "limit": {"type": "integer", "minimum": 1, "maximum": 200, "default": 50},
                     "event_types": {"type": "array", "items": {"type": "string"}}
@@ -198,7 +199,7 @@ fn mcp_session(state: &AppState, args: &Value) -> Result<Value, String> {
         .and_then(Value::as_str)
         .unwrap_or_else(|| legacy_session_view(&include));
     match view {
-        "summary" => Ok(session_summary_view(state, name)),
+        "summary" => Ok(session_summary_view(state, name, &include)),
         "tui" => session_tui_view(state, name, args),
         "events" => session_events(state, name, args, false),
         "debug" => session_debug_view(state, name, args, &include),
@@ -220,8 +221,9 @@ fn legacy_session_view(include: &[String]) -> &'static str {
     }
 }
 
-fn session_summary_view(state: &AppState, name: &str) -> Value {
+fn session_summary_view(state: &AppState, name: &str, include: &[String]) -> Value {
     let projection = session_projection_summary(state, name);
+    let wants_screen = include.iter().any(|item| item == "screen");
     let attention_status = projection
         .get("attention_status")
         .and_then(Value::as_str)
@@ -230,7 +232,7 @@ fn session_summary_view(state: &AppState, name: &str) -> Value {
         .get("last_progress_brief")
         .cloned()
         .unwrap_or(Value::Null);
-    let value = json!({
+    let mut value = json!({
         "schema_version": 1,
         "view": "summary",
         "session": projection.get("session").cloned().unwrap_or_else(|| json!(name)),
@@ -255,6 +257,20 @@ fn session_summary_view(state: &AppState, name: &str) -> Value {
         "claude_cwd": projection.get("claude_cwd").cloned().unwrap_or(Value::Null),
         "warnings": projection.get("warnings").cloned().unwrap_or_else(|| json!([]))
     });
+    if wants_screen {
+        let terminal = get_session(state, name)
+            .map(|session| terminal_snapshot_value(&session, 40))
+            .unwrap_or_else(|| {
+                json!({
+                    "screen_snapshot_available": false,
+                    "raw_output_tail_available": false,
+                    "reason": "session is not live; screen snapshot requires an in-memory PTY session"
+                })
+            });
+        if let Some(object) = value.as_object_mut() {
+            object.insert("terminal".to_string(), terminal);
+        }
+    }
     attach_budget(
         value,
         "summary",
@@ -263,7 +279,7 @@ fn session_summary_view(state: &AppState, name: &str) -> Value {
             "raw_events": true,
             "tool_outputs": true,
             "tool_inputs": true,
-            "terminal_tail": true
+            "terminal_tail": !wants_screen
         }),
     )
 }
@@ -446,27 +462,29 @@ fn session_debug_view(
 ) -> Result<Value, String> {
     let wants_clean_tail = include.iter().any(|item| item == "clean_tail")
         || args.get("detail").and_then(Value::as_str) == Some("debug");
+    let wants_screen = include.iter().any(|item| item == "screen")
+        || args.get("detail").and_then(Value::as_str) == Some("debug");
     let wants_plan = include.iter().any(|item| item == "plan");
     let wants_events = include.iter().any(|item| item == "events");
     let mut response = json!({
         "schema_version": 1,
         "view": "debug",
-        "summary": session_summary_view(state, name),
+        "summary": session_summary_view(state, name, &[]),
     });
-    let session = if wants_clean_tail || wants_plan {
+    let session = if wants_clean_tail || wants_screen || wants_plan {
         Some(get_session(state, name).ok_or_else(|| {
-            "session is not live; clean_tail/plan require an in-memory PTY session".to_string()
+            "session is not live; clean_tail/screen/plan require an in-memory PTY session".to_string()
         })?)
     } else {
         None
     };
+    if wants_screen {
+        let session = session.as_ref().unwrap();
+        response["terminal"] = terminal_snapshot_value(session, 80);
+    }
     if wants_clean_tail {
         let session = session.as_ref().unwrap();
-        response["clean_tail"] = json!({
-                "session": name,
-                "clean_output": clean_session_output(session),
-                "decode_health": session.decode_health.lock().unwrap().clone()
-        });
+        response["clean_tail"] = deprecated_clean_tail_value(session, 80);
     }
     if wants_plan {
         let session = session.as_ref().unwrap();

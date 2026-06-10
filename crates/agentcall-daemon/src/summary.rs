@@ -10,6 +10,7 @@ use crate::scheduler::scheduler_health;
 use crate::session::{Session, SessionInfo, list_sessions};
 use crate::state::{AppState, read_events, read_json_file, write_json_file};
 use crate::terminal::{clean_terminal_text, tail_lines};
+use crate::terminal_screen::TerminalEmulator;
 use crate::util::now_ms;
 use serde_json::Value;
 use std::collections::HashSet;
@@ -43,8 +44,8 @@ pub(crate) fn board_state(
         return board_attention_projection(state, owner_id);
     }
     let agent_dir = state.workspace.join(".agentcall");
-    let live_daemon_sessions = list_sessions(state);
-    cleanup_stale_runtime_state(state, &live_daemon_sessions);
+    let runtime_sessions = list_sessions(state);
+    cleanup_stale_runtime_state(state, &runtime_sessions);
     let attention = attention_items(state);
     if filter == Some("attention") {
         return serde_json::json!({
@@ -80,8 +81,10 @@ pub(crate) fn board_state(
     let full = serde_json::json!({
         "workspace": state.workspace,
         "runtime_health": runtime_health_value,
-        "pty_sessions": live_daemon_sessions,
-        "live_daemon_sessions": list_sessions(state),
+        "pty_sessions": runtime_sessions.clone(),
+        "runtime_sessions": runtime_sessions.clone(),
+        "live_daemon_sessions": runtime_sessions,
+        "live_daemon_sessions_deprecated_alias": true,
         "legacy_detached_sessions": legacy_sessions,
         "attention": attention,
         "active_sessions": active_sessions,
@@ -96,7 +99,9 @@ pub(crate) fn board_state(
     let selected = match section.unwrap_or("all") {
         "sessions" => serde_json::json!({
             "workspace": state.workspace,
+            "runtime_sessions": full["runtime_sessions"],
             "live_daemon_sessions": full["live_daemon_sessions"],
+            "live_daemon_sessions_deprecated_alias": true,
             "legacy_detached_sessions": full["legacy_detached_sessions"],
         }),
         "events" => {
@@ -118,7 +123,9 @@ pub(crate) fn board_state(
             "workspace": state.workspace,
             "view": "compact",
             "runtime_health": selected.get("runtime_health").cloned().unwrap_or_else(|| runtime_health(state)),
+            "runtime_sessions": selected.get("runtime_sessions").cloned().unwrap_or_else(|| selected.get("live_daemon_sessions").cloned().unwrap_or(serde_json::json!([]))),
             "live_daemon_sessions": selected.get("live_daemon_sessions").cloned().unwrap_or(serde_json::json!([])),
+            "live_daemon_sessions_deprecated_alias": true,
             "legacy_detached_sessions": selected.get("legacy_detached_sessions").cloned().unwrap_or(serde_json::json!([])),
             "attention": selected.get("attention").cloned().unwrap_or(serde_json::json!([])),
             "routes": recent_route_summaries(&full["routes"]),
@@ -535,12 +542,6 @@ pub(crate) fn session_summary(state: &AppState, session: &Arc<Session>) -> serde
         lifecycle_dimensions(&status).unwrap_or_else(|| {
             if let Some((liveness, attention)) = hook_dimensions {
                 (liveness, attention, "hook".to_string())
-            } else if waiting_input || interrupted {
-                (
-                    "waiting_input".to_string(),
-                    "waiting_input".to_string(),
-                    "tui".to_string(),
-                )
             } else if status == "running" {
                 (
                     "working".to_string(),
@@ -826,8 +827,44 @@ pub(crate) fn session_plan_artifact(
 }
 
 pub(crate) fn clean_session_output(session: &Arc<Session>) -> String {
-    let text = session.clean_replay.lock().unwrap().clone();
-    tail_lines(&clean_terminal_text(&text), 120)
+    terminal_snapshot_tail_text(session, 120)
+}
+
+pub(crate) fn terminal_snapshot_value(
+    session: &Arc<Session>,
+    max_lines: usize,
+) -> serde_json::Value {
+    let snapshot = session.terminal_screen.lock().unwrap().snapshot(max_lines);
+    serde_json::json!({
+        "raw_output_tail_available": true,
+        "screen_snapshot_available": true,
+        "screen_snapshot": snapshot,
+    })
+}
+
+pub(crate) fn terminal_snapshot_tail_text(session: &Arc<Session>, max_lines: usize) -> String {
+    session
+        .terminal_screen
+        .lock()
+        .unwrap()
+        .snapshot(max_lines)
+        .tail
+        .join("\n")
+}
+
+pub(crate) fn deprecated_clean_tail_value(
+    session: &Arc<Session>,
+    max_lines: usize,
+) -> serde_json::Value {
+    let raw_text = session.clean_replay.lock().unwrap().clone();
+    serde_json::json!({
+        "deprecated": true,
+        "replacement": "terminal.screen_snapshot.tail",
+        "session": session.name,
+        "clean_output": terminal_snapshot_tail_text(session, max_lines),
+        "raw_output_tail": tail_lines(&clean_terminal_text(&raw_text), max_lines),
+        "decode_health": session.decode_health.lock().unwrap().clone()
+    })
 }
 
 fn patience_contract(
@@ -1682,7 +1719,9 @@ mod tests {
 
         let board = board_state(&state, Some("compact"), Some("attention"), None, None);
         assert_eq!(board["projection_only"], true);
-        assert_eq!(board["live_daemon_sessions"][0]["session"], "worker-a");
+        assert_eq!(board["live_daemon_sessions"].as_array().unwrap().len(), 0);
+        assert_eq!(board["runtime_sessions"].as_array().unwrap().len(), 0);
+        assert_eq!(board["historical_sessions"][0]["session"], "worker-a");
         assert_eq!(
             board["attention"][0]["attention_status"],
             "needs_permission"
@@ -1727,9 +1766,11 @@ mod tests {
         );
         assert_eq!(board["projection_only"], true);
         assert_eq!(board["owner_id"], "codex");
-        assert_eq!(board["live_daemon_sessions"].as_array().unwrap().len(), 1);
-        assert_eq!(board["live_daemon_sessions"][0]["session"], "codex-worker");
-        assert_eq!(board["live_daemon_sessions"][0]["owner"], "codex");
+        assert_eq!(board["live_daemon_sessions"].as_array().unwrap().len(), 0);
+        assert_eq!(board["runtime_sessions"].as_array().unwrap().len(), 0);
+        assert_eq!(board["historical_sessions"].as_array().unwrap().len(), 1);
+        assert_eq!(board["historical_sessions"][0]["session"], "codex-worker");
+        assert_eq!(board["historical_sessions"][0]["owner"], "codex");
         assert_eq!(board["attention"].as_array().unwrap().len(), 1);
         assert_eq!(board["attention"][0]["session"], "codex-worker");
         let _ = fs::remove_dir_all(root);

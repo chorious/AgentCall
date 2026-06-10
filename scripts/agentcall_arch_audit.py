@@ -74,7 +74,7 @@ def check_mcp_default_session_fast_path(root: Path) -> list[str]:
     text = path.read_text(encoding="utf-8")
     body = extract_rust_item_body(text, "fn mcp_session")
     failures: list[str] = []
-    if '"summary" => Ok(session_summary_view(state, name))' not in body:
+    if '"summary" => Ok(session_summary_view(state, name, &include))' not in body:
         failures.append("mcp_session must route view=summary to session_summary_view")
     if "session_summary(" in body:
         failures.append("mcp_session default path must not call full session_summary")

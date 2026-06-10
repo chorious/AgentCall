@@ -24,6 +24,7 @@ mod store_json;
 mod store_sqlite;
 mod summary;
 mod terminal;
+mod terminal_screen;
 mod util;
 
 use crate::config::LocalConfig;

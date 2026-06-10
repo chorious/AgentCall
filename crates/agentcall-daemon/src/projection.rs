@@ -1,5 +1,5 @@
 use crate::events::EventEnvelopeV1;
-use crate::session::{Session, SessionInfo};
+use crate::session::{Session, SessionInfo, list_sessions};
 use crate::state::AppState;
 use crate::store::BoardQuery;
 use serde::{Deserialize, Serialize};
@@ -35,6 +35,18 @@ pub(crate) struct SessionProjectionV1 {
     pub(crate) report_ready: bool,
     pub(crate) last_error_brief: Option<String>,
     pub(crate) warnings: Vec<String>,
+    #[serde(default)]
+    pub(crate) terminal: bool,
+    #[serde(default)]
+    pub(crate) terminal_event_id: Option<String>,
+    #[serde(default)]
+    pub(crate) terminal_global_seq: Option<u64>,
+    #[serde(default)]
+    pub(crate) terminal_reason: Option<String>,
+    #[serde(default)]
+    pub(crate) stop_intent: Option<String>,
+    #[serde(default)]
+    pub(crate) last_command_status: Option<Value>,
 }
 
 #[derive(Clone, Debug)]
@@ -74,6 +86,12 @@ pub(crate) fn default_session_projection(session: &SessionInfo) -> SessionProjec
         report_ready: false,
         last_error_brief: None,
         warnings: vec![],
+        terminal: false,
+        terminal_event_id: None,
+        terminal_global_seq: None,
+        terminal_reason: None,
+        stop_intent: None,
+        last_command_status: None,
     }
 }
 
@@ -106,6 +124,12 @@ pub(crate) fn stale_projection_for_session_name(session_name: &str) -> SessionPr
         report_ready: false,
         last_error_brief: None,
         warnings: vec!["projection missing; default path did not scan cold logs".to_string()],
+        terminal: false,
+        terminal_event_id: None,
+        terminal_global_seq: None,
+        terminal_reason: None,
+        stop_intent: None,
+        last_command_status: None,
     }
 }
 
@@ -170,9 +194,31 @@ pub(crate) fn apply_event_to_projection(
     projection.owner = event.owner_id.clone();
 
     let mut reason = "event_reduced".to_string();
+    if projection.terminal
+        && !matches!(
+            event.event_type.as_str(),
+            "session.started" | "process.started" | "mcp.tool_called" | "pty.session_started"
+        )
+        && event.event_type.starts_with("command.")
+    {
+        update_last_command_status(&mut projection, event);
+        projection.last_progress_brief = Some(event.message.clone());
+        return ProjectionUpdate {
+            projection,
+            changed: true,
+            reason: "terminal_dominated_command_event".to_string(),
+        };
+    }
+
     match event.event_type.as_str() {
         "session.started" | "process.started" | "mcp.tool_called" | "pty.session_started" => {
+            projection.terminal = false;
+            projection.terminal_event_id = None;
+            projection.terminal_global_seq = None;
+            projection.terminal_reason = None;
+            projection.stop_intent = None;
             projection.liveness_status = "working".to_string();
+            projection.turn_status = "working".to_string();
             projection.attention_status = "none".to_string();
             projection.needs_attention = false;
             projection.last_progress_brief = Some(event.message.clone());
@@ -182,25 +228,34 @@ pub(crate) fn apply_event_to_projection(
             }
         }
         "command.accepted" | "command.completed" | "pty.input_sent" => {
+            update_last_command_status(&mut projection, event);
             projection.liveness_status = "working".to_string();
             projection.attention_status = "none".to_string();
             projection.needs_attention = false;
             projection.last_progress_brief = Some(event.message.clone());
         }
         "command.awaiting_observation" => {
+            update_last_command_status(&mut projection, event);
             projection.liveness_status = "working".to_string();
             projection.turn_status = "awaiting_observation".to_string();
             projection.attention_status = "none".to_string();
             projection.needs_attention = false;
             projection.last_progress_brief = Some(event.message.clone());
         }
-        "session.cleanup" | "process.exited" | "pty.session_ended" => {
-            projection.liveness_status = "completed".to_string();
-            projection.attention_status = "none".to_string();
-            projection.needs_attention = false;
+        "session.cleanup" => {
+            if !projection.terminal {
+                projection.liveness_status = "cleanup_observed".to_string();
+                projection.attention_status = "needs_runtime_reconcile".to_string();
+                projection.needs_attention = true;
+                projection.next_recommended_action = "inspect_runtime_health".to_string();
+            }
             projection.last_progress_brief = Some(event.message.clone());
         }
+        "process.exited" | "pty.session_ended" => {
+            apply_terminal_event(&mut projection, event);
+        }
         "pty.stop_requested" => {
+            projection.stop_intent = Some("stop".to_string());
             projection.liveness_status = "stopping".to_string();
             projection.turn_status = "awaiting_observation".to_string();
             projection.attention_status = "none".to_string();
@@ -208,6 +263,7 @@ pub(crate) fn apply_event_to_projection(
             projection.last_progress_brief = Some(event.message.clone());
         }
         "pty.kill_requested" => {
+            projection.stop_intent = Some("kill".to_string());
             projection.liveness_status = "killing".to_string();
             projection.turn_status = "awaiting_observation".to_string();
             projection.attention_status = "none".to_string();
@@ -219,7 +275,12 @@ pub(crate) fn apply_event_to_projection(
         | "session.writer_closed"
         | "session.reader_failed"
         | "session.orphaned" => {
+            projection.terminal = true;
+            projection.terminal_event_id = Some(event.event_id.clone());
+            projection.terminal_global_seq = Some(event.global_seq);
+            projection.terminal_reason = Some(event.event_type.clone());
             projection.liveness_status = "failed_or_orphaned".to_string();
+            projection.turn_status = "terminal".to_string();
             projection.attention_status = "failed".to_string();
             projection.needs_attention = true;
             projection.last_error_brief = Some(
@@ -269,7 +330,9 @@ pub(crate) fn board_attention_projection(state: &AppState, owner_id: Option<&str
             owner_id: owner_id.map(str::to_string),
         })
         .unwrap_or_else(|_| serde_json::json!({"sessions": []}));
-    let live_daemon_sessions = projection_items(all.get("sessions").and_then(Value::as_array));
+    let live_sessions = list_sessions(state);
+    let runtime_sessions = runtime_session_items(&live_sessions);
+    let historical_sessions = projection_items(all.get("sessions").and_then(Value::as_array));
     let attention = projection_items(
         attention_projection
             .get("sessions")
@@ -282,9 +345,40 @@ pub(crate) fn board_attention_projection(state: &AppState, owner_id: Option<&str
         "owner_id": owner_id,
         "projection_only": true,
         "store_backend": state.store.backend_name(),
-        "live_daemon_sessions": live_daemon_sessions,
+        "runtime_sessions": runtime_sessions.clone(),
+        "live_daemon_sessions": runtime_sessions,
+        "live_daemon_sessions_deprecated_alias": true,
+        "historical_sessions": historical_sessions.clone(),
+        "counts": {
+            "runtime": live_sessions.len(),
+            "historical": historical_sessions.len(),
+            "attention": attention.len(),
+        },
         "attention": attention,
     })
+}
+
+fn runtime_session_items(items: &[SessionInfo]) -> Vec<Value> {
+    items
+        .iter()
+        .map(|session| {
+            serde_json::json!({
+                "session": session.name,
+                "name": session.name,
+                "runtime": "pty",
+                "status": session.status,
+                "liveness_status": if session.status == "running" { "working" } else { session.status.as_str() },
+                "attention_status": "none",
+                "needs_attention": false,
+                "cwd": session.cwd,
+                "child_pid": session.child_pid,
+                "created_at": session.created_at,
+                "updated_at": session.updated_at,
+                "replay_bytes": session.replay_bytes,
+                "decode_health": session.decode_health,
+            })
+        })
+        .collect()
 }
 
 fn projection_items(items: Option<&Vec<Value>>) -> Vec<Value> {
@@ -367,6 +461,55 @@ fn reduce_hook_event(projection: &mut SessionProjectionV1, event: &EventEnvelope
         projection.next_recommended_action = "accept_report_or_stop_worker".to_string();
         projection.last_progress_brief = Some("Worker wrote the requested report.".to_string());
     }
+}
+
+fn update_last_command_status(projection: &mut SessionProjectionV1, event: &EventEnvelopeV1) {
+    projection.last_command_status = Some(serde_json::json!({
+        "event_id": event.event_id.clone(),
+        "global_seq": event.global_seq,
+        "session_seq": event.session_seq,
+        "event_type": event.event_type.clone(),
+        "command_id": event.command_id.clone(),
+        "message": event.message.clone(),
+        "awaiting_observation": event.payload.get("awaiting_observation").cloned().unwrap_or(Value::Null),
+    }));
+}
+
+fn apply_terminal_event(projection: &mut SessionProjectionV1, event: &EventEnvelopeV1) {
+    projection.terminal = true;
+    projection.terminal_event_id = Some(event.event_id.clone());
+    projection.terminal_global_seq = Some(event.global_seq);
+    projection.terminal_reason = Some(event.event_type.clone());
+    projection.turn_status = "terminal".to_string();
+    projection.last_progress_brief = Some(event.message.clone());
+
+    match projection.stop_intent.as_deref() {
+        Some("kill") => {
+            projection.liveness_status = "killed".to_string();
+            projection.attention_status = "none".to_string();
+            projection.needs_attention = false;
+        }
+        Some("stop") => {
+            projection.liveness_status = "stopped".to_string();
+            projection.attention_status = "none".to_string();
+            projection.needs_attention = false;
+        }
+        _ if terminal_exit_code(event).is_some_and(|code| code != 0) => {
+            projection.liveness_status = "failed".to_string();
+            projection.attention_status = "failed".to_string();
+            projection.needs_attention = true;
+            projection.next_recommended_action = "inspect_failure_or_restart_worker".to_string();
+        }
+        _ => {
+            projection.liveness_status = "completed".to_string();
+            projection.attention_status = "none".to_string();
+            projection.needs_attention = false;
+        }
+    }
+}
+
+fn terminal_exit_code(event: &EventEnvelopeV1) -> Option<i64> {
+    event.payload.get("exit_code").and_then(Value::as_i64)
 }
 
 fn hook_event_marks_report_ready(event: &EventEnvelopeV1) -> bool {
@@ -458,8 +601,38 @@ mod tests {
             Some(killed.projection),
             &test_projection_event(4, "worker-a", "pty.session_ended", "PTY session ended."),
         );
-        assert_eq!(ended.projection.liveness_status, "completed");
+        assert_eq!(ended.projection.liveness_status, "killed");
         assert_eq!(ended.projection.attention_status, "none");
+        assert!(ended.projection.terminal);
+        assert_eq!(ended.projection.turn_status, "terminal");
+    }
+
+    #[test]
+    fn terminal_event_dominates_late_command_awaiting_observation() {
+        let started = apply_event_to_projection(
+            None,
+            &test_projection_event(1, "worker-a", "pty.session_started", "PTY session started."),
+        );
+        let ended = apply_event_to_projection(
+            Some(started.projection),
+            &test_projection_event(2, "worker-a", "pty.session_ended", "PTY session ended."),
+        );
+        assert_eq!(ended.projection.liveness_status, "completed");
+        assert_eq!(ended.projection.turn_status, "terminal");
+
+        let late = apply_event_to_projection(
+            Some(ended.projection),
+            &test_projection_event(
+                3,
+                "worker-a",
+                "command.awaiting_observation",
+                "Session actor dispatched command and is waiting for observed worker state.",
+            ),
+        );
+        assert_eq!(late.projection.liveness_status, "completed");
+        assert_eq!(late.projection.turn_status, "terminal");
+        assert_eq!(late.projection.attention_status, "none");
+        assert!(late.projection.last_command_status.is_some());
     }
 
     #[test]

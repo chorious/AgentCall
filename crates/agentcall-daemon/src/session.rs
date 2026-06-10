@@ -4,6 +4,7 @@ use crate::ownership::{ensure_owner_lease, release_owner_lease, release_workspac
 use crate::process::ProcessHandle;
 use crate::state::{AppState, append_agent_event};
 use crate::terminal::{DecodeHealth, append_limited_text, decode_utf8_stream};
+use crate::terminal_screen::{TerminalEmulator, TerminalScreen};
 use crate::util::{now_ms, safe_name};
 use portable_pty::{Child, ChildKiller, CommandBuilder, MasterPty, PtySize, native_pty_system};
 use serde::{Deserialize, Serialize};
@@ -31,6 +32,7 @@ pub(crate) struct Session {
     pub(crate) replay: Mutex<Vec<u8>>,
     pub(crate) clean_replay: Mutex<String>,
     pub(crate) decode_health: Mutex<DecodeHealth>,
+    pub(crate) terminal_screen: Mutex<TerminalScreen>,
     pub(crate) clients: Mutex<Vec<Sender<StreamEvent>>>,
 }
 
@@ -89,11 +91,13 @@ pub(crate) fn start_session(
     if !cwd.exists() {
         return Err(format!("cwd does not exist: {}", cwd.display()));
     }
+    let rows = req.rows.unwrap_or(40);
+    let cols = req.cols.unwrap_or(100);
     let pty_system = native_pty_system();
     let pair = pty_system
         .openpty(PtySize {
-            rows: req.rows.unwrap_or(40),
-            cols: req.cols.unwrap_or(100),
+            rows,
+            cols,
             pixel_width: 0,
             pixel_height: 0,
         })
@@ -138,6 +142,7 @@ pub(crate) fn start_session(
         replay: Mutex::new(Vec::new()),
         clean_replay: Mutex::new(String::new()),
         decode_health: Mutex::new(DecodeHealth::default()),
+        terminal_screen: Mutex::new(TerminalScreen::new(rows, cols)),
         clients: Mutex::new(Vec::new()),
     });
 
@@ -194,6 +199,7 @@ pub(crate) fn spawn_reader(
                             replay.drain(..drop);
                         }
                     }
+                    session.terminal_screen.lock().unwrap().process(bytes);
                     let mut control_scan = control_tail.clone();
                     control_scan.extend_from_slice(bytes);
                     for _ in control_scan
@@ -383,6 +389,11 @@ pub(crate) fn resize_session(
             pixel_height: 0,
         })
         .map_err(|err| err.to_string())?;
+    session
+        .terminal_screen
+        .lock()
+        .unwrap()
+        .resize(req.rows, req.cols);
     append_agent_event(
         state,
         "pty.resized",

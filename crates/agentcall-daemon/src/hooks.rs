@@ -1939,7 +1939,18 @@ pub(crate) fn infer_hook_status(event: &str, payload: &serde_json::Value) -> Str
             }
         }
         "Stop" => "idle".to_string(),
-        "SubagentStop" => "checkpoint_due".to_string(),
+        "SubagentStop" => {
+            if payload.get("checkpoint_request").and_then(|value| value.as_bool()) == Some(true)
+                || payload
+                    .get("agentcall_checkpoint")
+                    .and_then(|value| value.as_bool())
+                    == Some(true)
+            {
+                "checkpoint_due".to_string()
+            } else {
+                "observed".to_string()
+            }
+        }
         "SessionEnd" => "completed".to_string(),
         _ => "observed".to_string(),
     }
@@ -2858,6 +2869,13 @@ mod tests {
         assert_eq!(infer_hook_status("Stop", &serde_json::json!({})), "idle");
         assert_eq!(
             infer_hook_status("SubagentStop", &serde_json::json!({})),
+            "observed"
+        );
+        assert_eq!(
+            infer_hook_status(
+                "SubagentStop",
+                &serde_json::json!({"checkpoint_request": true})
+            ),
             "checkpoint_due"
         );
         assert_eq!(

@@ -16,8 +16,8 @@ use crate::session::{
 };
 use crate::state::{AppState, append_agent_event};
 use crate::summary::{
-    board_owner_filter, board_state, clean_session_output, projects_state, runtime_health,
-    session_summary,
+    board_owner_filter, board_state, deprecated_clean_tail_value, projects_state, runtime_health,
+    session_summary, terminal_snapshot_value,
 };
 use portable_pty::PtySize;
 use serde::{Deserialize, Serialize};
@@ -355,8 +355,8 @@ pub(crate) fn dynamic_route(request: Request, state: Arc<AppState>) -> Response 
         ("GET", "output/clean") => match get_session(&state, &name) {
             Some(session) => json_response(&serde_json::json!({
                 "session": name,
-                "clean_output": clean_session_output(&session),
-                "decode_health": session.decode_health.lock().unwrap().clone()
+                "clean_tail": deprecated_clean_tail_value(&session, 120),
+                "terminal": terminal_snapshot_value(&session, 120),
             })),
             None => error_response(404, "session not found"),
         },
