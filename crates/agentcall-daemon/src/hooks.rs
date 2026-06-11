@@ -1786,9 +1786,10 @@ fn bash_readonly_allowed(payload: &serde_json::Value) -> bool {
     if command.is_empty() {
         return false;
     }
+    if !readonly_redirections_allowed(&command) {
+        return false;
+    }
     let forbidden = [
-        ">",
-        ">>",
         "| tee",
         "set-content",
         "out-file",
@@ -1803,7 +1804,6 @@ fn bash_readonly_allowed(payload: &serde_json::Value) -> bool {
         "cp ",
         "mkdir",
         "rmdir",
-        "echo ",
     ];
     if forbidden.iter().any(|needle| command.contains(needle)) {
         return false;
@@ -1822,6 +1822,21 @@ fn bash_readonly_allowed(payload: &serde_json::Value) -> bool {
         "git show",
     ];
     allowed.iter().any(|prefix| command.starts_with(prefix))
+}
+
+fn readonly_redirections_allowed(command: &str) -> bool {
+    let mut scrubbed = command.to_string();
+    for allowed in [
+        "2>/dev/null",
+        "2> /dev/null",
+        "2>nul",
+        "2> nul",
+        "2>$null",
+        "2> $null",
+    ] {
+        scrubbed = scrubbed.replace(allowed, "");
+    }
+    !scrubbed.contains('>')
 }
 
 fn string_array(value: Option<&serde_json::Value>) -> Vec<String> {
@@ -2354,6 +2369,82 @@ mod tests {
         )
         .unwrap();
         assert_eq!(result["decision"]["allowed"], true);
+    }
+
+    #[test]
+    fn pty_auto_route_allows_absolute_write_inside_target_workspace_allowed_path() {
+        let state = test_state("pty-auto-allow-target-absolute");
+        let target_workspace = state.workspace.join("target-workspace");
+        let path = state
+            .workspace
+            .join(".agentcall")
+            .join("state")
+            .join("routes.json");
+        write_json_file(
+            &path,
+            &serde_json::json!({
+                "route-pty": {
+                    "route_id": "route-pty",
+                    "recommended_runtime": "pty",
+                    "session_name": "pty-a",
+                    "result": {
+                        "pty_workflow": "normal",
+                        "workflow_status": "running",
+                        "phase": "execute",
+                        "permission_mode": "auto",
+                        "containment": {
+                            "mode": "enforced_readonly_bash",
+                            "allowed_paths": ["."],
+                            "writable_paths": ["."],
+                            "roots": {
+                                "process_cwd": "D:\\guKimi",
+                                "target_workspace": target_workspace.display().to_string()
+                            },
+                            "writable_roots": [
+                                {
+                                    "kind": "allowed_path",
+                                    "display": ".",
+                                    "abs": target_workspace.display().to_string()
+                                }
+                            ],
+                            "bash_write_policy": "readonly_only"
+                        }
+                    }
+                }
+            }),
+        )
+        .unwrap();
+        let target_file = target_workspace
+            .join(".agentcall-parallel")
+            .join("frontend")
+            .join("report.md");
+        let mut payload = write_payload("claude-a", &target_file.display().to_string());
+        payload["wrapper_session"] = serde_json::json!("pty-a");
+        let result = ingest_hook(
+            &state,
+            HookIngestRequest {
+                event: "PreToolUse".to_string(),
+                payload,
+                runtime: Some("claude-code-session".to_string()),
+            },
+        )
+        .unwrap();
+        assert_eq!(result["decision"]["allowed"], true);
+    }
+
+    #[test]
+    fn bash_readonly_probe_allows_stderr_null_and_echo_fallback() {
+        let probe = bash_payload(
+            "claude-a",
+            "ls -la \"E:\\GameProject\\RKV\\.agentcall-parallel\\vic2\" 2>/dev/null || echo \"Directory does not exist yet\"",
+        );
+        assert!(bash_readonly_allowed(&probe));
+
+        let write = bash_payload(
+            "claude-a",
+            "echo \"hello\" > \"E:\\GameProject\\RKV\\.agentcall-parallel\\vic2\\report.md\"",
+        );
+        assert!(!bash_readonly_allowed(&write));
     }
 
     #[test]
