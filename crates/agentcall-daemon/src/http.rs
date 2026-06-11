@@ -171,6 +171,10 @@ pub(crate) fn route(request: Request, state: Arc<AppState>) -> Response {
                 query.get("filter").map(String::as_str),
                 query.get("section").map(String::as_str),
                 owner_id.as_deref(),
+                query
+                    .get("root")
+                    .or_else(|| query.get("workspace"))
+                    .map(String::as_str),
             ))
         }
         ("GET", "/api/runtime/health") => json_response(&runtime_health(&state)),

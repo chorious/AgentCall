@@ -55,32 +55,17 @@ fn board_tool() -> Value {
 fn route_tool() -> Value {
     json!({
         "name": "agentcall_route",
-        "description": "Recommend or start a Claude Code PTY utility worker. PTY workers are asynchronous background workers, not synchronous function calls; after start, wait for prompt_gate/hooks/session summary before retrying. Use pty_workflow=plan_then_auto only when the supervisor explicitly wants a plan gate.",
+        "description": "Start a Claude Code PTY utility worker. PTY workers are asynchronous background workers, not synchronous function calls; after start, inspect the returned worker state or agentcall_session summary before taking the next action.",
         "inputSchema": {
             "type": "object",
             "properties": {
                 "objective": {"type": "string"},
                 "workspace": {"type": "string"},
-                "mode": {"type": "string", "enum": ["recommend", "start"], "default": "recommend"},
-                "runtime": {"type": "string", "enum": ["auto", "pty"], "default": "auto"},
-                "estimated_minutes": {"type": "integer", "minimum": 0},
-                "estimated_files": {"type": "integer", "minimum": 0},
-                "estimated_loc": {"type": "integer", "minimum": 0},
-                "needs_continuity": {"type": "boolean", "default": false},
-                "risk": {"type": "string", "enum": ["low", "medium", "high"], "default": "medium"},
                 "session_name": {"type": "string"},
-                "command": {"type": "array", "items": {"type": "string"}},
-                "task_id": {"type": "string"},
-                "call_id": {"type": "string"},
-                "phase": {"type": "string", "default": "execute"},
-                    "role": {"type": "string", "default": "executor"},
-                    "allowed_paths": {"type": "array", "items": {"type": "string"}},
-                    "acceptance_criteria": {"type": "array", "items": {"type": "string"}},
-                    "report_path": {"type": "string"},
-                    "read_only": {"type": "boolean", "default": false},
-                    "pty_workflow": {"type": "string", "enum": ["normal", "plan_then_auto"], "default": "normal"},
-                "initial_permission_mode": {"type": "string", "enum": ["plan", "auto", "default"]},
-                "persist_context": {"type": "boolean", "default": true}
+                "allowed_paths": {"type": "array", "items": {"type": "string"}},
+                "acceptance_criteria": {"type": "array", "items": {"type": "string"}},
+                "report_path": {"type": "string"},
+                "read_only": {"type": "boolean", "default": false}
             },
             "required": ["objective"],
             "additionalProperties": false
@@ -91,7 +76,7 @@ fn route_tool() -> Value {
 fn session_tool() -> Value {
     json!({
         "name": "agentcall_session",
-        "description": "Return one daemon PTY session view. Default view=summary is compact and projection-first; use view=tui for dashboard data, view=events for compact events, and view=debug/raw only for explicit inspection.",
+        "description": "Return one daemon PTY session view. Default view=summary is compact and projection-first, including state/why/can_wait/next_actions/report/control/prompt_gate. Use view=tui for dashboard data, view=events for compact events, and view=debug/raw only for explicit inspection.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -113,22 +98,17 @@ fn session_tool() -> Value {
 fn session_send_tool() -> Value {
     json!({
         "name": "agentcall_session_send",
-        "description": "Send text or a high-level nudge action to a daemon PTY session. Avoid repeated continue nudges while the session is still inside its patience window unless attention_status requires intervention.",
+        "description": "Send text or a high-level action to a daemon PTY session. Use only returned next_actions. submit_pending_prompt sends a finite prompt commit signal and returns not_completed=true until UserPromptSubmit, tool progress, or report evidence is observed.",
         "inputSchema": {
             "type": "object",
             "properties": {
                 "root": {"type": "string"},
                 "name": {"type": "string"},
-                "action": {"type": "string", "enum": ["send", "continue", "stop", "kill", "request_report", "revise_plan", "approve_plan", "start_auto", "select_option", "interrupt"], "default": "send"},
-                "text": {"type": "string"},
-                "enter": {"type": "boolean", "default": true},
-                "idempotency_key": {"type": "string", "description": "Optional for MCP callers. If omitted, daemon MCP generates a stable key from session/action/projection/payload."},
-                "control_token": {"type": "string", "description": "Short-lived daemon-minted control token from agentcall_session(summary). Required for destructive or phase-changing actions."},
-                "precondition": {"type": "object"},
-                "owner_id": {"type": "string"},
-                "owner_lease_id": {"type": "string"},
-                "lease_generation": {"type": "integer", "minimum": 0}
-            },
+                    "action": {"type": "string", "enum": ["send", "continue", "request_report", "submit_pending_prompt", "select_option", "interrupt", "stop", "kill", "revise_plan", "approve_plan", "start_auto"], "default": "send"},
+                    "text": {"type": "string"},
+                    "control_token": {"type": "string", "description": "Short-lived daemon-minted control token from agentcall_session(summary). Required for destructive or phase-changing actions."},
+                    "choice": {"type": "string", "description": "Menu/permission choice for select_option, such as 1, 2, or 3."}
+                },
             "required": ["name"],
             "additionalProperties": false
         }
@@ -138,7 +118,7 @@ fn session_send_tool() -> Value {
 fn report_tool() -> Value {
     json!({
         "name": "agentcall_report",
-        "description": "Request or accept a report for a supervised session/task.",
+        "description": "Request or accept a report for a supervised session/task. Accept responses split confidence into overall/artifact/daemon_write/route_match; overall=high requires daemon-observed write or equivalent evidence.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -200,6 +180,37 @@ mod tests {
     }
 
     #[test]
+    fn route_tool_hides_debug_runtime_knobs() {
+        let tool = route_tool();
+        let properties = &tool["inputSchema"]["properties"];
+        assert!(properties.get("objective").is_some());
+        assert!(properties.get("workspace").is_some());
+        assert!(properties.get("allowed_paths").is_some());
+        assert!(properties.get("report_path").is_some());
+        for hidden in [
+            "mode",
+            "runtime",
+            "estimated_minutes",
+            "estimated_files",
+            "estimated_loc",
+            "needs_continuity",
+            "risk",
+            "pty_workflow",
+            "initial_permission_mode",
+            "persist_context",
+            "task_id",
+            "call_id",
+            "phase",
+            "role",
+        ] {
+            assert!(
+                properties.get(hidden).is_none(),
+                "{hidden} leaked into recommended route schema"
+            );
+        }
+    }
+
+    #[test]
     fn session_tool_schema_allows_explicit_debug_includes() {
         let tool = session_tool();
         let include_enum = tool["inputSchema"]["properties"]["include"]["items"]["enum"]
@@ -228,12 +239,17 @@ mod tests {
     }
 
     #[test]
-    fn session_send_tool_exposes_safety_fields() {
+    fn session_send_tool_hides_daemon_owned_safety_fields() {
         let tool = session_send_tool();
         let properties = &tool["inputSchema"]["properties"];
-        assert!(properties.get("idempotency_key").is_some());
-        assert!(properties.get("precondition").is_some());
+        assert!(properties.get("idempotency_key").is_none());
+        assert!(properties.get("precondition").is_none());
+        assert!(properties.get("owner_lease_id").is_none());
+        assert!(properties.get("lease_generation").is_none());
+        assert!(properties.get("choice").is_some());
+        assert!(properties.get("control_token").is_some());
         let actions = properties["action"]["enum"].as_array().unwrap();
         assert!(actions.contains(&json!("kill")));
+        assert!(actions.contains(&json!("submit_pending_prompt")));
     }
 }

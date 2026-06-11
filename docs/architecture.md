@@ -39,11 +39,13 @@ crates/agentcall-daemon/src
   commands.rs     command envelopes, idempotency, safety preconditions
   hooks.rs        hook ingest, binding, policy, claims, report-ready detection
   mcp.rs          daemon-side MCP tool handlers
+  prompt_gate.rs  route prompt delivery gate and UserPromptSubmit ack state
   projection.rs   session projection reducer and compact board items
   routes.rs       route creation, PTY prompt/context, containment
   session.rs      PTY spawn/read/wait/stop, cwd policy
   state.rs        event append, runtime state helpers, log artifacting
   summary.rs      board/session/runtime health projection
+  worker_state.rs normalized Codex-facing worker state and next actions
   store*.rs       JSON/SQLite runtime store implementations
 ```
 
@@ -74,36 +76,35 @@ The long-term direction is projection-first reads: board and session summaries s
 
 1. Codex calls `agentcall_route`.
 2. Daemon validates route fields, reserves leases, creates context packet, and starts a PTY worker.
-3. Claude Code starts in configured `claude_workspace`, not necessarily the task workspace.
-4. Daemon injects `AGENTCALL_WRAPPER_SESSION`.
-5. Claude hooks bind Claude session id/transcript to wrapper session.
-6. Hook events update runtime bindings, file claims, policy denials, and projections.
-7. Worker writes `report_path`.
-8. PostToolUse hook marks route/session as `report_ready`.
-9. Codex reads compact board/session summary and accepts or requests revision.
-10. Stop/cleanup releases claims and leases.
+3. Daemon writes the full handoff to a file and sends Claude a short prompt referencing that file.
+4. Claude Code starts in configured `claude_workspace`, not necessarily the task workspace.
+5. Daemon injects `AGENTCALL_WRAPPER_SESSION`.
+6. Claude hooks bind Claude session id/transcript to wrapper session.
+7. `UserPromptSubmit` closes the prompt gate and marks the task as truly started.
+8. Hook events update runtime bindings, file claims, policy denials, and projections.
+9. Worker writes `report_path`.
+10. PostToolUse hook marks route/session as `report_ready`.
+11. Codex reads compact board/session summary and accepts or requests revision.
+12. Stop/cleanup releases claims and leases.
 
 ## Current Guarantees
 
 - Claude cwd is forced by daemon local config `claude_workspace`.
 - Hook install target is `<claude_workspace>\.claude\settings.local.json`.
-- `stop` and `interrupt` require idempotency and projection precondition.
-- Stale projection preconditions are rejected before actor dispatch.
+- Normal MCP callers do not provide lease ids, preconditions, or idempotency keys; daemon mints command envelopes.
+- Destructive or phase-changing actions require a fresh daemon-minted control token.
+- `SessionStart`, `pty.input_sent`, and command completion are not treated as task start; `UserPromptSubmit` is the task-start ack.
+- Missing prompt ack becomes `prompt_missing` / `submit_pending_prompt`, not silent `working/none`.
 - Repeated policy denial becomes attention, not healthy working.
+- Compact board lists live workers, not historical projections.
+- Default session summary exposes normalized `state`, `why`, `can_wait`, `next_actions`, report info, control token, and debug refs.
 - Writing route `report_path` marks the worker as `report_ready`.
 - Read-only PTY routes conservatively deny `TaskCreate`.
 - Writer/reader PTY failures emit projection-visible failure events.
 
 ## Known Open Gates
 
-Tracked in [reports/v5.3-closure-status.md](reports/v5.3-closure-status.md):
-
-- actor panic guard;
-- control/output channel isolation;
-- stop/interrupt priority queues;
-- graceful stop vs hard kill split;
-- orphan detection after daemon restart;
-- report accept releasing worker leases.
+Tracked against the frozen [v6.0 code plan](v6.0-code-plan.md) and current implementation reports. Do not reopen ACP/SDK as the mainline unless the user explicitly asks.
 
 ## Design Direction
 

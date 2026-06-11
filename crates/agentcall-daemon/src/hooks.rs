@@ -5,7 +5,7 @@ use crate::state::{
 use crate::store::ReportIndexRecord;
 use serde::Deserialize;
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 #[derive(Deserialize)]
 pub(crate) struct HookIngestRequest {
@@ -239,6 +239,26 @@ pub(crate) fn ingest_hook(
         if let Some(wrapper) = wrapper_session.as_deref() {
             mark_route_prompt_submitted_locked(state, &agent_dir, wrapper)?;
         }
+    } else if matches!(
+        req.event.as_str(),
+        "PreToolUse" | "PostToolUse" | "PostToolBatch"
+    ) {
+        if let Some(wrapper) = wrapper_session.as_deref() {
+            mark_route_prompt_progress_observed_locked(
+                state,
+                &agent_dir,
+                wrapper,
+                &format!("hook.{}", req.event),
+            )?;
+            if decision.get("report_ready").and_then(serde_json::Value::as_bool) != Some(true) {
+                mark_route_report_progress_observed_locked(
+                    state,
+                    &agent_dir,
+                    wrapper,
+                    &format!("hook.{}", req.event),
+                )?;
+            }
+        }
     }
 
     upsert_active_session_locked(
@@ -260,6 +280,7 @@ pub(crate) fn ingest_hook(
         }),
     )?;
 
+    let safe_raw = redact_hook_payload(&payload);
     append_agent_event_locked(
         state,
         &agent_dir,
@@ -274,7 +295,7 @@ pub(crate) fn ingest_hook(
             "transcript_path": transcript_path,
             "wrapper_session": wrapper_session,
             "binding_source": binding_source,
-            "raw": payload,
+            "raw": safe_raw,
             "decision": decision,
         }),
     )?;
@@ -294,6 +315,64 @@ pub(crate) fn ingest_hook(
     Ok(response)
 }
 
+fn redact_hook_payload(value: &serde_json::Value) -> serde_json::Value {
+    redact_hook_value(value, None)
+}
+
+fn redact_hook_value(value: &serde_json::Value, key: Option<&str>) -> serde_json::Value {
+    match value {
+        serde_json::Value::Object(map) => {
+            let mut out = serde_json::Map::new();
+            for (child_key, child_value) in map {
+                out.insert(
+                    child_key.clone(),
+                    redact_hook_value(child_value, Some(child_key.as_str())),
+                );
+            }
+            serde_json::Value::Object(out)
+        }
+        serde_json::Value::Array(items) => serde_json::Value::Array(
+            items
+                .iter()
+                .map(|item| redact_hook_value(item, key))
+                .collect(),
+        ),
+        serde_json::Value::String(text) if should_redact_hook_string(key, text) => {
+            serde_json::json!({
+                "redacted": true,
+                "chars": text.chars().count(),
+                "reason": "hook_payload_budget_or_secret"
+            })
+        }
+        _ => value.clone(),
+    }
+}
+
+fn should_redact_hook_string(key: Option<&str>, text: &str) -> bool {
+    let lower_key = key.unwrap_or("").to_ascii_lowercase();
+    if matches!(
+        lower_key.as_str(),
+        "command" | "content" | "prompt" | "authorization" | "control_token"
+    ) {
+        return true;
+    }
+    if lower_key.contains("api_key")
+        || lower_key.contains("token")
+        || lower_key.contains("secret")
+        || lower_key.contains("password")
+    {
+        return true;
+    }
+    let lower_text = text.to_ascii_lowercase();
+    lower_text.contains("$env:")
+        || lower_text.contains("authorization:")
+        || lower_text.contains("bearer ")
+        || lower_text.contains("api_key")
+        || lower_text.contains("api-key")
+        || lower_text.contains("sk-")
+        || text.len() > 1024
+}
+
 fn mark_route_prompt_submitted_locked(
     state: &AppState,
     agent_dir: &Path,
@@ -308,9 +387,10 @@ fn mark_route_prompt_submitted_locked(
         .unwrap_or("");
     if !matches!(
         status,
-        "started_pending_prompt_ack"
-            | "started_pending_prompt_dispatch"
-            | "started_prompt_dispatched_without_hook_ack"
+        "prompt_pending_ack"
+            | "prompt_commit_signal_sent"
+            | "prompt_commit_unacknowledged"
+            | "prompt_missing"
             | "recommended"
             | "started"
     ) {
@@ -329,13 +409,112 @@ fn mark_route_prompt_submitted_locked(
                 "workflow_status": "running",
                 "prompt": {
                     "acknowledged": true,
+                    "task_started": true,
+                    "state": "prompt_submitted",
                     "ack_observed": "hook.UserPromptSubmit",
-                    "ack_observed_at": observed_at
+                    "submitted_at": observed_at,
+                    "ack_observed_at": observed_at,
+                    "active_commit_attempt_id": serde_json::Value::Null
                 },
                 "prompt_gate": {
+                    "schema_version": 2,
                     "acknowledged": true,
+                    "task_started": true,
+                    "state": "prompt_submitted",
                     "ack_observed": "hook.UserPromptSubmit",
-                    "ack_observed_at": observed_at
+                    "submitted_at": observed_at,
+                    "ack_observed_at": observed_at,
+                    "active_commit_attempt_id": serde_json::Value::Null
+                }
+            }
+        }),
+    )
+}
+
+fn mark_route_report_progress_observed_locked(
+    state: &AppState,
+    agent_dir: &Path,
+    wrapper_session: &str,
+    source: &str,
+) -> Result<(), String> {
+    let Some((route_id, route)) = route_for_wrapper_session(state, wrapper_session) else {
+        return Ok(());
+    };
+    let report_status = route
+        .pointer("/result/report/status")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("report_not_requested");
+    if report_status != "report_requested" {
+        return Ok(());
+    }
+    patch_route_record_locked(
+        state,
+        agent_dir,
+        &route_id,
+        serde_json::json!({
+            "updated_at": crate::util::now_ms(),
+            "result": {
+                "report": {
+                    "status": "report_drafting",
+                    "ready": false,
+                    "progress_observed_at_ms": crate::util::now_ms(),
+                    "progress_observed_by": source
+                }
+            }
+        }),
+    )
+}
+
+fn mark_route_prompt_progress_observed_locked(
+    state: &AppState,
+    agent_dir: &Path,
+    wrapper_session: &str,
+    observed_by: &str,
+) -> Result<(), String> {
+    let Some((route_id, route)) = route_for_wrapper_session(state, wrapper_session) else {
+        return Ok(());
+    };
+    let status = route
+        .get("status")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("");
+    if !matches!(
+        status,
+        "prompt_pending_ack"
+            | "prompt_missing"
+            | "prompt_commit_signal_sent"
+            | "prompt_commit_unacknowledged"
+            | "started"
+    ) {
+        return Ok(());
+    }
+    let observed_at = chrono::Utc::now().to_rfc3339();
+    patch_route_record_locked(
+        state,
+        agent_dir,
+        &route_id,
+        serde_json::json!({
+            "status": "prompt_submitted",
+            "updated_at": crate::util::now_ms(),
+            "required_next_step": "inspect_session_summary",
+            "result": {
+                "workflow_status": "running",
+                "prompt": {
+                    "acknowledged": true,
+                    "task_started": true,
+                    "state": "prompt_submitted",
+                    "progress_observed_at": observed_at,
+                    "progress_observed_by": observed_by,
+                    "active_commit_attempt_id": serde_json::Value::Null
+                },
+                "prompt_gate": {
+                    "schema_version": 2,
+                    "acknowledged": true,
+                    "task_started": true,
+                    "state": "prompt_submitted",
+                    "progress_observed_at": observed_at,
+                    "progress_observed_by": observed_by,
+                    "active_commit_attempt_id": serde_json::Value::Null
                 }
             }
         }),
@@ -860,7 +1039,29 @@ pub(crate) fn post_tool_use_observe_locked(
                     "workflow_status": "report_ready",
                     "report_ready": true,
                     "report_path": report_path,
-                    "report_source": "hook_write"
+                    "report_source": "hook_write",
+                    "report": {
+                        "status": "report_ready",
+                        "ready": true,
+                        "path": report_path,
+                        "source": "hook_write",
+                        "observed_at_ms": crate::util::now_ms()
+                    },
+                    "prompt_gate": {
+                        "schema_version": 2,
+                        "state": "prompt_submitted",
+                        "task_started": true,
+                        "progress_observed_at": chrono::Utc::now().to_rfc3339(),
+                        "progress_observed_by": "report_write",
+                        "active_commit_attempt_id": serde_json::Value::Null
+                    },
+                    "prompt": {
+                        "state": "prompt_submitted",
+                        "task_started": true,
+                        "progress_observed_at": chrono::Utc::now().to_rfc3339(),
+                        "progress_observed_by": "report_write",
+                        "active_commit_attempt_id": serde_json::Value::Null
+                    }
                 }
             }),
         )?;
@@ -1619,9 +1820,10 @@ fn report_write_for_wrapper(
 ) -> Option<(String, String, String)> {
     let (route_id, route) = route_for_wrapper_session(state, wrapper_session)?;
     let report_path = route_report_path(&route)?;
+    let target_workspace = route_workspace(state, &route);
     if files
         .iter()
-        .any(|file| paths_equivalent_for_policy(&state.workspace, file, &report_path))
+        .any(|file| paths_equivalent_for_policy(&target_workspace, file, &report_path))
     {
         Some((wrapper_session.to_string(), route_id, report_path))
     } else {
@@ -1629,14 +1831,41 @@ fn report_write_for_wrapper(
     }
 }
 
+fn route_workspace(state: &AppState, route: &serde_json::Value) -> PathBuf {
+    route
+        .get("workspace")
+        .and_then(serde_json::Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| state.workspace.clone())
+}
+
 fn route_report_path(route: &serde_json::Value) -> Option<String> {
     route
         .get("result")
-        .and_then(|result| result.get("context_packet"))
-        .and_then(|packet| packet.get("report_path"))
+        .and_then(|result| result.get("report"))
+        .and_then(|report| report.get("path"))
         .and_then(serde_json::Value::as_str)
         .filter(|value| !value.trim().is_empty())
         .map(str::to_string)
+        .or_else(|| {
+            route
+                .get("result")
+                .and_then(|result| result.get("report"))
+                .and_then(|report| report.get("rel_path"))
+                .and_then(serde_json::Value::as_str)
+                .filter(|value| !value.trim().is_empty())
+                .map(str::to_string)
+        })
+        .or_else(|| {
+            route
+                .get("result")
+                .and_then(|result| result.get("context_packet"))
+                .and_then(|packet| packet.get("report_path"))
+                .and_then(serde_json::Value::as_str)
+                .filter(|value| !value.trim().is_empty())
+                .map(str::to_string)
+        })
         .or_else(|| {
             route
                 .get("result")
@@ -2284,18 +2513,21 @@ mod tests {
                     "route_id": "route-pty",
                     "recommended_runtime": "pty",
                     "session_name": "pty-a",
-                    "status": "started_pending_prompt_ack",
+                    "status": "prompt_pending_ack",
                     "result": {
                         "pty_workflow": "normal",
                         "workflow_status": "starting",
                         "phase": "execute",
                         "prompt": {
                             "acknowledged": false,
-                            "ack_expected": "hook.UserPromptSubmit"
+                            "state": "prompt_pending_ack",
+                            "awaiting_hook": "UserPromptSubmit"
                         },
                         "prompt_gate": {
+                            "schema_version": 2,
                             "acknowledged": false,
-                            "ack_expected": "hook.UserPromptSubmit"
+                            "state": "prompt_pending_ack",
+                            "awaiting_hook": "UserPromptSubmit"
                         }
                     }
                 }
@@ -2325,6 +2557,183 @@ mod tests {
         );
         assert_eq!(
             routes["route-pty"]["result"]["prompt_gate"]["acknowledged"],
+            true
+        );
+    }
+
+    #[test]
+    fn user_prompt_submit_marks_commit_signal_sent_route_prompt_submitted() {
+        let state = test_state("pty-prompt-ack-commit-signal-route");
+        let path = state
+            .workspace
+            .join(".agentcall")
+            .join("state")
+            .join("routes.json");
+        write_json_file(
+            &path,
+            &serde_json::json!({
+                "route-pty": {
+                    "route_id": "route-pty",
+                    "recommended_runtime": "pty",
+                    "session_name": "pty-a",
+                    "status": "prompt_commit_signal_sent",
+                    "result": {
+                        "pty_workflow": "normal",
+                        "workflow_status": "starting",
+                        "phase": "execute",
+                        "prompt": {
+                            "state": "commit_signal_sent",
+                            "active_commit_attempt_id": "prompt-commit-route-pty-pty-a-1",
+                            "commit_attempts": [{"attempt_id": "prompt-commit-route-pty-pty-a-1"}],
+                            "task_started": false
+                        },
+                        "prompt_gate": {
+                            "schema_version": 2,
+                            "state": "commit_signal_sent",
+                            "active_commit_attempt_id": "prompt-commit-route-pty-pty-a-1",
+                            "commit_attempts": [{"attempt_id": "prompt-commit-route-pty-pty-a-1"}],
+                            "task_started": false
+                        }
+                    }
+                }
+            }),
+        )
+        .unwrap();
+        let result = ingest_hook(
+            &state,
+            HookIngestRequest {
+                event: "UserPromptSubmit".to_string(),
+                payload: serde_json::json!({
+                    "session_id": "claude-a",
+                    "wrapper_session": "pty-a",
+                    "prompt": "do work"
+                }),
+                runtime: Some("claude-code-session".to_string()),
+            },
+        )
+        .unwrap();
+        assert_eq!(result["status"], "working");
+
+        let routes = read_json_file(&path, serde_json::json!({}));
+        assert_eq!(routes["route-pty"]["status"], "prompt_submitted");
+        assert_eq!(
+            routes["route-pty"]["result"]["prompt_gate"]["state"],
+            "prompt_submitted"
+        );
+        assert_eq!(
+            routes["route-pty"]["result"]["prompt_gate"]["acknowledged"],
+            true
+        );
+    }
+
+    #[test]
+    fn pre_tool_use_closes_prompt_gate_when_user_prompt_submit_missing() {
+        let state = test_state("pty-prompt-progress-pretool");
+        let path = state
+            .workspace
+            .join(".agentcall")
+            .join("state")
+            .join("routes.json");
+        write_json_file(
+            &path,
+            &serde_json::json!({
+                "route-pty": {
+                    "route_id": "route-pty",
+                    "recommended_runtime": "pty",
+                    "session_name": "pty-a",
+                    "status": "prompt_pending_ack",
+                    "result": {
+                        "prompt_gate": {
+                            "schema_version": 2,
+                            "state": "prompt_pending_ack",
+                            "task_started": false,
+                            "awaiting_hook": "UserPromptSubmit"
+                        }
+                    }
+                }
+            }),
+        )
+        .unwrap();
+        let result = ingest_hook(
+            &state,
+            HookIngestRequest {
+                event: "PreToolUse".to_string(),
+                payload: serde_json::json!({
+                    "session_id": "claude-a",
+                    "wrapper_session": "pty-a",
+                    "tool_name": "Read",
+                    "tool_input": {"file_path": "src/lib.rs"}
+                }),
+                runtime: Some("claude-code-session".to_string()),
+            },
+        )
+        .unwrap();
+        assert_eq!(result["status"], "working");
+
+        let routes = read_json_file(&path, serde_json::json!({}));
+        assert_eq!(routes["route-pty"]["status"], "prompt_submitted");
+        assert_eq!(
+            routes["route-pty"]["result"]["prompt_gate"]["progress_observed_by"],
+            "hook.PreToolUse"
+        );
+        assert_eq!(
+            routes["route-pty"]["result"]["prompt_gate"]["task_started"],
+            true
+        );
+    }
+
+    #[test]
+    fn post_tool_batch_closes_prompt_gate_when_user_prompt_submit_missing() {
+        let state = test_state("pty-prompt-progress-postbatch");
+        let path = state
+            .workspace
+            .join(".agentcall")
+            .join("state")
+            .join("routes.json");
+        write_json_file(
+            &path,
+            &serde_json::json!({
+                "route-pty": {
+                    "route_id": "route-pty",
+                    "recommended_runtime": "pty",
+                    "session_name": "pty-a",
+                    "status": "prompt_pending_ack",
+                    "result": {
+                        "prompt_gate": {
+                            "schema_version": 2,
+                            "state": "prompt_pending_ack",
+                            "task_started": false,
+                            "awaiting_hook": "UserPromptSubmit"
+                        }
+                    }
+                }
+            }),
+        )
+        .unwrap();
+        let result = ingest_hook(
+            &state,
+            HookIngestRequest {
+                event: "PostToolBatch".to_string(),
+                payload: serde_json::json!({
+                    "session_id": "claude-a",
+                    "wrapper_session": "pty-a",
+                    "tool_name": "Read",
+                    "tool_response": {"stdout": "ok"}
+                }),
+                runtime: Some("claude-code-session".to_string()),
+            },
+        )
+        .unwrap();
+        assert_eq!(result["status"], "working");
+
+        let routes = read_json_file(&path, serde_json::json!({}));
+        assert_eq!(routes["route-pty"]["status"], "prompt_submitted");
+        assert_eq!(
+            routes["route-pty"]["result"]["prompt_gate"]["progress_observed_by"],
+            "hook.PostToolBatch"
+        );
+        assert_eq!(
+            routes["route-pty"]["result"]["prompt_gate"]["task_started"],
             true
         );
     }
@@ -2481,12 +2890,21 @@ mod tests {
                     "route_id": "route-pty",
                     "recommended_runtime": "pty",
                     "session_name": "pty-a",
-                    "status": "started_pending_prompt_ack",
+                    "status": "prompt_pending_ack",
                     "result": {
                         "binding_gate": {
                             "required": true,
                             "expected_binding_source": "env",
                             "status": "pending_hook"
+                        },
+                        "prompt_gate": {
+                            "schema_version": 2,
+                            "state": "prompt_pending_ack",
+                            "task_started": false,
+                            "awaiting_hook": "UserPromptSubmit",
+                            "ack_deadline_ms": 15000,
+                            "commit_ack_deadline_ms": 8000,
+                            "commit_attempts": []
                         },
                         "containment": {
                             "mode": "enforced_readonly_bash",
@@ -2757,6 +3175,59 @@ mod tests {
             projection.next_recommended_action,
             "accept_report_or_stop_worker"
         );
+    }
+
+    #[test]
+    fn post_tool_report_write_uses_route_workspace_for_relative_report_path() {
+        let state = test_state("pty-report-ready-route-workspace");
+        let target_workspace = state.workspace.join("target-workspace");
+        let report_rel = ".agentcall/reports/worker-report.md";
+        let report_abs = target_workspace.join(report_rel);
+        let path = state
+            .workspace
+            .join(".agentcall")
+            .join("state")
+            .join("routes.json");
+        write_json_file(
+            &path,
+            &serde_json::json!({
+                "route-report": {
+                    "route_id": "route-report",
+                    "recommended_runtime": "pty",
+                    "session_name": "pty-a",
+                    "workspace": target_workspace.display().to_string(),
+                    "status": "started",
+                    "result": {
+                        "pty_workflow": "normal",
+                        "workflow_status": "running",
+                        "phase": "execute",
+                        "permission_mode": "auto",
+                        "context_packet": {
+                            "report_path": report_rel
+                        }
+                    }
+                }
+            }),
+        )
+        .unwrap();
+
+        let mut payload = write_payload("claude-a", &report_abs.display().to_string());
+        payload["wrapper_session"] = serde_json::json!("pty-a");
+        let result = ingest_hook(
+            &state,
+            HookIngestRequest {
+                event: "PostToolUse".to_string(),
+                payload,
+                runtime: Some("claude-code-session".to_string()),
+            },
+        )
+        .unwrap();
+
+        assert_eq!(result["decision"]["report_ready"], true);
+        assert_eq!(result["decision"]["route_id"], "route-report");
+        let projection = crate::projection::read_session_projection(&state, "pty-a").unwrap();
+        assert!(projection.report_ready);
+        assert_eq!(projection.attention_status, "report_ready");
     }
 
     #[test]

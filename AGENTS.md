@@ -15,11 +15,12 @@ AgentCall lets Codex supervise Claude Code PTY utility workers through a local R
 - Default state source for Codex: compact board/session projection, not raw terminal output.
 - Historical ACP/SDK plans are archived; do not revive them unless the user explicitly asks.
 
-## Frozen v5.4 Plan
+## Frozen Plans
 
-- Authoritative plan: `docs/v5.4-code-plan.md`.
-- The old v5.4.1/v5.4.2/v5.4.3 split drafts are superseded by the single v5.4 mainline plan.
-- Until every v5.4 acceptance criterion is complete, agents must not edit, split, rename, or replace the v5.4 plan.
+- Current authoritative plan: `docs/v6.2-code-plan.md`.
+- `docs/v6.1-code-plan.md` remains a frozen historical plan and must not be edited.
+- The v6.2 plan was created from the v6.1 post-release evidence and is frozen during implementation.
+- Until every v6.2 acceptance criterion is complete, agents must not edit, split, rename, or replace the v6.2 plan.
 - If implementation finds new evidence, write it to `docs/reports/` or an implementation report, then fix code/tests within the frozen plan.
 - If new evidence conflicts with the frozen plan, report a blocker instead of rewriting the plan.
 - Plan changes are user-owned during the freeze; agents may only modify the plan after the user explicitly lifts the freeze.
@@ -71,11 +72,13 @@ Preferred flow:
 ```text
 agentcall_daemon(action=start)
 agentcall_board(view=compact, filter=attention)
-agentcall_route(mode=start, runtime=auto|pty, objective=..., workspace=...)
-agentcall_session(name=..., include=["summary"])
-agentcall_session_send(action=continue|request_report|select_option|interrupt|stop)
+agentcall_route(objective=..., workspace=..., allowed_paths=...)
+agentcall_session(name=...)
+agentcall_session_send(action=<one of returned next_actions>)
 agentcall_report(action=request|accept)
 ```
+
+`agentcall_route` defaults to a daemon-owned PTY worker. Do not ask Codex to choose `runtime`, estimate task size, or hand-build lease/precondition/idempotency fields in the normal flow. `report_path` is optional; the daemon mints a unique report path when it is omitted.
 
 Use `agentcall_daemon(action=status)` as the real availability check. `tool_search agentcall` may be stale or false-negative inside Codex.
 
@@ -122,11 +125,18 @@ git diff --check
 - Put old reviews under `docs/arch/review/`.
 - Root directory should stay focused on source entrypoints, README, CHANGELOG, config template, and build manifests.
 
-## Current v5.4 Status
+## Current v6.2 Status
 
-See `docs/reports/v5.4-implementation-closure.md`.
+See `docs/v6.2-code-plan.md` for the frozen target. Do not edit that plan during implementation.
 
-- v5.4 compact MCP/session views, route short transactions, destructive preconditions, binding trust, path diagnosis, local token boundary, and path traversal checks are implemented.
+- v6.2 keeps the default Codex loop slim: compact board, route start, normalized worker summary, explicit next actions, report request, and structured report acceptance.
+- `submit_pending_prompt` is a finite prompt commit signal, not a completion state; it must converge to `prompt_submitted` or `prompt_commit_unacknowledged`.
+- `agentcall_route` mints a unique per-route report path under the target workspace when `report_path` is omitted.
+- `agentcall_session_send(action=request_report)` is a finite report state transition; observe `report_requested`, `report_drafting`, `report_ready`, or `report_overdue`.
+- Report acceptance confidence is split into `overall`, `artifact`, `daemon_write`, and `route_match`; `overall=high` requires daemon-observed evidence.
+- `agentcall_session` default summary must expose `state`, `why`, `can_wait`, `next_actions`, report info, workspace projection, and a short-lived control token if available.
+- Compact board must list current live workers and attention only; historical projections belong in debug/raw views.
+- Board/session must distinguish daemon workspace, target workspace, Claude cwd, and report workspace.
 - `/api/*` requires daemon token unless `dev_open_loopback=true` is explicitly set in local config.
 - `config/agentcall.local.json` is local-only; do not commit daemon tokens.
-- Keep `docs/v5.4-code-plan.md` frozen as the authoritative plan unless the user explicitly lifts the freeze.
+- Keep `docs/v6.2-code-plan.md` frozen as the authoritative plan unless the user explicitly lifts the freeze.

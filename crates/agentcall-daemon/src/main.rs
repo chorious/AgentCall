@@ -12,6 +12,7 @@ mod mcp;
 mod ownership;
 mod process;
 mod projection;
+mod prompt_gate;
 mod routes;
 mod runtime;
 mod runtime_lock;
@@ -27,6 +28,7 @@ mod summary;
 mod terminal;
 mod terminal_screen;
 mod util;
+mod worker_state;
 
 use crate::config::LocalConfig;
 use crate::http::handle_connection;

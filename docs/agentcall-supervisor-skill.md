@@ -29,71 +29,69 @@ Do not call deprecated delegate/workflow tools. Do not use raw terminal output a
 
 ```text
 1. Inspect board: agentcall_board(view=compact, filter=attention).
-2. Route work: agentcall_route(mode=recommend|start, runtime=auto|pty).
-3. Inspect worker: agentcall_session(name, include=["summary"]).
-4. Send only when summary says it is safe or attention requires intervention.
-5. Accept report only after reading report confidence and evidence.
+2. Route work: agentcall_route(objective, workspace, allowed_paths).
+3. Inspect worker: agentcall_session(name).
+4. Take one of the returned next_actions.
+5. Use request_report only when the worker should close.
+6. Accept report only after reading report confidence and evidence.
 ```
 
-`runtime=auto` selects PTY. `runtime=sdk` is experimental and disabled unless local daemon config explicitly enables it. ACP is not the default runtime.
+`agentcall_route` defaults to a daemon-owned Claude Code PTY worker. Runtime selection, task-size estimation, SDK/ACP knobs, lease ids, preconditions, and idempotency are daemon/debug internals, not the normal Codex loop. `report_path` is optional in normal use; if omitted, the daemon mints a unique per-route report path under the target workspace.
+
+Board and session projections are project-aware. Read `workspace.daemon_workspace`, `workspace.target_workspace`, `workspace.claude_cwd`, and `report.path` before judging where a worker is operating. `workspace` on `agentcall_route` is the target project; Claude Code process cwd still comes from daemon local config.
 
 ## Action Matrix
 
-| State / signal | Codex action |
+| Worker state | Codex action |
 | --- | --- |
-| `projection_stale=true` | Do not send new work. Inspect session events or debug projection first. |
-| `attention_status=none` and `patience_status=inside_patience_window` | Wait. Do not retry the same prompt. |
-| `attention_status=needs_permission` | Use `agentcall_session_send(action=select_option, text="1|2|3")` only after reading the structured interaction. |
-| `attention_status=waiting_input` | Send the minimal missing answer with a fresh `idempotency_key`. |
-| `attention_status=blocked_by_policy` or `policy_blocked` | Do not repeat the denied command. Interrupt only when the worker is clearly stuck or wrong; otherwise change allowed paths or ask for blocker report. |
-| `report_ready=true` | Call `agentcall_report(action=accept)` and inspect `confidence.band`, `evidence`, and `contradictions`. |
-| `confidence.band=low` | Treat the report as unproven. Inspect evidence or request a revised report. |
-| `confidence.contradictions` non-empty | Review before accepting; do not mark task completed. |
+| `starting` / `prompt_pending` with `can_wait=true` | Wait briefly, then refresh `agentcall_session`. |
+| `prompt_missing` | Use `agentcall_session_send(action=submit_pending_prompt)`. Do not queue natural language. |
+| `prompt_commit_unacknowledged` | Use `submit_pending_prompt` only if it is in `next_actions`; otherwise inspect or stop. |
+| `prompt_submitted` | Wait for hook/tool/report progress; do not send more text yet. |
+| `working` | Wait, or request a report only when the task should close. |
+| `idle_after_turn` | Request a report or inspect progress before sending more text. |
+| `report_requested` / `report_drafting` | Wait inside the deadline; refresh `agentcall_session` rather than sending more prompts. |
+| `report_overdue` | Inspect, interrupt, or stop; do not keep waiting as if it were ordinary working. |
+| `needs_permission` | Use `agentcall_session_send(action=select_option, choice="1|2|3")` only after reading the structured interaction. |
+| `blocked_by_policy` | Do not repeat the denied command. Adjust allowed paths/task, request a blocker report, interrupt, or stop. |
+| `report_ready` | Call `agentcall_report(action=accept, session_id=...)` and inspect validation/confidence. |
+| `confidence.overall=medium` | Report artifact exists, but daemon evidence is incomplete; inspect before final closure. |
+| `confidence.overall=low` | Treat the report as unproven. Inspect evidence or request a revised report. |
 
 ## Session Send Rules
 
-Every side-effecting `agentcall_session_send` call must include an explicit `idempotency_key`.
+Codex sends intent; the daemon generates idempotency, attaches leases, checks projection freshness, and returns structured refusals.
 
-Destructive actions such as `interrupt`, `stop`, or future `kill` require a safety precondition when available:
+Use `control_token` only for destructive or phase-changing actions such as `interrupt`, `stop`, `kill`, `approve_plan`, and `start_auto`. Fetch a fresh token from `agentcall_session(name)` before using those actions.
 
-```json
-{
-  "idempotency_key": "stable-operation-key",
-  "precondition": {
-    "projection_last_session_seq": 123,
-    "turn_state": "Idle"
-  }
-}
-```
+Do not provide `idempotency_key`, `owner_lease_id`, `lease_generation`, or `precondition` in normal flow.
 
-Never rely on a timeout retry to resend natural language. Reuse the same `idempotency_key` only for the same exact command payload.
+`agentcall_session_send(action=request_report)` is a state transition, not just natural language. It records `report_requested`, returns a request id/deadline, and expects later daemon-observed report write evidence. After requesting a report, wait for `report_drafting`, `report_ready`, or `report_overdue`.
 
 ## Permission And Menu Rules
 
 Permission menus are structured interactions, not free-form chat prompts.
 
-Use `select_option` for numbered menus. Do not send natural language into a permission menu unless the wrapper explicitly classifies the interaction as a question.
+Use `select_option` with `choice` for numbered menus. Do not send natural language into a permission menu unless the wrapper explicitly classifies the interaction as a question.
 
-When a worker is still running, ordinary `send` may be queued and not heard immediately by Claude Code. Use queued supervisor instructions for gentle guidance; use `interrupt` only when the worker is clearly wrong, unsafe, or must be recovered immediately.
+When a worker is still running, ordinary `send` may be queued and not heard immediately by Claude Code. If the worker is in `prompt_pending`, `prompt_missing`, or `prompt_commit_unacknowledged`, do not queue text; use the returned `next_actions`. `submit_pending_prompt` returns `prompt_commit_signal_sent` with `not_completed=true`; keep observing until `prompt_submitted`, tool progress, report evidence, or explicit failure appears.
 
 ## Runtime Rules
 
-PTY is the default and production runtime. It is human-visible and hook-aware.
-
-SDK runtime is experimental, gated by `experimental_sdk_runtime=true`, and must still emit the same EventEnvelope / Projection contract. It must not bypass SessionActor or write raw PTY stdin.
+PTY is the default and production runtime. It is human-visible and hook-aware. Historical ACP/SDK paths are not part of the normal Codex control loop.
 
 ## Report Acceptance Rules
 
 AgentCall report acceptance is evidence-based:
 
 ```text
-high confidence:
-  structured success report + daemon-observed file write or test pass
+overall=high:
+  report artifact exists and daemon_observed_write/equivalent deterministic evidence is true
 
-medium confidence:
+overall=medium:
   report artifact exists but deterministic backing evidence is incomplete
 
-low confidence:
+overall=low:
   natural-language-only report, missing evidence, policy block, permission denial, test failure, or contradiction
 ```
 

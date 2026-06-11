@@ -34,6 +34,7 @@ pub(crate) struct CommandEnvelopeV1 {
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub(crate) enum CommandType {
     SendInput,
+    SubmitPendingPrompt,
     QueueSupervisorInstruction,
     SelectOption,
     InterruptTurn,
@@ -262,6 +263,7 @@ pub(crate) fn command_type_for_session_send(action: &str) -> CommandType {
         "kill" => CommandType::KillSession,
         "interrupt" => CommandType::InterruptTurn,
         "select_option" => CommandType::SelectOption,
+        "submit_pending_prompt" => CommandType::SubmitPendingPrompt,
         "request_report" => CommandType::RequestReport,
         "continue" | "send" | "revise_plan" | "approve_plan" | "start_auto" => {
             CommandType::SendInput

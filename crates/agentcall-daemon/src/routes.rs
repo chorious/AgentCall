@@ -4,6 +4,7 @@ use crate::ownership::{
     install_reserved_route_leases, release_owner_lease, release_workspace_lease,
     reserve_route_leases,
 };
+use crate::prompt_gate::{DEFAULT_ACK_DEADLINE_MS, route_prompt_id};
 use crate::runtime::{AgentRuntime, StartSpec};
 use crate::runtime_pty::ClaudeCodePtyRuntime;
 use crate::runtime_sdk::{ClaudeCodeSdkRuntime, sdk_runtime_enabled};
@@ -14,6 +15,7 @@ use crate::store::{RouteDecisionV1, SessionRecord};
 use crate::util::{now_ms, safe_name};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use std::path::PathBuf;
 use std::sync::Arc;
 
 #[derive(Deserialize)]
@@ -90,15 +92,16 @@ impl PtyWorkflow {
 }
 
 pub(crate) fn handle_route(state: &Arc<AppState>, req: RouteRequest) -> Result<Value, String> {
+    let mut req = req;
     if req.objective.trim().is_empty() {
         return Err("missing objective".to_string());
     }
-    let mode = req.mode.as_deref().unwrap_or("recommend");
-    if !matches!(mode, "recommend" | "start") {
+    let mode = req.mode.clone().unwrap_or_else(|| "start".to_string());
+    if !matches!(mode.as_str(), "recommend" | "start") {
         return Err("mode must be recommend or start".to_string());
     }
-    let runtime = req.runtime.as_deref().unwrap_or("auto");
-    if !matches!(runtime, "auto" | "pty" | "sdk") {
+    let runtime = req.runtime.clone().unwrap_or_else(|| "auto".to_string());
+    if !matches!(runtime.as_str(), "auto" | "pty" | "sdk") {
         return Err("runtime must be auto, pty, or sdk".to_string());
     }
     if runtime == "sdk" && !sdk_runtime_enabled(state) {
@@ -109,13 +112,15 @@ pub(crate) fn handle_route(state: &Arc<AppState>, req: RouteRequest) -> Result<V
     }
     let route_id = format!("route-{}", state.next_seq());
     let decision = route_decision(&req);
+    let report_source = ensure_route_report_path(&mut req, &mode, &decision.runtime, &route_id);
+    let report_warning = route_report_path_warning(state, &req, &report_source);
     let mut record = RouteRecord {
         route_id: route_id.clone(),
         invocation_id: None,
         objective: req.objective.clone(),
         workspace: req.workspace.clone(),
-        mode: mode.to_string(),
-        runtime: runtime.to_string(),
+        mode: mode.clone(),
+        runtime: runtime.clone(),
         recommended_runtime: decision.runtime.clone(),
         status: "recommended".to_string(),
         reason: decision.reason.clone(),
@@ -139,6 +144,12 @@ pub(crate) fn handle_route(state: &Arc<AppState>, req: RouteRequest) -> Result<V
             "pty" => start_pty_route(state, &req, &mut record)?,
             "sdk" => start_sdk_route(state, &req, &mut record)?,
             other => return Err(format!("unsupported route runtime: {other}")),
+        }
+    }
+    if let Some(report) = route_report_projection(state, &req, &report_source, report_warning) {
+        merge_result_field(&mut record.result, "report", report);
+        if let Some(report_path) = req.report_path.clone() {
+            merge_result_field(&mut record.result, "report_path", json!(report_path));
         }
     }
     if route_has_context_fields(&req) {
@@ -443,6 +454,131 @@ fn route_decision(req: &RouteRequest) -> RouteDecision {
     }
 }
 
+fn ensure_route_report_path(
+    req: &mut RouteRequest,
+    mode: &str,
+    runtime: &str,
+    route_id: &str,
+) -> String {
+    if req
+        .report_path
+        .as_ref()
+        .is_some_and(|value| !value.trim().is_empty())
+    {
+        return "caller".to_string();
+    }
+    if mode != "start" || runtime != "pty" {
+        return "none".to_string();
+    }
+    let session_name = req
+        .session_name
+        .clone()
+        .unwrap_or_else(|| route_id.replace("route-", "route-pty-"));
+    let safe_session = safe_path_segment(&session_name);
+    let safe_route = safe_path_segment(route_id);
+    req.report_path = Some(format!(".agents/agentcall/{safe_route}-{safe_session}.md"));
+    "daemon_minted".to_string()
+}
+
+fn safe_path_segment(value: &str) -> String {
+    let mut out = String::new();
+    for ch in value.chars() {
+        if ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' {
+            out.push(ch);
+        } else {
+            out.push('-');
+        }
+    }
+    if out.is_empty() {
+        "value".to_string()
+    } else {
+        out
+    }
+}
+
+fn route_report_projection(
+    state: &AppState,
+    req: &RouteRequest,
+    source: &str,
+    warning: Option<Value>,
+) -> Option<Value> {
+    let path = req
+        .report_path
+        .as_ref()
+        .filter(|value| !value.trim().is_empty())?;
+    let target_workspace = route_target_workspace(state, req);
+    let abs_path = materialize_route_path(&target_workspace, path);
+    let report_workspace = abs_path
+        .parent()
+        .map(|path| path.display().to_string())
+        .unwrap_or_else(|| target_workspace.display().to_string());
+    Some(json!({
+        "status": "report_not_requested",
+        "ready": false,
+        "path": path,
+        "rel_path": path,
+        "abs_path": abs_path.display().to_string(),
+        "target_workspace": target_workspace.display().to_string(),
+        "report_workspace": report_workspace,
+        "source": source,
+        "warning": warning.unwrap_or(Value::Null)
+    }))
+}
+
+fn route_report_path_warning(
+    state: &AppState,
+    req: &RouteRequest,
+    source: &str,
+) -> Option<Value> {
+    if source != "caller" {
+        return None;
+    }
+    let report_path = req.report_path.as_ref()?;
+    let target_workspace = route_target_workspace(state, req);
+    let wanted = normalized_route_path_for_warning(&target_workspace, report_path);
+    let routes = read_routes(state);
+    let duplicate = routes
+        .as_object()
+        .into_iter()
+        .flat_map(|items| items.values())
+        .find_map(|route| {
+            let route_workspace = route
+                .get("workspace")
+                .and_then(Value::as_str)
+                .map(PathBuf::from)
+                .unwrap_or_else(|| state.workspace.clone());
+            let existing = route_report_path_from_value(route)?;
+            if normalized_route_path_for_warning(&route_workspace, &existing) == wanted {
+                Some(json!({
+                    "kind": "duplicate_explicit_report_path",
+                    "route_id": route.get("route_id").cloned().unwrap_or(Value::Null),
+                    "report_path": existing
+                }))
+            } else {
+                None
+            }
+        });
+    duplicate
+}
+
+fn route_report_path_from_value(route: &Value) -> Option<String> {
+    route
+        .pointer("/result/report/path")
+        .and_then(Value::as_str)
+        .or_else(|| route.pointer("/result/context_packet/report_path").and_then(Value::as_str))
+        .or_else(|| route.pointer("/result/prompt_gate/report_path").and_then(Value::as_str))
+        .or_else(|| route.pointer("/result/report_path").and_then(Value::as_str))
+        .filter(|value| !value.trim().is_empty())
+        .map(str::to_string)
+}
+
+fn normalized_route_path_for_warning(root: &std::path::Path, path: &str) -> String {
+    materialize_route_path(root, path)
+        .to_string_lossy()
+        .replace('\\', "/")
+        .to_ascii_lowercase()
+}
+
 fn start_sdk_route(
     state: &Arc<AppState>,
     req: &RouteRequest,
@@ -534,25 +670,28 @@ fn start_pty_route(
             let _ = release_owner_lease(state, &session_name, "route_start_failed");
             let _ = release_workspace_lease(state, &session_name, "route_start_failed");
         })?;
+    let (handoff_path, short_prompt) =
+        create_handoff_prompt(state, &record.route_id, &session_name, req, &containment)?;
     let prompt_gate = if is_claude_command(&runtime_session.info.command) {
         submit_pty_prompt_with_ack(
             state,
             &record.route_id,
             &session_name,
-            pty_prompt(req, &containment),
+            short_prompt.clone(),
+            Some(handoff_path.clone()),
         )
     } else {
         submit_pty_prompt_without_hook_ack(
             state,
             &record.route_id,
             &session_name,
-            pty_prompt(req, &containment),
+            short_prompt.clone(),
         )
     };
     let prompt_status = prompt_gate
         .get("status")
         .and_then(Value::as_str)
-        .unwrap_or("started_pending_prompt_ack")
+        .unwrap_or("prompt_pending_ack")
         .to_string();
     record.status = prompt_status.to_string();
     record.session_name = Some(session_name.clone());
@@ -579,6 +718,10 @@ fn start_pty_route(
         "workspace_lease": leases.workspace_lease,
         "prompt": prompt_gate,
         "prompt_gate": prompt_gate,
+        "handoff": {
+            "path": handoff_path,
+            "short_prompt": short_prompt
+        },
         "binding_gate": {
             "required": true,
             "expected_binding_source": "env",
@@ -590,7 +733,8 @@ fn start_pty_route(
             "stall_threshold_seconds": 300,
             "hint": "Claude Code PTY may spend time reading files, thinking, or preparing tool calls. Inspect session summary/attention before retrying or restarting."
         },
-        "containment": containment
+        "containment": containment,
+        "toolchain_context": toolchain_context_value(state, req)
     });
     Ok(())
 }
@@ -821,8 +965,10 @@ fn submit_pty_prompt_with_ack(
     route_id: &str,
     wrapper_session: &str,
     prompt: String,
+    handoff_path: Option<PathBuf>,
 ) -> Value {
-    let idempotency_key = format!("route_prompt:{route_id}:{wrapper_session}");
+    let idempotency_key = route_prompt_id(route_id, wrapper_session);
+    let now = now_ms();
     let args = json!({
         "text": prompt,
         "enter": true,
@@ -833,28 +979,44 @@ fn submit_pty_prompt_with_ack(
         Ok(PreparedCommand::Submit(command)) => command,
         Ok(PreparedCommand::Deduped(previous)) => {
             return json!({
-                "status": "started_pending_prompt_ack",
+                "schema_version": 2,
+                "status": "prompt_pending_ack",
                 "command_status": "deduped",
                 "idempotency_key": idempotency_key,
+                "prompt_idempotency_key": idempotency_key,
                 "dispatched": true,
                 "acknowledged": false,
-                "ack_expected": "hook.UserPromptSubmit",
-                "expected_hook": "UserPromptSubmit",
-                "ack_deadline_hint_seconds": 15,
+                "state": "prompt_pending_ack",
+                "task_started": false,
+                "prompt_id": idempotency_key,
+                "prompt_written_at_ms": now,
+                "ack_deadline_ms": DEFAULT_ACK_DEADLINE_MS,
+                "commit_ack_deadline_ms": crate::prompt_gate::DEFAULT_COMMIT_ACK_DEADLINE_MS,
+                "awaiting_hook": "UserPromptSubmit",
+                "commit_attempts": [],
+                "handoff_path": handoff_path.as_ref().map(|path| path.display().to_string()),
                 "next_observation": "agentcall_session(view=summary)",
                 "previous": previous
             });
         }
         Err(err) => {
             return json!({
-                "status": "started_pending_prompt_dispatch",
+                "schema_version": 2,
+                "status": "prompt_commit_failed",
                 "command_status": "prepare_failed",
                 "idempotency_key": idempotency_key,
+                "prompt_idempotency_key": idempotency_key,
                 "dispatched": false,
                 "acknowledged": false,
-                "ack_expected": "hook.UserPromptSubmit",
-                "expected_hook": "UserPromptSubmit",
-                "ack_deadline_hint_seconds": 15,
+                "state": "prompt_commit_failed",
+                "task_started": false,
+                "prompt_id": idempotency_key,
+                "prompt_written_at_ms": now,
+                "ack_deadline_ms": DEFAULT_ACK_DEADLINE_MS,
+                "commit_ack_deadline_ms": crate::prompt_gate::DEFAULT_COMMIT_ACK_DEADLINE_MS,
+                "awaiting_hook": "UserPromptSubmit",
+                "commit_attempts": [],
+                "handoff_path": handoff_path.as_ref().map(|path| path.display().to_string()),
                 "next_observation": "agentcall_session(view=summary)",
                 "last_error": err
             });
@@ -863,28 +1025,44 @@ fn submit_pty_prompt_with_ack(
     let command_id = command.command_id.clone();
     match submit_session_command(state, wrapper_session, command) {
         Ok(actor_result) => json!({
-            "status": "started_pending_prompt_ack",
+            "schema_version": 2,
+            "status": "prompt_pending_ack",
             "command_status": "dispatched",
             "command_id": command_id,
             "idempotency_key": idempotency_key,
+            "prompt_idempotency_key": idempotency_key,
             "dispatched": true,
             "acknowledged": false,
-            "ack_expected": "hook.UserPromptSubmit",
-            "expected_hook": "UserPromptSubmit",
-            "ack_deadline_hint_seconds": 15,
+            "state": "prompt_pending_ack",
+            "task_started": false,
+            "prompt_id": idempotency_key,
+            "prompt_written_at_ms": now,
+            "ack_deadline_ms": DEFAULT_ACK_DEADLINE_MS,
+            "commit_ack_deadline_ms": crate::prompt_gate::DEFAULT_COMMIT_ACK_DEADLINE_MS,
+            "awaiting_hook": "UserPromptSubmit",
+            "commit_attempts": [],
+            "handoff_path": handoff_path.as_ref().map(|path| path.display().to_string()),
             "next_observation": "agentcall_session(view=summary)",
             "actor_result": actor_result
         }),
         Err(err) => json!({
-            "status": "started_pending_prompt_dispatch",
+            "schema_version": 2,
+            "status": "prompt_commit_failed",
             "command_status": "dispatch_failed",
             "command_id": command_id,
             "idempotency_key": idempotency_key,
+            "prompt_idempotency_key": idempotency_key,
             "dispatched": false,
             "acknowledged": false,
-            "ack_expected": "hook.UserPromptSubmit",
-            "expected_hook": "UserPromptSubmit",
-            "ack_deadline_hint_seconds": 15,
+            "state": "prompt_commit_failed",
+            "task_started": false,
+            "prompt_id": idempotency_key,
+            "prompt_written_at_ms": now,
+            "ack_deadline_ms": DEFAULT_ACK_DEADLINE_MS,
+            "commit_ack_deadline_ms": crate::prompt_gate::DEFAULT_COMMIT_ACK_DEADLINE_MS,
+            "awaiting_hook": "UserPromptSubmit",
+            "commit_attempts": [],
+            "handoff_path": handoff_path.as_ref().map(|path| path.display().to_string()),
             "next_observation": "agentcall_session(view=summary)",
             "last_error": err
         }),
@@ -908,24 +1086,28 @@ fn submit_pty_prompt_without_hook_ack(
         Ok(PreparedCommand::Submit(command)) => command,
         Ok(PreparedCommand::Deduped(previous)) => {
             return json!({
-                "status": "started_prompt_dispatched_without_hook_ack",
+                "schema_version": 2,
+                "status": "prompt_submitted",
                 "command_status": "deduped",
                 "idempotency_key": args.get("idempotency_key").and_then(Value::as_str),
                 "dispatched": true,
-                "expected_hook": Value::Null,
-                "acknowledged": false,
+                "state": "prompt_submitted",
+                "task_started": true,
+                "awaiting_hook": Value::Null,
                 "previous": previous,
-                "reason": "custom PTY command is not expected to emit Claude Code UserPromptSubmit hooks"
+                "reason": "custom PTY command accepted prompt without Claude Code hook contract"
             });
         }
         Err(err) => {
             return json!({
-                "status": "started_pending_prompt_dispatch",
+                "schema_version": 2,
+                "status": "prompt_commit_failed",
                 "command_status": "prepare_failed",
                 "idempotency_key": args.get("idempotency_key").and_then(Value::as_str),
                 "dispatched": false,
-                "expected_hook": Value::Null,
-                "acknowledged": false,
+                "state": "prompt_commit_failed",
+                "task_started": false,
+                "awaiting_hook": Value::Null,
                 "last_error": err
             });
         }
@@ -933,24 +1115,28 @@ fn submit_pty_prompt_without_hook_ack(
     let command_id = command.command_id.clone();
     match submit_session_command(state, wrapper_session, command) {
         Ok(result) => json!({
-            "status": "started_prompt_dispatched_without_hook_ack",
+            "schema_version": 2,
+            "status": "prompt_submitted",
             "command_status": "dispatched",
             "command_id": command_id,
             "idempotency_key": args.get("idempotency_key").and_then(Value::as_str),
             "dispatched": true,
-            "expected_hook": Value::Null,
-            "acknowledged": false,
+            "state": "prompt_submitted",
+            "task_started": true,
+            "awaiting_hook": Value::Null,
             "actor_result": result,
-            "reason": "custom PTY command is not expected to emit Claude Code UserPromptSubmit hooks"
+            "reason": "custom PTY command accepted prompt without Claude Code hook contract"
         }),
         Err(err) => json!({
-            "status": "started_pending_prompt_dispatch",
+            "schema_version": 2,
+            "status": "prompt_commit_failed",
             "command_status": "dispatch_failed",
             "command_id": command_id,
             "idempotency_key": args.get("idempotency_key").and_then(Value::as_str),
             "dispatched": false,
-            "expected_hook": Value::Null,
-            "acknowledged": false,
+            "state": "prompt_commit_failed",
+            "task_started": false,
+            "awaiting_hook": Value::Null,
             "last_error": err
         }),
     }
@@ -1004,7 +1190,35 @@ fn new_claude_session_id(state: &AppState) -> String {
     )
 }
 
-fn pty_prompt(req: &RouteRequest, containment: &Value) -> String {
+fn create_handoff_prompt(
+    state: &AppState,
+    route_id: &str,
+    session_name: &str,
+    req: &RouteRequest,
+    containment: &Value,
+) -> Result<(PathBuf, String), String> {
+    let task_dir = state
+        .workspace
+        .join(".agentcall")
+        .join("tasks")
+        .join(route_id);
+    std::fs::create_dir_all(&task_dir).map_err(|err| err.to_string())?;
+    let handoff_path = task_dir.join("prompt.md");
+    let full_prompt = pty_prompt(state, req, containment);
+    std::fs::write(&handoff_path, full_prompt).map_err(|err| err.to_string())?;
+    let report = req
+        .report_path
+        .as_deref()
+        .unwrap_or(".agentcall/reports/report.md");
+    let report_target = report_abs_path(containment).unwrap_or_else(|| report.to_string());
+    let short_prompt = format!(
+        "AgentCall handoff for `{session_name}`. Read and follow `{}`. Write the final report to `{report_target}`. When finished, say COMPLETE.",
+        handoff_path.display()
+    );
+    Ok((handoff_path, short_prompt))
+}
+
+fn pty_prompt(state: &AppState, req: &RouteRequest, containment: &Value) -> String {
     let criteria = req
         .acceptance_criteria
         .as_ref()
@@ -1013,16 +1227,17 @@ fn pty_prompt(req: &RouteRequest, containment: &Value) -> String {
         .unwrap_or_else(|| "Complete the requested task and write a report.".to_string());
     let allowed = pty_prompt_containment(containment);
     let envelope = pty_prompt_control_envelope(req, containment);
+    let toolchain = pty_prompt_toolchain_context(state, req);
     let workflow =
         PtyWorkflow::from_request(req.pty_workflow.as_deref()).unwrap_or(PtyWorkflow::Normal);
     match workflow {
         PtyWorkflow::PlanThenAuto => format!(
-            "AgentCall PTY handoff. Start in PLAN MODE.\n\nStep 0 - control envelope:\n{}\n\nObjective:\n{}\n\nAllowed paths / ownership:\n- {}\n\nAcceptance criteria:\n- {}\n\nPlan-phase rules:\n- Inspect the code and write a concrete plan only.\n- If anything important is unclear, ask concise clarification questions instead of guessing.\n- Do not modify project files during plan phase.\n- When the plan is ready, use ExitPlanMode and wait for approval. After approval, continue in auto mode and write the requested report.\n",
-            envelope, req.objective, allowed, criteria
+            "AgentCall PTY handoff. Start in PLAN MODE.\n\nStep 0 - control envelope:\n{}\n\nKnown local toolchain:\n{}\n\nObjective:\n{}\n\nAllowed paths / ownership:\n- {}\n\nAcceptance criteria:\n- {}\n\nPlan-phase rules:\n- Inspect the code and write a concrete plan only.\n- If anything important is unclear, ask concise clarification questions instead of guessing.\n- Do not modify project files during plan phase.\n- When the plan is ready, use ExitPlanMode and wait for approval. After approval, continue in auto mode and write the requested report.\n",
+            envelope, toolchain, req.objective, allowed, criteria
         ),
         PtyWorkflow::Normal => format!(
-            "AgentCall utility PTY worker.\n\nStep 0 - control envelope:\n{}\n\nObjective:\n{}\n\nAllowed paths / ownership:\n- {}\n\nAcceptance criteria:\n- {}\n\nRules:\n- Work in auto mode.\n- If key context is unclear, ask a concise question in this PTY.\n- Respect allowed_paths. Do not write outside them.\n- When finished, write the requested report or summarize exact changes, tests, risks, and remaining questions.\n- Stop at the prompt for supervisor review.\n",
-            envelope, req.objective, allowed, criteria
+            "AgentCall utility PTY worker.\n\nStep 0 - control envelope:\n{}\n\nKnown local toolchain:\n{}\n\nObjective:\n{}\n\nAllowed paths / ownership:\n- {}\n\nAcceptance criteria:\n- {}\n\nRules:\n- Work in auto mode.\n- If key context is unclear, ask a concise question in this PTY.\n- Respect allowed_paths. Do not write outside them.\n- When finished, write the requested report or summarize exact changes, tests, risks, and remaining questions.\n- Stop at the prompt for supervisor review.\n",
+            envelope, toolchain, req.objective, allowed, criteria
         ),
     }
 }
@@ -1049,11 +1264,100 @@ fn pty_prompt_control_envelope(req: &RouteRequest, containment: &Value) -> Strin
     }
     if let Some(report_path) = req.report_path.as_ref() {
         lines.push(format!("report_path: {report_path}"));
+        if let Some(report_abs) = report_abs_path(containment) {
+            lines.push(format!("report_abs_path: {report_abs}"));
+            lines.push(
+                "report_path is relative to target_workspace; because Claude cwd may differ, write the final report to report_abs_path exactly."
+                    .to_string(),
+            );
+        }
     }
     if let Some(scratch) = containment.get("scratch_path").and_then(Value::as_str) {
         lines.push(format!("scratch_path: {scratch}"));
     }
     lines.join("\n- ")
+}
+
+fn pty_prompt_toolchain_context(state: &AppState, req: &RouteRequest) -> String {
+    let context = toolchain_context_value(state, req);
+    if context.get("status").and_then(Value::as_str) == Some("missing") {
+        return "- toolchain_context: missing\n- If a tool is missing from PATH, report the exact command and continue with static analysis where possible.".to_string();
+    }
+    let source = context
+        .get("source")
+        .and_then(Value::as_str)
+        .unwrap_or("unknown");
+    let mut lines = vec![format!("- source: {source}")];
+    if let Some(path) = context.get("path").and_then(Value::as_str) {
+        lines.push(format!("- context_file: {path}"));
+    }
+    if let Some(summary) = context.get("summary").and_then(Value::as_str) {
+        lines.push(format!("- {summary}"));
+    }
+    if let Some(hints) = context.get("hints").and_then(Value::as_array) {
+        for hint in hints.iter().filter_map(Value::as_str).take(12) {
+            lines.push(format!("- {hint}"));
+        }
+    }
+    lines.join("\n")
+}
+
+fn toolchain_context_value(state: &AppState, req: &RouteRequest) -> Value {
+    let target_workspace = route_target_workspace(state, req);
+    let candidates = [
+        target_workspace.join(".agentcall").join("toolchain.json"),
+        state
+            .workspace
+            .join("config")
+            .join("toolchain.local.json"),
+    ];
+    for path in candidates {
+        let Ok(text) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        let Ok(value) = serde_json::from_str::<Value>(&text) else {
+            return json!({
+                "status": "invalid",
+                "source": "file",
+                "path": path.display().to_string(),
+                "summary": "Toolchain context file exists but is invalid JSON; do not treat PATH misses as final blockers without reporting this."
+            });
+        };
+        return json!({
+            "status": "available",
+            "source": "file",
+            "path": path.display().to_string(),
+            "summary": value.get("summary").and_then(Value::as_str).unwrap_or("Use the provided local toolchain hints before declaring a tool unavailable."),
+            "hints": toolchain_hints_from_value(&value),
+            "raw": value
+        });
+    }
+    json!({
+        "status": "missing",
+        "source": "none",
+        "summary": "No toolchain context file found."
+    })
+}
+
+fn toolchain_hints_from_value(value: &Value) -> Value {
+    if let Some(hints) = value.get("hints").and_then(Value::as_array) {
+        return Value::Array(hints.iter().filter(|item| item.is_string()).cloned().collect());
+    }
+    let mut hints = vec![];
+    for key in ["go", "node", "npm", "python", "cache", "tmp"] {
+        if let Some(item) = value.get(key) {
+            hints.push(json!(format!("{key}: {}", compact_json_for_prompt(item))));
+        }
+    }
+    Value::Array(hints)
+}
+
+fn compact_json_for_prompt(value: &Value) -> String {
+    serde_json::to_string(value)
+        .unwrap_or_else(|_| "<unserializable>".to_string())
+        .chars()
+        .take(500)
+        .collect()
 }
 
 fn pty_prompt_containment(containment: &Value) -> String {
@@ -1064,6 +1368,15 @@ fn pty_prompt_containment(containment: &Value) -> String {
     if let Some(paths) = containment.get("writable_paths").and_then(Value::as_array) {
         for path in paths.iter().filter_map(Value::as_str) {
             lines.push(format!("writable: {path}"));
+        }
+    }
+    if let Some(paths) = containment.get("writable_roots").and_then(Value::as_array) {
+        for path in paths {
+            let display = path.get("display").and_then(Value::as_str).unwrap_or("");
+            let abs = path.get("abs").and_then(Value::as_str).unwrap_or("");
+            if !abs.is_empty() {
+                lines.push(format!("writable_abs: {display} => {abs}"));
+            }
         }
     }
     if let Some(paths) = containment.get("allowed_paths").and_then(Value::as_array) {
@@ -1084,6 +1397,17 @@ fn pty_prompt_containment(containment: &Value) -> String {
     } else {
         lines.join("\n- ")
     }
+}
+
+fn report_abs_path(containment: &Value) -> Option<String> {
+    containment
+        .get("writable_roots")
+        .and_then(Value::as_array)?
+        .iter()
+        .find(|item| item.get("kind").and_then(Value::as_str) == Some("report"))?
+        .get("abs")
+        .and_then(Value::as_str)
+        .map(str::to_string)
 }
 
 fn count_tools(value: &Value, tool_uses: &mut u64, tool_results: &mut u64) {
@@ -1283,6 +1607,101 @@ mod tests {
     }
 
     #[test]
+    fn pty_start_mints_report_path_when_caller_omits_one() {
+        let workspace = test_workspace("route-report-minted");
+        let state = Arc::new(AppState::test(workspace));
+        let mut req = RouteRequest {
+            objective: "write a compact report".to_string(),
+            workspace: None,
+            mode: Some("start".to_string()),
+            runtime: Some("pty".to_string()),
+            estimated_minutes: None,
+            estimated_files: None,
+            estimated_loc: None,
+            needs_continuity: None,
+            risk: None,
+            session_name: Some("worker:one".to_string()),
+            command: Some(vec!["fake-worker".to_string()]),
+            task_id: None,
+            call_id: None,
+            phase: None,
+            role: None,
+            allowed_paths: Some(vec![".agents/agentcall".to_string()]),
+            acceptance_criteria: None,
+            persist_context: None,
+            report_path: None,
+            read_only: None,
+            pty_workflow: None,
+            initial_permission_mode: None,
+        };
+        let source = ensure_route_report_path(&mut req, "start", "pty", "route-123");
+        let report = route_report_projection(&state, &req, &source, None).unwrap();
+
+        assert_eq!(report["status"], "report_not_requested");
+        assert_eq!(report["ready"], false);
+        assert_eq!(report["source"], "daemon_minted");
+        assert_eq!(
+            report["path"],
+            ".agents/agentcall/route-123-worker-one.md"
+        );
+        assert!(report["abs_path"].as_str().unwrap().contains("worker-one.md"));
+    }
+
+    #[test]
+    fn explicit_duplicate_report_path_is_projected_as_warning() {
+        let workspace = test_workspace("route-report-duplicate");
+        let state = Arc::new(AppState::test(workspace.clone()));
+        let state_dir = workspace.join(".agentcall").join("state");
+        std::fs::create_dir_all(&state_dir).unwrap();
+        write_json_file(
+            &state_dir.join("routes.json"),
+            &json!({
+                "route-a": {
+                    "route_id": "route-a",
+                    "workspace": workspace.display().to_string(),
+                    "result": {
+                        "report": {
+                            "path": "reports/shared.md"
+                        }
+                    }
+                }
+            }),
+        )
+        .unwrap();
+        let req = RouteRequest {
+            objective: "second".to_string(),
+            workspace: Some(workspace.display().to_string()),
+            mode: Some("start".to_string()),
+            runtime: Some("pty".to_string()),
+            estimated_minutes: None,
+            estimated_files: None,
+            estimated_loc: None,
+            needs_continuity: None,
+            risk: None,
+            session_name: Some("worker-b".to_string()),
+            command: Some(vec!["fake-worker".to_string()]),
+            task_id: None,
+            call_id: None,
+            phase: None,
+            role: None,
+            allowed_paths: Some(vec!["reports".to_string()]),
+            acceptance_criteria: None,
+            persist_context: None,
+            report_path: Some("reports/shared.md".to_string()),
+            read_only: None,
+            pty_workflow: None,
+            initial_permission_mode: None,
+        };
+        let warning = route_report_path_warning(&state, &req, "caller").unwrap();
+
+        assert_eq!(
+            warning["kind"],
+            "duplicate_explicit_report_path"
+        );
+        assert_eq!(warning["route_id"], "route-a");
+    }
+
+    #[test]
     fn checkpoint_session_preserves_active_sessions_object_shape() {
         let workspace = test_workspace("checkpoint-object");
         let state = Arc::new(AppState::test(workspace.clone()));
@@ -1323,19 +1742,20 @@ mod tests {
             "route-test",
             "missing-worker",
             "do work".to_string(),
+            None,
         );
 
-        assert_eq!(gate["status"], "started_pending_prompt_dispatch");
+        assert_eq!(gate["status"], "prompt_commit_failed");
         assert_eq!(gate["command_status"], "dispatch_failed");
         assert_eq!(
             gate["idempotency_key"],
             "route_prompt:route-test:missing-worker"
         );
         assert_eq!(gate["dispatched"], false);
-        assert_eq!(gate["ack_expected"], "hook.UserPromptSubmit");
-        assert_eq!(gate["ack_deadline_hint_seconds"], 15);
+        assert_eq!(gate["awaiting_hook"], "UserPromptSubmit");
+        assert_eq!(gate["ack_deadline_ms"], DEFAULT_ACK_DEADLINE_MS);
         assert_eq!(gate["next_observation"], "agentcall_session(view=summary)");
-        assert!(gate.get("attempts").is_none());
+        assert_eq!(gate["commit_attempts"].as_array().unwrap().len(), 0);
         assert!(
             gate["last_error"]
                 .as_str()
@@ -1502,6 +1922,53 @@ mod tests {
                 .join(".agentcall/workspaces/containment-a/README.md")
                 .exists()
         );
+    }
+
+    #[test]
+    fn pty_handoff_names_absolute_report_path_when_cwd_differs() {
+        let workspace = test_workspace("handoff-report-abs");
+        let target_workspace = workspace.join("target-workspace");
+        let state = AppState::test(workspace.clone());
+        let req = RouteRequest {
+            objective: "write report".to_string(),
+            workspace: Some(target_workspace.display().to_string()),
+            mode: Some("start".to_string()),
+            runtime: Some("pty".to_string()),
+            estimated_minutes: None,
+            estimated_files: None,
+            estimated_loc: None,
+            needs_continuity: None,
+            risk: None,
+            session_name: Some("handoff-a".to_string()),
+            command: None,
+            task_id: None,
+            call_id: None,
+            phase: None,
+            role: None,
+            allowed_paths: Some(vec![".agentcall/reports".to_string()]),
+            acceptance_criteria: None,
+            persist_context: None,
+            report_path: Some(".agentcall/reports/report.md".to_string()),
+            read_only: None,
+            pty_workflow: None,
+            initial_permission_mode: None,
+        };
+        let containment = pty_containment(&state, &req, "handoff-a");
+        let report_abs = target_workspace
+            .join(".agentcall/reports/report.md")
+            .display()
+            .to_string();
+        assert_eq!(
+            report_abs_path(&containment).as_deref(),
+            Some(report_abs.as_str())
+        );
+
+        let envelope = pty_prompt_control_envelope(&req, &containment);
+        assert!(envelope.contains("report_abs_path:"));
+        assert!(envelope.contains(&report_abs));
+        let containment_text = pty_prompt_containment(&containment);
+        assert!(containment_text.contains("writable_abs: .agentcall/reports/report.md =>"));
+        assert!(containment_text.contains(&report_abs));
     }
 
     #[test]

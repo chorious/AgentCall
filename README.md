@@ -1,12 +1,12 @@
 # AgentCall
 
-当前版本 / Current version: `v5.3.0 checkpoint`
+当前版本 / Current version: `v6.2 worker closure and project-aware supervisor loop`
 
 AgentCall is a local coordination plane that lets **Codex supervise Claude Code PTY utility workers** through a daemon-backed MCP interface. Codex stays the parent agent: it reads a compact board, starts bounded workers, sends safe commands, waits with patience hints, asks for reports, and accepts or revises deliverables. Claude Code workers do the visible PTY work under hook-aware policy and file ownership.
 
 AgentCall 是一个本地多 Agent 协作控制面：让 **Codex 指挥 Claude Code PTY worker 集群**。Codex 负责拆分、监督、验收和整合；Claude Code worker 负责执行边界明确的实现、审查、证据检查和报告任务。
 
-v5.3 是 hard-gate closure checkpoint：已经闭合 report-ready projection、stale command precondition、read-only worker drift、writer/reader failure projection 等真实运行暴露的问题；仍保留 actor control/output 隔离、stop/kill 语义拆分等 open gates，详见 [v5.3 closure status](docs/reports/v5.3-closure-status.md)。
+v6.2 是 worker closure 与 project-aware supervisor loop 主线：Codex 默认只需要 `board -> route -> session -> next action -> request_report -> report`，daemon 负责吸收 prompt gate、唯一 report path、workspace projection、租约、幂等、report evidence 和 debug 细节。冻结计划见 [v6.2 code plan](docs/v6.2-code-plan.md)。
 
 ## Product Shape / 产品特点
 
@@ -16,7 +16,8 @@ v5.3 是 hard-gate closure checkpoint：已经闭合 report-ready projection、s
 - **Hook-aware state**: Claude/Codex hooks provide structured liveness, attention, report, permission, and policy signals.
 - **Projection-first MCP**: Codex should read compact board/session projections, not raw PTY logs by default.
 - **Bounded write policy**: write tools are constrained by route containment; Bash remains readonly-only in the default policy.
-- **Report-ready closure**: writing the route `report_path` updates route/session projection to `report_ready`.
+- **Report-ready closure**: route can mint a unique report path, `request_report` is a state transition, and daemon-observed report writes update route/session projection to `report_ready`.
+- **Prompt commit contract**: `submit_pending_prompt` returns `prompt_commit_signal_sent`, `not_completed=true`, and must converge to `prompt_submitted` or `prompt_commit_unacknowledged`.
 - **Readable wrapper**: raw output, clean output, and LLM summary are separate surfaces.
 - **Recent-first logs**: large hook payloads are stored as artifacts; hot logs rotate by hook type.
 - **Plugin-provided MCP**: the repo ships a Codex plugin so tool metadata and usage guidance travel together.
@@ -94,6 +95,7 @@ Use the repo entrypoint for routine diagnostics:
 python agentcall.py doctor
 python agentcall.py install-hooks
 python agentcall.py daemon-health
+python agentcall.py verify-runtime-build
 python agentcall.py paths
 python agentcall.py logs doctor
 python agentcall.py sessions cleanup --stale-after 5m
@@ -180,11 +182,27 @@ Recommended Codex flow:
 ```text
 agentcall_daemon(action=start)
 agentcall_board(view=compact, filter=attention)
-agentcall_route(mode=start, runtime=auto|pty, objective=..., workspace=...)
-agentcall_session(name=..., include=["summary"])
-agentcall_session_send(action=continue|request_report|select_option|interrupt|stop)
+agentcall_route(objective=..., workspace=..., allowed_paths=...)
+agentcall_session(name=...)
+agentcall_session_send(action=<one of returned next_actions>)
 agentcall_report(action=request|accept)
 ```
+
+`agentcall_route` defaults to a daemon-owned Claude Code PTY worker. `runtime`, `mode`, SDK/ACP, estimates, lease ids, preconditions, and idempotency keys are debug/compatibility internals, not the normal Codex loop.
+
+`report_path` is optional. If omitted, the daemon generates a unique path under the route target workspace:
+
+```text
+<target_workspace>\.agents\agentcall\<route_id>-<session_name>.md
+```
+
+Route/session/report projections distinguish `daemon_workspace`, `target_workspace`, `claude_cwd`, and `report_workspace`. The route `workspace` is the task target; it does not override Claude Code cwd.
+
+If `agentcall_session` returns `state=prompt_missing` or `state=prompt_commit_unacknowledged`, use `agentcall_session_send(action=submit_pending_prompt)`. A successful call means only that the commit signal was sent; it returns `not_completed=true` and must be followed by `agentcall_session(name=...)` until `UserPromptSubmit`, tool progress, report evidence, or explicit failure appears.
+
+Use `agentcall_session_send(action=request_report)` when the worker should close. It returns `report_requested` with a request id/deadline. Then refresh `agentcall_session` until `report_drafting`, `report_ready`, or `report_overdue`; do not keep sending closure prompts.
+
+`agentcall_report(action=accept, session_id=...)` splits confidence into `overall`, `artifact`, `daemon_write`, and `route_match`. `overall=high` requires daemon-observed report/write evidence; an existing report file without daemon evidence is at most `medium`.
 
 Use `agentcall_daemon(action="status")` as the smoke test. `tool_search agentcall` can return false negatives depending on Codex session state.
 
@@ -214,6 +232,7 @@ POST /api/hooks/ingest
 ```powershell
 cargo test --workspace
 python -m pytest -q
+python agentcall.py verify-runtime-build
 python -m compileall scripts src
 python C:\Users\MUSHI\.codex\skills\.system\plugin-creator\scripts\validate_plugin.py E:\Project\AgentCall\plugins\agentcall
 ```
@@ -227,4 +246,6 @@ python C:\Users\MUSHI\.codex\skills\.system\plugin-creator\scripts\validate_plug
 - [AGENTS.md](AGENTS.md)
 - [v5.4 implementation closure](docs/reports/v5.4-implementation-closure.md)
 - [v5.4 code plan](docs/v5.4-code-plan.md)
+- [v6.0 code plan](docs/v6.0-code-plan.md)
+- [v6.1 code plan](docs/v6.1-code-plan.md)
 - [MCP transport recovery](docs/mcp-transport-recovery.md)

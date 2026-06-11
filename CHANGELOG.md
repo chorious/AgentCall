@@ -1,5 +1,36 @@
 # CHANGELOG
 
+## v6.2.0 - Worker Closure And Project-Aware Supervisor Loop
+
+- `agentcall_route` 在调用方未传 `report_path` 时自动生成唯一报告路径：`<target_workspace>/.agents/agentcall/<route_id>-<session_name>.md`。
+- route/session/report projection 统一返回 report block，包含 `path`、`rel_path`、`abs_path`、`target_workspace`、`report_workspace` 与来源。
+- `agentcall_session_send(action=request_report)` 升级为一等状态：写入 `report_requested`、request id、deadline，并在后续 hook/tool progress 后进入 `report_drafting`。
+- `agentcall_session` worker state 新增 `report_requested`、`report_drafting`、`report_overdue`、`report_accepted`，并把 `can_wait` / `next_actions` 对齐 report 生命周期。
+- `agentcall_board(root|workspace=...)` 支持 target workspace 过滤，并在响应中明确 `daemon_workspace`、`workspace_filter`、`workspace_filter_applied`。
+- PTY handoff prompt 注入短工具链上下文；可从目标项目 `.agentcall/toolchain.json` 或 daemon `config/toolchain.local.json` 读取。
+- real-worker smoke 新增 `--omit-report-path`，覆盖 daemon-minted report path；6 并发 smoke 验证路径唯一、report accept high、stop 后 lease 清空。
+
+## v6.1.0 - Prompt Commit And Report Projection Closure
+
+- 新增冻结计划 `docs/v6.1-code-plan.md`，v6.1 主线固定为 prompt commit 收敛和 report projection 运行态闭环。
+- `submit_pending_prompt` 公开返回改为 `prompt_commit_signal_sent`，并显式包含 `not_completed=true`、`awaiting_hook=UserPromptSubmit`、attempt id 和 ack deadline。
+- Prompt gate 状态收敛为 `prompt_pending_ack`、`prompt_missing`、`commit_signal_sent`、`prompt_submitted`、`prompt_commit_unacknowledged`、`prompt_commit_failed`，不再从运行代码发出旧的 pending/ack 名称。
+- `UserPromptSubmit`、工具进展和 report write 都会关闭 prompt gate，避免真实 worker 已开始工作但 projection 仍提示 prompt 未提交。
+- `agentcall_session_send` 在 prompt gate 未闭合时拒绝普通 `send/continue`，要求使用 `submit_pending_prompt` 或继续等待，不再把 supervisor 文本排队到 worker 后面。
+- `agentcall_report(action=accept)` 拆分 `confidence.overall/artifact/daemon_write/route_match`；`overall=high` 需要 daemon-observed report/write evidence。
+- `/api/runtime/health` 增加 build identity，`python agentcall.py verify-runtime-build` 可验证 daemon 已运行当前构建产物。
+
+## v6.0.0 - Slim Codex Control Plane
+
+- 新增冻结计划 `docs/v6.0-code-plan.md`，v6.0 主线收敛为 `board -> route -> session -> next action -> report`。
+- 新增 `worker_state.rs` / `prompt_gate.rs`，把 route、projection、prompt gate、report 和 control 信息归一为 Codex-facing worker state。
+- `agentcall_session` 默认 summary 改为 schema v2：只返回 `state`、`why`、`can_wait`、`next_actions`、report、control 和 debug refs，不再默认混入 raw terminal/events/tool payload。
+- `agentcall_board(view=compact)` 默认只展示 live daemon workers 和 attention，不再把 historical sessions 伪装成 live workers。
+- `agentcall_route` 推荐 schema 收窄为 PTY-first 启动入口；`runtime`、`mode`、SDK、估算字段、plan workflow 等调试/兼容字段不再出现在推荐工具面。
+- `agentcall_session_send` 推荐 schema 移除 caller-supplied lease/precondition/idempotency 字段，新增 `submit_pending_prompt` 作为 prompt stuck 的产品化恢复动作。
+- Projection 不再把 `SessionStart`、`pty.input_sent`、`command.accepted/completed` 当成 task started；缺 `UserPromptSubmit` 会进入 prompt gate 状态而不是静默 `working/none`。
+- Hook raw payload 在写 event 前做敏感字段/大文本 redaction，降低命令、环境变量、prompt 和 Write 内容泄露到 compact/debug 常用路径的风险。
+
 ## v5.3.0 - Worker Projection Gates Checkpoint
 
 - README、docs 索引、About 和 plugin manifest 更新到 v5.3 checkpoint 口径。

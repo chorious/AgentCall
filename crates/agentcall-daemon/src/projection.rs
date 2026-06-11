@@ -233,26 +233,46 @@ pub(crate) fn apply_event_to_projection(
             projection.terminal_global_seq = None;
             projection.terminal_reason = None;
             projection.stop_intent = None;
-            projection.liveness_status = "working".to_string();
-            projection.turn_status = "working".to_string();
+            projection.liveness_status = "starting".to_string();
+            projection.turn_status = "starting".to_string();
             projection.attention_status = "none".to_string();
             projection.needs_attention = false;
             projection.last_progress_brief = Some(event.message.clone());
-            if let Some(workspace) = event.payload.get("cwd").and_then(Value::as_str) {
-                projection.workspace = workspace.to_string();
-                projection.claude_cwd = workspace.to_string();
+            if let Some(target_workspace) = event
+                .payload
+                .get("requested_cwd")
+                .or_else(|| event.payload.get("target_workspace"))
+                .and_then(Value::as_str)
+            {
+                projection.workspace = target_workspace.to_string();
+            }
+            if let Some(cwd) = event.payload.get("cwd").and_then(Value::as_str) {
+                projection.claude_cwd = cwd.to_string();
             }
         }
         "command.accepted" | "command.completed" | "pty.input_sent" => {
             update_last_command_status(&mut projection, event);
-            projection.liveness_status = "working".to_string();
+            if !matches!(
+                projection.liveness_status.as_str(),
+                "working" | "waiting_input"
+            ) {
+                projection.liveness_status = "prompt_pending".to_string();
+                projection.turn_status = "prompt_pending".to_string();
+                projection.next_recommended_action = "wait_or_submit_pending_prompt".to_string();
+            }
             projection.attention_status = "none".to_string();
             projection.needs_attention = false;
             projection.last_progress_brief = Some(event.message.clone());
         }
         "command.awaiting_observation" => {
             update_last_command_status(&mut projection, event);
-            projection.liveness_status = "working".to_string();
+            if !matches!(
+                projection.liveness_status.as_str(),
+                "working" | "waiting_input"
+            ) {
+                projection.liveness_status = "prompt_pending".to_string();
+                projection.next_recommended_action = "wait_or_submit_pending_prompt".to_string();
+            }
             projection.turn_status = "awaiting_observation".to_string();
             projection.attention_status = "none".to_string();
             projection.needs_attention = false;
@@ -455,6 +475,27 @@ fn reduce_hook_event(projection: &mut SessionProjectionV1, event: &EventEnvelope
         projection.next_recommended_action = "fix_path_policy_or_interrupt_worker".to_string();
         return;
     }
+    if event.event_type == "hook.SessionStart" {
+        projection.liveness_status = "prompt_pending".to_string();
+        projection.turn_status = "claude_ready".to_string();
+        projection.attention_status = "none".to_string();
+        projection.needs_attention = false;
+        projection.next_recommended_action = "wait_or_submit_pending_prompt".to_string();
+        projection.last_progress_brief = Some(event.message.clone());
+        if let Some(cwd) = event.payload.get("workspace").and_then(Value::as_str) {
+            projection.claude_cwd = cwd.to_string();
+        }
+        return;
+    }
+    if event.event_type == "hook.UserPromptSubmit" {
+        projection.liveness_status = "working".to_string();
+        projection.turn_status = "working".to_string();
+        projection.attention_status = "none".to_string();
+        projection.needs_attention = false;
+        projection.next_recommended_action = "wait_or_request_report".to_string();
+        projection.last_progress_brief = Some(event.message.clone());
+        return;
+    }
     let status = event
         .payload
         .get("status")
@@ -477,8 +518,8 @@ fn reduce_hook_event(projection: &mut SessionProjectionV1, event: &EventEnvelope
     .to_string();
     projection.needs_attention = projection.attention_status != "none";
     projection.last_progress_brief = Some(event.message.clone());
-    if let Some(workspace) = event.payload.get("workspace").and_then(Value::as_str) {
-        projection.workspace = workspace.to_string();
+    if let Some(cwd) = event.payload.get("workspace").and_then(Value::as_str) {
+        projection.claude_cwd = cwd.to_string();
     }
     if hook_event_marks_report_ready(event) {
         projection.report_ready = true;
@@ -674,7 +715,8 @@ mod tests {
             None,
             &test_projection_event(1, "worker-a", "pty.session_started", "PTY session started."),
         );
-        assert_eq!(started.projection.liveness_status, "working");
+        assert_eq!(started.projection.liveness_status, "starting");
+        assert_eq!(started.projection.turn_status, "starting");
         assert_eq!(started.projection.attention_status, "none");
         assert!(!started.projection.projection_stale);
 
@@ -758,7 +800,11 @@ mod tests {
                 "Session actor accepted command.",
             ),
         );
-        assert_eq!(accepted.projection.liveness_status, "working");
+        assert_eq!(accepted.projection.liveness_status, "prompt_pending");
+        assert_eq!(
+            accepted.projection.next_recommended_action,
+            "wait_or_submit_pending_prompt"
+        );
         assert_eq!(accepted.projection.attention_status, "none");
 
         let awaiting = apply_event_to_projection(
@@ -770,7 +816,7 @@ mod tests {
                 "Session actor dispatched command and is waiting for observed worker state.",
             ),
         );
-        assert_eq!(awaiting.projection.liveness_status, "working");
+        assert_eq!(awaiting.projection.liveness_status, "prompt_pending");
         assert_eq!(awaiting.projection.turn_status, "awaiting_observation");
         assert_eq!(awaiting.projection.attention_status, "none");
     }

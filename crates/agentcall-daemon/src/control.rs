@@ -351,6 +351,7 @@ fn allowed_actions_for_projection(projection: &SessionProjectionV1) -> Vec<Strin
     actions.insert("revise_plan".to_string());
     actions.insert("select_option".to_string());
     actions.insert("send".to_string());
+    actions.insert("submit_pending_prompt".to_string());
     if !projection.terminal {
         actions.insert("interrupt".to_string());
         actions.insert("stop".to_string());

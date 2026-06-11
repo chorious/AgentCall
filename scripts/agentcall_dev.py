@@ -58,6 +58,15 @@ def main() -> int:
     health.add_argument("--timeout", type=float, default=5.0, help="HTTP timeout in seconds.")
     health.set_defaults(func=cmd_daemon_health)
 
+    verify_runtime = sub.add_parser(
+        "verify-runtime-build",
+        help="Fail if the running daemon cannot prove it is the current built binary.",
+    )
+    verify_runtime.add_argument("--daemon-url", default=default_daemon_url(), help="Daemon base URL.")
+    verify_runtime.add_argument("--daemon-bin", default=None, help="Expected daemon binary path.")
+    verify_runtime.add_argument("--timeout", type=float, default=5.0, help="HTTP timeout in seconds.")
+    verify_runtime.set_defaults(func=cmd_verify_runtime_build)
+
     hooks = sub.add_parser("install-hooks", help="Install Claude/Codex hooks using the repo config conventions.")
     hooks.add_argument("--claude", action="store_true", help="Install Claude Code hooks.")
     hooks.add_argument("--codex", action="store_true", help="Install Codex hooks.")
@@ -83,6 +92,17 @@ def main() -> int:
         choices=["json", "sqlite"],
         default="json",
         help="Temporary daemon RuntimeStore backend.",
+    )
+    real_worker.add_argument(
+        "--parallel-workers",
+        type=int,
+        default=1,
+        help="Run N concurrent fake PTY workers with independent target workspaces.",
+    )
+    real_worker.add_argument(
+        "--omit-report-path",
+        action="store_true",
+        help="Do not pass report_path to route; require daemon to mint a unique report path.",
     )
     real_worker.set_defaults(func=cmd_smoke_real_worker)
 
@@ -121,7 +141,7 @@ def cmd_doctor(root: Path, args: argparse.Namespace) -> int:
     checks.append(check_plugin(root))
     checks.extend(check_claude_hooks(root, config))
     checks.append(check_scratch_workspaces(root))
-    checks.append(check_daemon(args.daemon_url, timeout=5.0))
+    checks.append(check_daemon(root, args.daemon_url, timeout=5.0))
     checks.append(check_git(root))
     print_checks(checks)
     failed = [item for item in checks if item.status == "FAIL"]
@@ -145,13 +165,49 @@ def cmd_doctor(root: Path, args: argparse.Namespace) -> int:
 
 
 def cmd_daemon_health(root: Path, args: argparse.Namespace) -> int:
-    _ = root
     url = args.daemon_url.rstrip("/") + "/api/runtime/health"
     try:
-        payload = http_json(url, timeout=args.timeout)
+        payload = http_json(url, timeout=args.timeout, headers=daemon_auth_headers(root))
     except ToolError as exc:
         raise ToolError(f"daemon health failed: {exc}") from exc
     print(json.dumps(payload, ensure_ascii=False, indent=2))
+    return 0
+
+
+def cmd_verify_runtime_build(root: Path, args: argparse.Namespace) -> int:
+    expected_bin = Path(args.daemon_bin).resolve() if args.daemon_bin else default_daemon_binary(root)
+    if not expected_bin.exists():
+        raise ToolError(f"expected daemon binary missing: {expected_bin}")
+    url = args.daemon_url.rstrip("/") + "/api/runtime/health"
+    try:
+        payload = http_json(url, timeout=args.timeout, headers=daemon_auth_headers(root))
+    except ToolError as exc:
+        raise ToolError(f"daemon health failed: {exc}") from exc
+    build = payload.get("build")
+    if not isinstance(build, dict):
+        raise ToolError("daemon health did not expose build identity")
+    binary_path = Path(str(build.get("binary_path") or "")).resolve()
+    if not paths_same(binary_path, expected_bin):
+        raise ToolError(f"daemon binary mismatch: running={binary_path}; expected={expected_bin}")
+    process_started_at_ms = build.get("process_started_at_ms")
+    if not isinstance(process_started_at_ms, int):
+        raise ToolError("daemon build identity missing process_started_at_ms")
+    binary_modified_ms = int(expected_bin.stat().st_mtime * 1000)
+    if process_started_at_ms + 1000 < binary_modified_ms:
+        raise ToolError(
+            "daemon process started before the expected binary was modified; rebuild/restart required"
+        )
+    result = {
+        "status": "ok",
+        "daemon_url": args.daemon_url,
+        "binary_path": str(binary_path),
+        "process_started_at": build.get("process_started_at"),
+        "binary_modified_at": build.get("binary_modified_at"),
+        "version": build.get("version"),
+        "git_sha": build.get("git_sha"),
+        "build_profile": build.get("build_profile"),
+    }
+    print(json.dumps(result, ensure_ascii=False, indent=2))
     return 0
 
 
@@ -214,7 +270,11 @@ def cmd_smoke_real_worker(root: Path, args: argparse.Namespace) -> int:
     if args.keep_workspace:
         cmd.append("--keep-workspace")
     cmd.extend(["--store-backend", args.store_backend])
-    run_checked(cmd, root, "real worker PTY smoke", timeout=90)
+    if args.parallel_workers != 1:
+        cmd.extend(["--parallel-workers", str(args.parallel_workers)])
+    if args.omit_report_path:
+        cmd.append("--omit-report-path")
+    run_checked(cmd, root, "real worker PTY smoke", timeout=max(90, 20 * args.parallel_workers))
     return 0
 
 
@@ -430,9 +490,13 @@ def check_claude_hooks(root: Path, config: dict) -> list[Check]:
     return checks
 
 
-def check_daemon(base_url: str, timeout: float) -> Check:
+def check_daemon(root: Path, base_url: str, timeout: float) -> Check:
     try:
-        payload = http_json(base_url.rstrip("/") + "/api/runtime/health", timeout=timeout)
+        payload = http_json(
+            base_url.rstrip("/") + "/api/runtime/health",
+            timeout=timeout,
+            headers=daemon_auth_headers(root),
+        )
     except ToolError as exc:
         return Check(
             "daemon",
@@ -587,9 +651,10 @@ def run_checked(
     print(f"[OK] {label}")
 
 
-def http_json(url: str, timeout: float) -> dict:
+def http_json(url: str, timeout: float, headers: dict[str, str] | None = None) -> dict:
+    request = urllib.request.Request(url, headers=headers or {})
     try:
-        with urllib.request.urlopen(url, timeout=timeout) as response:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
             raw = response.read().decode("utf-8", errors="replace")
     except urllib.error.HTTPError as exc:
         body = exc.read().decode("utf-8", errors="replace")
@@ -602,6 +667,13 @@ def http_json(url: str, timeout: float) -> dict:
         return json.loads(raw)
     except json.JSONDecodeError as exc:
         raise ToolError(f"invalid JSON from {url}: {exc}") from exc
+
+
+def daemon_auth_headers(root: Path) -> dict[str, str]:
+    token = os.environ.get("AGENTCALL_DAEMON_TOKEN", "").strip()
+    if not token:
+        token = str(read_local_config(root).get("daemon_token") or "").strip()
+    return {"X-AgentCall-Token": token} if token else {}
 
 
 def read_local_config(root: Path) -> dict:
@@ -632,6 +704,18 @@ def find_cargo() -> Path | None:
         if candidate.exists():
             return candidate
     return None
+
+
+def default_daemon_binary(root: Path) -> Path:
+    name = "agentcall-daemon.exe" if os.name == "nt" else "agentcall-daemon"
+    return (root / "target" / "debug" / name).resolve()
+
+
+def paths_same(left: Path, right: Path) -> bool:
+    try:
+        return left.samefile(right)
+    except OSError:
+        return os.path.normcase(str(left)) == os.path.normcase(str(right))
 
 
 def plugin_validator_path() -> Path:

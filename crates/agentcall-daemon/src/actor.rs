@@ -187,7 +187,7 @@ fn command_type_priority(command_type: &CommandType) -> u8 {
     match command_type {
         CommandType::KillSession => 0,
         CommandType::StopSession | CommandType::InterruptTurn | CommandType::CancelCommand => 1,
-        CommandType::SelectOption => 2,
+        CommandType::SelectOption | CommandType::SubmitPendingPrompt => 2,
         CommandType::SendInput | CommandType::RequestReport => 3,
         CommandType::QueueSupervisorInstruction | CommandType::RefreshProjection => 4,
     }
@@ -363,6 +363,35 @@ fn execute_command(
                 "hint": "Claude Code does not reliably accept new prompts mid-turn. AgentCall queued this instruction for hook additionalContext instead of blindly typing into the PTY."
             })
         }
+        CommandType::SubmitPendingPrompt => {
+            let text = command
+                .payload
+                .get("text")
+                .and_then(Value::as_str)
+                .unwrap_or(" ")
+                .to_string();
+            actor_write_input(state, session_id, writer, &text, true)?;
+            append_agent_event(
+                state,
+                "prompt_gate.submit_pending_prompt_sent",
+                "Pending route prompt commit was sent to PTY.",
+                json!({
+                    "session_id": session_id,
+                    "name": session_id,
+                    "prompt_id": command.payload.get("prompt_id").cloned().unwrap_or(Value::Null),
+                    "commit": "space_enter"
+                }),
+            );
+            json!({
+                "ok": true,
+                "status": "prompt_commit_signal_sent",
+                "not_completed": true,
+                "awaiting_hook": "UserPromptSubmit",
+                "prompt_gate": {
+                    "state": "commit_signal_sent"
+                }
+            })
+        }
         CommandType::SelectOption | CommandType::SendInput | CommandType::RequestReport => {
             let text = command
                 .payload
@@ -406,6 +435,11 @@ fn command_terminal_event(command_type: &CommandType) -> (&'static str, &'static
             "command.awaiting_observation",
             "Session actor dispatched command and is waiting for observed worker state.",
             true,
+        ),
+        CommandType::SubmitPendingPrompt => (
+            "command.completed",
+            "Pending prompt submit command dispatched.",
+            false,
         ),
         _ => (
             "command.completed",

@@ -25,4 +25,4 @@ def test_agentcall_supervisor_skill_is_generated_and_contains_action_matrix() ->
     assert "idempotency_key" in skill
     assert "select_option" in skill
     assert "Do not default to raw terminal" in skill
-    assert "confidence.band=low" in skill
+    assert "confidence.overall=low" in skill

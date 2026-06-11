@@ -7,6 +7,10 @@ use crate::control::{
 use crate::events::EventEnvelopeV1;
 use crate::hooks::{policy_denials_state, runtime_bindings_state};
 use crate::projection::session_projection_summary;
+use crate::prompt_gate::{
+    DEFAULT_COMMIT_ACK_DEADLINE_MS, prompt_commit_attempt_id, prompt_gate_from_route,
+    refresh_prompt_gate_timeouts_for_session,
+};
 use crate::routes::{
     RouteRequest, checkpoint_session, handle_route, patch_route_record, route_for_wrapper_session,
 };
@@ -18,8 +22,10 @@ use crate::summary::{
     session_plan_artifact, session_summary, terminal_snapshot_value,
 };
 use crate::util::now_ms;
+use crate::worker_state::{WorkerStateKind, worker_state_for_session};
 use serde::Deserialize;
 use serde_json::{Value, json};
+use std::path::PathBuf;
 use std::sync::Arc;
 
 const SUMMARY_VIEW_MAX_BYTES: usize = 8 * 1024;
@@ -27,6 +33,7 @@ const TUI_VIEW_MAX_BYTES: usize = 20 * 1024;
 const EVENTS_VIEW_MAX_BYTES: usize = 48 * 1024;
 const DEBUG_VIEW_MAX_BYTES: usize = 128 * 1024;
 const STRING_PREVIEW_BYTES: usize = 160;
+const REPORT_REQUEST_DEADLINE_MS: u64 = 5 * 60 * 1000;
 
 #[derive(Deserialize)]
 pub(crate) struct McpCallRequest {
@@ -54,32 +61,17 @@ pub(crate) fn mcp_tools() -> Vec<Value> {
         }),
         json!({
             "name": "agentcall_route",
-            "description": "Recommend or start a Claude Code PTY utility worker. PTY workers are asynchronous background workers, not synchronous function calls; after start, wait for prompt_gate/hooks/session summary before retrying. Use pty_workflow=plan_then_auto only when the supervisor explicitly wants a plan gate.",
+            "description": "Start a Claude Code PTY utility worker. PTY workers are asynchronous background workers, not synchronous function calls; after start, inspect the returned worker state or agentcall_session summary before taking the next action.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "objective": {"type": "string"},
                     "workspace": {"type": "string"},
-                    "mode": {"type": "string", "enum": ["recommend", "start"], "default": "recommend"},
-                    "runtime": {"type": "string", "enum": ["auto", "pty", "sdk"], "default": "auto", "description": "sdk is experimental and only works when daemon local config enables experimental_sdk_runtime; auto still selects PTY."},
-                    "estimated_minutes": {"type": "integer", "minimum": 0},
-                    "estimated_files": {"type": "integer", "minimum": 0},
-                    "estimated_loc": {"type": "integer", "minimum": 0},
-                    "needs_continuity": {"type": "boolean", "default": false},
-                    "risk": {"type": "string", "enum": ["low", "medium", "high"], "default": "medium"},
                     "session_name": {"type": "string"},
-                    "command": {"type": "array", "items": {"type": "string"}},
-                    "task_id": {"type": "string"},
-                    "call_id": {"type": "string"},
-                    "phase": {"type": "string", "default": "execute"},
-                    "role": {"type": "string", "default": "executor"},
                     "allowed_paths": {"type": "array", "items": {"type": "string"}},
                     "acceptance_criteria": {"type": "array", "items": {"type": "string"}},
                     "report_path": {"type": "string"},
-                    "read_only": {"type": "boolean", "default": false},
-                    "pty_workflow": {"type": "string", "enum": ["normal", "plan_then_auto"], "default": "normal"},
-                    "initial_permission_mode": {"type": "string", "enum": ["plan", "auto", "default"]},
-                    "persist_context": {"type": "boolean", "default": true}
+                    "read_only": {"type": "boolean", "default": false}
                 },
                 "required": ["objective"],
                 "additionalProperties": false
@@ -87,7 +79,7 @@ pub(crate) fn mcp_tools() -> Vec<Value> {
         }),
         json!({
             "name": "agentcall_session",
-            "description": "Return one daemon PTY session view. Default view=summary is compact and projection-first; use view=tui for dashboard data, view=events for compact events, and view=debug/raw only for explicit inspection.",
+            "description": "Return one daemon PTY session view. Default view=summary is compact and projection-first, including state/why/can_wait/next_actions/report/control/prompt_gate. Use view=tui for dashboard data, view=events for compact events, and view=debug/raw only for explicit inspection.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -106,21 +98,16 @@ pub(crate) fn mcp_tools() -> Vec<Value> {
         }),
         json!({
             "name": "agentcall_session_send",
-            "description": "Send text or a high-level nudge action to a daemon PTY session. Avoid repeated continue nudges while the session is still inside its patience window unless attention_status requires intervention.",
+            "description": "Send text or a high-level action to a daemon PTY session. Use only returned next_actions. submit_pending_prompt sends a finite prompt commit signal and returns not_completed=true until UserPromptSubmit, tool progress, or report evidence is observed.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "root": {"type": "string"},
                     "name": {"type": "string"},
-                    "action": {"type": "string", "enum": ["send", "continue", "stop", "kill", "request_report", "revise_plan", "approve_plan", "start_auto", "select_option", "interrupt"], "default": "send"},
+                    "action": {"type": "string", "enum": ["send", "continue", "request_report", "submit_pending_prompt", "select_option", "interrupt", "stop", "kill", "revise_plan", "approve_plan", "start_auto"], "default": "send"},
                     "text": {"type": "string"},
-                    "enter": {"type": "boolean", "default": true},
-                    "idempotency_key": {"type": "string", "description": "Optional for MCP callers. If omitted, daemon MCP generates a stable key from session/action/projection/payload."},
                     "control_token": {"type": "string", "description": "Short-lived daemon-minted control token from agentcall_session(summary). Required for destructive or phase-changing actions."},
-                    "precondition": {"type": "object"},
-                    "owner_id": {"type": "string"},
-                    "owner_lease_id": {"type": "string"},
-                    "lease_generation": {"type": "integer", "minimum": 0}
+                    "choice": {"type": "string", "description": "Menu/permission choice for select_option, such as 1, 2, or 3."}
                 },
                 "required": ["name"],
                 "additionalProperties": false
@@ -128,7 +115,7 @@ pub(crate) fn mcp_tools() -> Vec<Value> {
         }),
         json!({
             "name": "agentcall_report",
-            "description": "Request or accept a report for a supervised session/task.",
+            "description": "Request or accept a report for a supervised session/task. Accept responses split confidence into overall/artifact/daemon_write/route_match; overall=high requires daemon-observed write or equivalent evidence.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -186,13 +173,66 @@ fn mcp_board(state: &AppState, args: &Value) -> Result<Value, String> {
         args.get("filter").and_then(Value::as_str),
         args.get("section").and_then(Value::as_str),
         owner_id.as_deref(),
+        args.get("root")
+            .or_else(|| args.get("workspace"))
+            .and_then(Value::as_str),
     ))
 }
 
 fn mcp_route(state: &Arc<AppState>, args: Value) -> Result<Value, String> {
     let req: RouteRequest =
         serde_json::from_value(args).map_err(|err| format!("invalid route arguments: {err}"))?;
-    handle_route(state, req)
+    let route = handle_route(state, req)?;
+    Ok(route_mcp_response(state, &route))
+}
+
+fn route_mcp_response(state: &AppState, route: &Value) -> Value {
+    let route_id = route
+        .get("route_id")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
+    let worker_name = route
+        .get("session_name")
+        .and_then(Value::as_str)
+        .map(str::to_string)
+        .or_else(|| {
+            route
+                .pointer("/result/session/name")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        });
+    let report = route
+        .pointer("/result/report")
+        .cloned()
+        .unwrap_or_else(|| {
+            let path = route_report_path(route).map(Value::String).unwrap_or(Value::Null);
+            json!({"ready": false, "path": path})
+        });
+    if let Some(worker_name) = worker_name {
+        let worker = worker_state_for_session(state, &worker_name);
+        return json!({
+            "schema_version": 2,
+            "route_id": route_id,
+            "worker": worker.worker,
+            "state": worker.state.as_str(),
+            "why": worker.why,
+            "can_wait": worker.can_wait,
+            "next_action": worker.next_actions.first().and_then(|item| item.get("kind")).cloned().unwrap_or(Value::Null),
+            "next_actions": worker.next_actions,
+            "report": if report.get("path").is_some() { report } else { worker.report }
+        });
+    }
+    json!({
+        "schema_version": 2,
+        "route_id": route_id,
+        "worker": Value::Null,
+        "state": "done",
+        "why": "Route did not start a live PTY worker. Start a route without debug-only recommend mode for normal Codex flow.",
+        "can_wait": false,
+        "next_action": "start_worker",
+        "report": report
+    })
 }
 
 fn mcp_session(state: &AppState, args: &Value) -> Result<Value, String> {
@@ -228,6 +268,22 @@ fn legacy_session_view(include: &[String]) -> &'static str {
 fn session_summary_view(state: &AppState, name: &str, include: &[String]) -> Value {
     let projection = session_projection_summary(state, name);
     let wants_screen = include.iter().any(|item| item == "screen");
+    if !wants_screen {
+        let worker = worker_state_for_session(state, name);
+        let control = slim_control_summary(control_summary_for_session(state, name, None));
+        return attach_budget(
+            worker.to_summary_value(control),
+            "summary",
+            SUMMARY_VIEW_MAX_BYTES,
+            json!({
+                "raw_events": true,
+                "tool_outputs": true,
+                "tool_inputs": true,
+                "terminal_tail": true,
+                "legacy_projection_fields": true
+            }),
+        );
+    }
     let attention_status = projection
         .get("attention_status")
         .and_then(Value::as_str)
@@ -287,6 +343,19 @@ fn session_summary_view(state: &AppState, name: &str, include: &[String]) -> Val
             "terminal_tail": !wants_screen
         }),
     )
+}
+
+fn slim_control_summary(control: Value) -> Value {
+    if control.get("available").and_then(Value::as_bool) != Some(true) {
+        return control;
+    }
+    json!({
+        "available": true,
+        "token": control.get("token").cloned().unwrap_or(Value::Null),
+        "expires_at": control.get("expires_at").cloned().unwrap_or(Value::Null),
+        "ttl_seconds": control.get("ttl_seconds").cloned().unwrap_or(Value::Null),
+        "token_required_for": ["interrupt", "stop", "kill", "approve_plan", "start_auto"],
+    })
 }
 
 fn session_tui_view(state: &AppState, name: &str, args: &Value) -> Result<Value, String> {
@@ -400,63 +469,40 @@ fn session_tui_view(state: &AppState, name: &str, args: &Value) -> Result<Value,
 }
 
 fn effective_route_status(route: &Value) -> Value {
-    let status = route
-        .get("status")
+    let route_id = route
+        .get("route_id")
         .and_then(Value::as_str)
-        .unwrap_or("unknown");
-    if status == "started_pending_prompt_ack" && route_prompt_ack_missing(route) {
-        return json!("prompt_ack_missing");
+        .unwrap_or("route");
+    let gate = prompt_gate_from_route(route_id, route);
+    if matches!(
+        gate.state.as_str(),
+        "prompt_missing" | "prompt_commit_unacknowledged"
+    ) {
+        return json!(gate.state.as_str());
     }
-    json!(status)
+    json!(
+        route
+            .get("status")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown")
+    )
 }
 
 fn route_prompt_status(route: &Value) -> Value {
-    let prompt = route
-        .pointer("/result/prompt")
-        .or_else(|| route.pointer("/result/prompt_gate"));
-    let acknowledged = prompt
-        .and_then(|prompt| prompt.get("acknowledged"))
-        .and_then(Value::as_bool)
-        .unwrap_or(false);
-    let ack_expected = prompt
-        .and_then(|prompt| prompt.get("ack_expected"))
-        .or_else(|| prompt.and_then(|prompt| prompt.get("expected_hook")))
-        .cloned()
-        .unwrap_or(Value::Null);
+    let route_id = route
+        .get("route_id")
+        .and_then(Value::as_str)
+        .unwrap_or("route");
+    let gate = prompt_gate_from_route(route_id, route);
     json!({
-        "acknowledged": acknowledged,
-        "ack_expected": ack_expected,
-        "ack_missing": route_prompt_ack_missing(route),
-        "deadline_hint_seconds": prompt
-            .and_then(|prompt| prompt.get("ack_deadline_hint_seconds"))
-            .and_then(Value::as_u64)
-            .unwrap_or(0)
+        "state": gate.state.as_str(),
+        "task_started": gate.task_started,
+        "awaiting_hook": gate.awaiting_hook,
+        "ack_deadline_ms": gate.ack_deadline_ms,
+        "commit_ack_deadline_ms": gate.commit_ack_deadline_ms,
+        "commit_attempts": gate.commit_attempts,
+        "can_submit_pending_prompt": gate.can_submit_pending_prompt()
     })
-}
-
-fn route_prompt_ack_missing(route: &Value) -> bool {
-    let status = route.get("status").and_then(Value::as_str).unwrap_or("");
-    if status != "started_pending_prompt_ack" {
-        return false;
-    }
-    let prompt = route
-        .pointer("/result/prompt")
-        .or_else(|| route.pointer("/result/prompt_gate"));
-    if prompt
-        .and_then(|prompt| prompt.get("acknowledged"))
-        .and_then(Value::as_bool)
-        == Some(true)
-    {
-        return false;
-    }
-    let deadline_seconds = prompt
-        .and_then(|prompt| prompt.get("ack_deadline_hint_seconds"))
-        .and_then(Value::as_u64)
-        .unwrap_or(15);
-    let Some(created_at) = route.get("created_at").and_then(Value::as_u64) else {
-        return false;
-    };
-    now_ms().saturating_sub(created_at) > deadline_seconds.saturating_mul(1000)
 }
 
 fn session_debug_view(
@@ -1027,6 +1073,76 @@ fn mcp_session_send(state: &AppState, args: &Value) -> Result<Value, String> {
     if action == "stop" || action == "kill" || action == "interrupt" {
         return submit_session_command(state, name, command);
     }
+    if action == "submit_pending_prompt" {
+        let gate = refresh_prompt_gate_timeouts_for_session(state, name);
+        if !gate.can_submit_pending_prompt() {
+            return Ok(json!({
+                "ok": false,
+                "status": "prompt_commit_not_allowed",
+                "state": gate.state.as_str(),
+                "reason": "submit_pending_prompt is only allowed for prompt_missing or prompt_commit_unacknowledged states with attempts remaining.",
+                "prompt_gate": gate.to_value(),
+                "next_step": "refresh agentcall_session"
+            }));
+        }
+        let route_id = gate
+            .route_id
+            .clone()
+            .ok_or_else(|| "missing route_id for prompt gate".to_string())?;
+        let attempt_index = gate.commit_attempts.saturating_add(1);
+        let attempt_id = prompt_commit_attempt_id(&route_id, name, attempt_index);
+        let sent_at_ms = now_ms();
+        command.payload["text"] = json!(" ");
+        command.payload["enter"] = json!(true);
+        command.payload["attempt_id"] = json!(attempt_id.clone());
+        command.payload["prompt_id"] = gate
+            .prompt_id
+            .clone()
+            .map(Value::String)
+            .unwrap_or(Value::Null);
+        let actor_result = submit_session_command(state, name, command)?;
+        let attempts = prompt_commit_attempts_for_session(state, name, &attempt_id, sent_at_ms);
+        let _ = patch_route_record(
+            state,
+            &route_id,
+            json!({
+                "status": "prompt_commit_signal_sent",
+                "updated_at": now_ms(),
+                "result": {
+                    "prompt": {
+                        "state": "commit_signal_sent",
+                        "task_started": false,
+                        "active_commit_attempt_id": attempt_id,
+                        "active_commit_sent_at_ms": sent_at_ms,
+                        "commit_ack_deadline_ms": DEFAULT_COMMIT_ACK_DEADLINE_MS,
+                        "awaiting_hook": "UserPromptSubmit",
+                        "commit_attempts": attempts
+                    },
+                    "prompt_gate": {
+                        "schema_version": 2,
+                        "state": "commit_signal_sent",
+                        "task_started": false,
+                        "active_commit_attempt_id": attempt_id,
+                        "active_commit_sent_at_ms": sent_at_ms,
+                        "commit_ack_deadline_ms": DEFAULT_COMMIT_ACK_DEADLINE_MS,
+                        "awaiting_hook": "UserPromptSubmit",
+                        "commit_attempts": attempts
+                    }
+                }
+            }),
+        );
+        return Ok(json!({
+            "ok": true,
+            "action": action,
+            "status": "prompt_commit_signal_sent",
+            "not_completed": true,
+            "awaiting_hook": "UserPromptSubmit",
+            "attempt_id": attempt_id,
+            "ack_deadline_ms": DEFAULT_COMMIT_ACK_DEADLINE_MS,
+            "next_observation": "agentcall_session(view=summary)",
+            "actor_status": actor_result.get("status").cloned().unwrap_or(Value::Null)
+        }));
+    }
     if action == "approve_plan" || action == "start_auto" {
         if !is_plan_then_auto_session(state, name) {
             return Err("session is not a plan_then_auto PTY route".to_string());
@@ -1117,6 +1233,26 @@ fn mcp_session_send(state: &AppState, args: &Value) -> Result<Value, String> {
             "hint": "The PTY process is not running. Inspect session summary/report before sending more input."
         }));
     }
+    let worker_state = worker_state_for_session(state, name);
+    if matches!(
+        worker_state.state,
+        WorkerStateKind::PromptPending
+            | WorkerStateKind::PromptMissing
+            | WorkerStateKind::PromptCommitUnacknowledged
+    ) {
+        return Ok(json!({
+            "ok": false,
+            "status": "prompt_not_submitted",
+            "state": worker_state.state.as_str(),
+            "reason": worker_state.why,
+            "can_wait": worker_state.can_wait,
+            "next_actions": worker_state.next_actions,
+            "prompt_gate": worker_state.prompt_gate.to_value(),
+            "next_action": "submit_pending_prompt",
+            "recommended_args": {"action": "submit_pending_prompt"},
+            "hint": "The route prompt has not been acknowledged by UserPromptSubmit or worker progress. Do not queue supervisor text."
+        }));
+    }
     let summary = session_summary(state, &session);
     let liveness_status = summary
         .get("liveness_status")
@@ -1150,6 +1286,15 @@ fn mcp_session_send(state: &AppState, args: &Value) -> Result<Value, String> {
         command.payload["text"] = json!(text);
         command.payload["action"] = json!(action);
         let mut actor_result = submit_session_command(state, name, command)?;
+        if action == "request_report" {
+            let report = mark_report_requested(state, name)?;
+            actor_result["ok"] = json!(true);
+            actor_result["action"] = json!(action);
+            actor_result["status"] = json!("report_requested");
+            actor_result["not_completed"] = json!(true);
+            actor_result["awaiting"] = json!("report_write");
+            actor_result["report"] = report;
+        }
         let post_tool_batch_seen = session_has_seen_hook_event(state, name, "PostToolBatch");
         let warning = if post_tool_batch_seen {
             Value::Null
@@ -1167,6 +1312,18 @@ fn mcp_session_send(state: &AppState, args: &Value) -> Result<Value, String> {
         command.payload["enter"] = json!(enter);
     }
     let actor_result = submit_session_command(state, name, command)?;
+    if action == "request_report" {
+        let report = mark_report_requested(state, name)?;
+        return Ok(json!({
+            "ok": true,
+            "action": action,
+            "status": "report_requested",
+            "not_completed": true,
+            "awaiting": "report_write",
+            "actor_result": actor_result,
+            "report": report
+        }));
+    }
     if action == "revise_plan" {
         let _ = update_pty_workflow_route(
             state,
@@ -1177,6 +1334,111 @@ fn mcp_session_send(state: &AppState, args: &Value) -> Result<Value, String> {
         );
     }
     Ok(actor_result)
+}
+
+fn mark_report_requested(state: &AppState, session_name: &str) -> Result<Value, String> {
+    let Some((route_id, route)) = route_for_wrapper_session(state, session_name) else {
+        return Err("cannot request report: session has no route record".to_string());
+    };
+    let now = now_ms();
+    let deadline = now + REPORT_REQUEST_DEADLINE_MS;
+    let request_id = format!(
+        "report-request-{}-{}",
+        route_id,
+        stable_hash_hex(&format!("{session_name}:{now}"))
+    );
+    let report = report_block_from_route(&route);
+    let patch_report = json!({
+        "status": "report_requested",
+        "ready": false,
+        "request_id": request_id,
+        "requested_at_ms": now,
+        "deadline_at_ms": deadline,
+        "requested_by": "agentcall_session_send",
+        "path": report.get("path").cloned().unwrap_or(Value::Null),
+        "rel_path": report.get("rel_path").cloned().unwrap_or_else(|| report.get("path").cloned().unwrap_or(Value::Null)),
+        "abs_path": report.get("abs_path").cloned().unwrap_or(Value::Null),
+        "target_workspace": report.get("target_workspace").cloned().unwrap_or(Value::Null),
+        "source": report.get("source").cloned().unwrap_or(Value::Null)
+    });
+    patch_route_record(
+        state,
+        &route_id,
+        json!({
+            "status": "report_requested",
+            "updated_at": now,
+            "required_next_step": "wait_for_report_or_inspect_session",
+            "result": {
+                "report": patch_report,
+                "report_request": {
+                    "request_id": request_id,
+                    "status": "report_requested",
+                    "requested_at_ms": now,
+                    "deadline_at_ms": deadline
+                }
+            }
+        }),
+    )?;
+    Ok(patch_report)
+}
+
+fn report_block_from_route(route: &Value) -> Value {
+    route
+        .pointer("/result/report")
+        .cloned()
+        .unwrap_or_else(|| {
+            let path = route_report_path(route).map(Value::String).unwrap_or(Value::Null);
+            json!({
+                "status": "report_not_requested",
+                "ready": false,
+                "path": path,
+                "rel_path": path,
+                "abs_path": Value::Null,
+                "target_workspace": route.get("workspace").cloned().unwrap_or(Value::Null),
+                "source": "unknown"
+            })
+        })
+}
+
+fn route_report_path(route: &Value) -> Option<String> {
+    route
+        .pointer("/result/report/path")
+        .and_then(Value::as_str)
+        .or_else(|| {
+            route
+                .pointer("/result/context_packet/report_path")
+                .and_then(Value::as_str)
+        })
+        .or_else(|| route.pointer("/result/prompt_gate/report_path").and_then(Value::as_str))
+        .or_else(|| route.pointer("/result/report_path").and_then(Value::as_str))
+        .filter(|value| !value.trim().is_empty())
+        .map(str::to_string)
+}
+
+fn prompt_commit_attempts_for_session(
+    state: &AppState,
+    session_name: &str,
+    attempt_id: &str,
+    sent_at_ms: u64,
+) -> Value {
+    let mut attempts = route_for_wrapper_session(state, session_name)
+        .and_then(|(_, route)| {
+            route
+                .pointer("/result/prompt_gate/commit_attempts")
+                .and_then(Value::as_array)
+                .cloned()
+        })
+        .unwrap_or_default();
+    let next_index = attempts.len() + 1;
+    attempts.push(json!({
+        "attempt_id": attempt_id,
+        "kind": "manual_mcp",
+        "state": "signal_sent",
+        "sent_at_ms": sent_at_ms,
+        "ack_deadline_ms": DEFAULT_COMMIT_ACK_DEADLINE_MS,
+        "index": next_index,
+    }));
+    Value::Array(attempts)
 }
 
 fn session_send_args_with_control_token(
@@ -1240,6 +1502,7 @@ fn session_send_args_with_control_token(
 fn menu_choice(args: &Value) -> Result<String, String> {
     let choice = args
         .get("text")
+        .or_else(|| args.get("choice"))
         .and_then(Value::as_str)
         .map(str::trim)
         .ok_or_else(|| {
@@ -1409,7 +1672,10 @@ fn mcp_report(state: &Arc<AppState>, args: &Value) -> Result<Value, String> {
             checkpoint_session(state, session_id)
         }
         "accept" => {
-            let reports = board_state(state, None, None, Some("reports"), None)
+            if let Some(session_id) = args.get("session_id").and_then(Value::as_str) {
+                return Ok(accept_report_for_session(state, session_id));
+            }
+            let reports = board_state(state, None, None, Some("reports"), None, None)
                 .get("reports")
                 .cloned()
                 .unwrap_or_else(|| json!([]));
@@ -1435,6 +1701,102 @@ fn mcp_report(state: &Arc<AppState>, args: &Value) -> Result<Value, String> {
     }
 }
 
+fn accept_report_for_session(state: &AppState, session_id: &str) -> Value {
+    let route =
+        route_for_wrapper_session(state, session_id).map(|(route_id, route)| (route_id, route));
+    let target_workspace = route
+        .as_ref()
+        .and_then(|(_, route)| route.get("workspace"))
+        .and_then(Value::as_str)
+        .map(PathBuf::from)
+        .unwrap_or_else(|| state.workspace.clone());
+    let report_path = route
+        .as_ref()
+        .and_then(|(_, route)| route_report_path(route));
+    let report_abs = report_path.as_deref().map(|path| {
+        let candidate = PathBuf::from(path);
+        if candidate.is_absolute() {
+            candidate
+        } else {
+            target_workspace.join(candidate)
+        }
+    });
+    let exists = report_abs.as_ref().is_some_and(|path| path.exists());
+    let non_empty = report_abs
+        .as_ref()
+        .and_then(|path| std::fs::metadata(path).ok())
+        .is_some_and(|metadata| metadata.len() > 0);
+    let matched_route_report_path = report_abs.is_some();
+    let daemon_observed_write = route
+        .as_ref()
+        .and_then(|(_, route)| route.pointer("/result/report_ready"))
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let accepted = exists && non_empty && matched_route_report_path;
+    let artifact_confidence = if exists && non_empty { "high" } else { "low" };
+    let route_match_confidence = if matched_route_report_path {
+        "high"
+    } else {
+        "low"
+    };
+    let daemon_write_confidence = if daemon_observed_write { "high" } else { "low" };
+    let overall_confidence = if accepted && daemon_observed_write {
+        "high"
+    } else if accepted {
+        "medium"
+    } else {
+        "low"
+    };
+    if accepted {
+        if let Some((route_id, _)) = route.as_ref() {
+            let _ = patch_route_record(
+                state,
+                route_id,
+                json!({
+                    "status": "report_accepted",
+                    "updated_at": now_ms(),
+                    "result": {
+                        "report": {
+                            "status": "report_accepted",
+                            "accepted": true,
+                            "accepted_at_ms": now_ms()
+                        }
+                    }
+                }),
+            );
+        }
+    }
+    json!({
+        "ok": accepted,
+        "status": if accepted { "accepted" } else { "report_missing_or_empty" },
+        "worker": session_id,
+        "session_id": session_id,
+        "route_id": route.as_ref().map(|(route_id, _)| route_id.clone()),
+        "report_path": report_path,
+        "report_rel_path": report_path,
+        "target_workspace": target_workspace.display().to_string(),
+        "report_abs_path": report_abs
+            .as_ref()
+            .map(|path| path.display().to_string()),
+        "validation": {
+            "exists": exists,
+            "non_empty": non_empty,
+            "matched_route_report_path": matched_route_report_path,
+            "daemon_observed_write": daemon_observed_write,
+            "report_abs_path": report_abs
+                .as_ref()
+                .map(|path| path.display().to_string())
+        },
+        "confidence": {
+            "overall": overall_confidence,
+            "artifact": artifact_confidence,
+            "daemon_write": daemon_write_confidence,
+            "route_match": route_match_confidence
+        },
+        "next_action": if accepted { "stop_worker" } else { "inspect_session_or_request_report" }
+    })
+}
+
 fn required_str<'a>(args: &'a Value, name: &str) -> Result<&'a str, String> {
     args.get(name)
         .and_then(Value::as_str)
@@ -1457,6 +1819,59 @@ fn string_array(args: &Value, name: &str) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::actor::{ActorControlCommand, ActorHandle};
+    use std::sync::mpsc;
+    use std::thread;
+
+    fn install_prompt_gate_route(
+        state: &AppState,
+        route_id: &str,
+        session_name: &str,
+        gate: Value,
+    ) {
+        let state_dir = state.workspace.join(".agentcall").join("state");
+        std::fs::create_dir_all(&state_dir).unwrap();
+        crate::state::write_json_file(
+            &state_dir.join("routes.json"),
+            &json!({
+                route_id: {
+                    "route_id": route_id,
+                    "recommended_runtime": "pty",
+                    "runtime": "pty",
+                    "session_name": session_name,
+                    "workspace": state.workspace.display().to_string(),
+                    "status": gate.get("state").and_then(Value::as_str).unwrap_or("prompt_pending_ack"),
+                    "result": {
+                        "phase": "execute",
+                        "prompt_gate": gate
+                    }
+                }
+            }),
+        )
+        .unwrap();
+    }
+
+    fn install_ok_actor(state: &AppState, session_name: &str) {
+        let (tx, rx) = mpsc::channel();
+        state.actors.lock().unwrap().insert(
+            session_name.to_string(),
+            ActorHandle {
+                session_id: session_name.to_string(),
+                sender: tx,
+            },
+        );
+        thread::spawn(move || {
+            let ActorControlCommand::Submit(command, reply) = rx.recv().unwrap() else {
+                return;
+            };
+            let _ = reply.send(Ok(json!({
+                "ok": true,
+                "status": "command_completed",
+                "command_id": command.command_id,
+                "command_type": format!("{:?}", command.command_type),
+            })));
+        });
+    }
 
     #[test]
     fn daemon_mcp_tools_are_canonical_only() {
@@ -1500,6 +1915,41 @@ mod tests {
                 .get("event_types")
                 .is_some()
         );
+    }
+
+    #[test]
+    fn daemon_route_tool_schema_hides_debug_runtime_knobs() {
+        let tools = mcp_tools();
+        let route_tool = tools
+            .iter()
+            .find(|tool| tool["name"] == "agentcall_route")
+            .unwrap();
+        let properties = &route_tool["inputSchema"]["properties"];
+        assert!(properties.get("objective").is_some());
+        assert!(properties.get("workspace").is_some());
+        assert!(properties.get("allowed_paths").is_some());
+        assert!(properties.get("report_path").is_some());
+        for hidden in [
+            "mode",
+            "runtime",
+            "estimated_minutes",
+            "estimated_files",
+            "estimated_loc",
+            "needs_continuity",
+            "risk",
+            "pty_workflow",
+            "initial_permission_mode",
+            "persist_context",
+            "task_id",
+            "call_id",
+            "phase",
+            "role",
+        ] {
+            assert!(
+                properties.get(hidden).is_none(),
+                "{hidden} leaked into recommended route schema"
+            );
+        }
     }
 
     #[test]
@@ -1550,8 +2000,10 @@ mod tests {
 
         let summary = mcp_session(&state, &json!({"name": "worker-a"})).unwrap();
         assert_eq!(summary["view"], "summary");
-        assert_eq!(summary["projection_stale"], false);
-        assert_eq!(summary["attention"], "needs_permission");
+        assert_eq!(summary["schema_version"], 2);
+        assert_eq!(summary["worker"], "worker-a");
+        assert_eq!(summary["state"], "done");
+        assert_eq!(summary["can_wait"], false);
         assert!(summary.get("clean_tail").is_none());
         assert!(summary.get("events").is_none());
         assert_eq!(summary["budget"]["view"], "summary");
@@ -1629,6 +2081,108 @@ mod tests {
         )
         .unwrap();
         assert_eq!(explicit["idempotency_key"], "caller-key");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn submit_pending_prompt_returns_signal_sent_contract() {
+        let root = std::env::temp_dir().join(format!(
+            "agentcall-mcp-submit-pending-v61-{}",
+            std::process::id()
+        ));
+        let state = AppState::test(root.clone());
+        install_prompt_gate_route(
+            &state,
+            "route-pty",
+            "worker-a",
+            json!({
+                "schema_version": 2,
+                "state": "prompt_missing",
+                "task_started": false,
+                "prompt_id": "route_prompt:route-pty:worker-a",
+                "prompt_written_at_ms": now_ms().saturating_sub(20_000),
+                "awaiting_hook": "UserPromptSubmit",
+                "ack_deadline_ms": 15_000,
+                "commit_ack_deadline_ms": DEFAULT_COMMIT_ACK_DEADLINE_MS,
+                "commit_attempts": []
+            }),
+        );
+        install_ok_actor(&state, "worker-a");
+
+        let result = mcp_session_send(
+            &state,
+            &json!({"name": "worker-a", "action": "submit_pending_prompt"}),
+        )
+        .unwrap();
+        assert_eq!(result["ok"], true);
+        assert_eq!(result["status"], "prompt_commit_signal_sent");
+        assert_eq!(result["not_completed"], true);
+        assert_eq!(result["awaiting_hook"], "UserPromptSubmit");
+        assert!(
+            result["attempt_id"]
+                .as_str()
+                .unwrap()
+                .starts_with("prompt-commit-route-pty-worker-a-")
+        );
+        let rendered = serde_json::to_string(&result).unwrap();
+        assert!(!rendered.contains("pending_prompt_commit_sent"));
+
+        let routes = crate::state::read_json_file(
+            &state
+                .workspace
+                .join(".agentcall")
+                .join("state")
+                .join("routes.json"),
+            json!({}),
+        );
+        let route = routes.get("route-pty").unwrap();
+        assert_eq!(route["status"], "prompt_commit_signal_sent");
+        assert_eq!(
+            route["result"]["prompt_gate"]["state"],
+            "commit_signal_sent"
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn prompt_commit_signal_sent_expires_to_unacknowledged() {
+        let root = std::env::temp_dir().join(format!(
+            "agentcall-mcp-commit-unack-v61-{}",
+            std::process::id()
+        ));
+        let state = AppState::test(root.clone());
+        install_prompt_gate_route(
+            &state,
+            "route-pty",
+            "worker-a",
+            json!({
+                "schema_version": 2,
+                "state": "commit_signal_sent",
+                "task_started": false,
+                "prompt_id": "route_prompt:route-pty:worker-a",
+                "prompt_written_at_ms": now_ms().saturating_sub(30_000),
+                "active_commit_attempt_id": "prompt-commit-route-pty-worker-a-1",
+                "active_commit_sent_at_ms": now_ms().saturating_sub(DEFAULT_COMMIT_ACK_DEADLINE_MS + 1000),
+                "awaiting_hook": "UserPromptSubmit",
+                "ack_deadline_ms": 15_000,
+                "commit_ack_deadline_ms": DEFAULT_COMMIT_ACK_DEADLINE_MS,
+                "commit_attempts": [{
+                    "attempt_id": "prompt-commit-route-pty-worker-a-1",
+                    "sent_at_ms": now_ms().saturating_sub(DEFAULT_COMMIT_ACK_DEADLINE_MS + 1000)
+                }]
+            }),
+        );
+
+        let tui = mcp_session(&state, &json!({"name": "worker-a", "view": "tui"})).unwrap();
+        assert_eq!(
+            tui["status"]["route_status"],
+            "prompt_commit_unacknowledged"
+        );
+        assert_eq!(
+            tui["status"]["prompt"]["state"],
+            "prompt_commit_unacknowledged"
+        );
+        assert_eq!(tui["status"]["prompt"]["can_submit_pending_prompt"], true);
         let _ = std::fs::remove_dir_all(root);
     }
 
@@ -1837,7 +2391,7 @@ mod tests {
     }
 
     #[test]
-    fn tui_view_projects_prompt_ack_missing_after_deadline() {
+    fn tui_view_projects_prompt_missing_after_deadline() {
         let root = std::env::temp_dir().join(format!(
             "agentcall-mcp-prompt-ack-missing-{}",
             std::process::id()
@@ -1852,14 +2406,21 @@ mod tests {
                     "route_id": "route-pty",
                     "recommended_runtime": "pty",
                     "session_name": "worker-a",
-                    "status": "started_pending_prompt_ack",
+                    "status": "prompt_pending_ack",
                     "created_at": now_ms().saturating_sub(20_000),
                     "result": {
                         "phase": "execute",
-                        "prompt": {
+                        "prompt_gate": {
+                            "schema_version": 2,
+                            "state": "prompt_pending_ack",
+                            "task_started": false,
+                            "prompt_id": "route_prompt:route-pty:worker-a",
+                            "prompt_written_at_ms": now_ms().saturating_sub(20_000),
                             "acknowledged": false,
-                            "ack_expected": "hook.UserPromptSubmit",
-                            "ack_deadline_hint_seconds": 15
+                            "awaiting_hook": "UserPromptSubmit",
+                            "ack_deadline_ms": 15_000,
+                            "commit_ack_deadline_ms": crate::prompt_gate::DEFAULT_COMMIT_ACK_DEADLINE_MS,
+                            "commit_attempts": []
                         }
                     }
                 }
@@ -1868,12 +2429,10 @@ mod tests {
         .unwrap();
 
         let tui = mcp_session(&state, &json!({"name": "worker-a", "view": "tui"})).unwrap();
-        assert_eq!(tui["status"]["route_status"], "prompt_ack_missing");
-        assert_eq!(tui["status"]["prompt"]["ack_missing"], true);
-        assert_eq!(
-            tui["status"]["prompt"]["ack_expected"],
-            "hook.UserPromptSubmit"
-        );
+        assert_eq!(tui["status"]["route_status"], "prompt_missing");
+        assert_eq!(tui["status"]["prompt"]["state"], "prompt_missing");
+        assert_eq!(tui["status"]["prompt"]["can_submit_pending_prompt"], true);
+        assert_eq!(tui["status"]["prompt"]["awaiting_hook"], "UserPromptSubmit");
         let _ = std::fs::remove_dir_all(root);
     }
 
@@ -1930,6 +2489,163 @@ mod tests {
                 .iter()
                 .any(|item| item["kind"] == "file_written")
         );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn report_accept_resolves_relative_report_path_against_route_workspace() {
+        let root = std::env::temp_dir().join(format!(
+            "agentcall-mcp-report-route-workspace-{}",
+            std::process::id()
+        ));
+        let state = AppState::test(root.clone());
+        let target_workspace = root.join("target-workspace");
+        let report_rel = ".agentcall/reports/worker-report.md";
+        let report_abs = target_workspace.join(report_rel);
+        std::fs::create_dir_all(report_abs.parent().unwrap()).unwrap();
+        std::fs::write(&report_abs, "# Report\n\nstatus: completed\n").unwrap();
+
+        let state_dir = root.join(".agentcall").join("state");
+        std::fs::create_dir_all(&state_dir).unwrap();
+        crate::state::write_json_file(
+            &state_dir.join("routes.json"),
+            &json!({
+                "route-a": {
+                    "route_id": "route-a",
+                    "recommended_runtime": "pty",
+                    "runtime": "auto",
+                    "session_name": "worker-a",
+                    "workspace": target_workspace.display().to_string(),
+                    "status": "started",
+                    "result": {
+                        "context_packet": {
+                            "report_path": report_rel,
+                            "workspace": target_workspace.display().to_string()
+                        }
+                    }
+                }
+            }),
+        )
+        .unwrap();
+
+        let accepted = accept_report_for_session(&state, "worker-a");
+        assert_eq!(accepted["ok"], true);
+        assert_eq!(accepted["status"], "accepted");
+        assert_eq!(accepted["validation"]["exists"], true);
+        assert_eq!(accepted["validation"]["non_empty"], true);
+        assert_eq!(accepted["validation"]["daemon_observed_write"], false);
+        assert_eq!(accepted["confidence"]["overall"], "medium");
+        assert_eq!(accepted["confidence"]["artifact"], "high");
+        assert_eq!(accepted["confidence"]["daemon_write"], "low");
+        assert_eq!(
+            accepted["report_abs_path"],
+            report_abs.display().to_string()
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn request_report_patches_route_with_deadline_and_report_block() {
+        let root = std::env::temp_dir().join(format!(
+            "agentcall-mcp-request-report-{}",
+            std::process::id()
+        ));
+        let state = AppState::test(root.clone());
+        let target_workspace = root.join("target-workspace");
+        let report_rel = ".agents/agentcall/route-1-worker-a.md";
+        let state_dir = root.join(".agentcall").join("state");
+        std::fs::create_dir_all(&state_dir).unwrap();
+        crate::state::write_json_file(
+            &state_dir.join("routes.json"),
+            &json!({
+                "route-1": {
+                    "route_id": "route-1",
+                    "recommended_runtime": "pty",
+                    "runtime": "pty",
+                    "session_name": "worker-a",
+                    "workspace": target_workspace.display().to_string(),
+                    "status": "working",
+                    "result": {
+                        "report": {
+                            "status": "report_not_requested",
+                            "ready": false,
+                            "path": report_rel,
+                            "rel_path": report_rel,
+                            "abs_path": target_workspace.join(report_rel).display().to_string(),
+                            "target_workspace": target_workspace.display().to_string(),
+                            "source": "daemon_minted"
+                        }
+                    }
+                }
+            }),
+        )
+        .unwrap();
+
+        let report = mark_report_requested(&state, "worker-a").unwrap();
+        assert_eq!(report["status"], "report_requested");
+        assert_eq!(report["ready"], false);
+        assert_eq!(report["path"], report_rel);
+        assert_eq!(report["source"], "daemon_minted");
+        assert!(report["request_id"].as_str().unwrap().starts_with("report-request-route-1-"));
+        assert!(
+            report["deadline_at_ms"].as_u64().unwrap()
+                > report["requested_at_ms"].as_u64().unwrap()
+        );
+
+        let routes = crate::state::read_json_file(&state_dir.join("routes.json"), json!({}));
+        assert_eq!(routes["route-1"]["status"], "report_requested");
+        assert_eq!(
+            routes["route-1"]["required_next_step"],
+            "wait_for_report_or_inspect_session"
+        );
+        assert_eq!(
+            routes["route-1"]["result"]["report_request"]["status"],
+            "report_requested"
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn report_accept_high_requires_daemon_observed_write() {
+        let root = std::env::temp_dir().join(format!(
+            "agentcall-mcp-report-route-write-confidence-{}",
+            std::process::id()
+        ));
+        let state = AppState::test(root.clone());
+        let report_rel = ".agentcall/reports/worker-report.md";
+        let report_abs = root.join(report_rel);
+        std::fs::create_dir_all(report_abs.parent().unwrap()).unwrap();
+        std::fs::write(&report_abs, "# Report\n\nstatus: completed\n").unwrap();
+
+        let state_dir = root.join(".agentcall").join("state");
+        std::fs::create_dir_all(&state_dir).unwrap();
+        crate::state::write_json_file(
+            &state_dir.join("routes.json"),
+            &json!({
+                "route-a": {
+                    "route_id": "route-a",
+                    "recommended_runtime": "pty",
+                    "runtime": "auto",
+                    "session_name": "worker-a",
+                    "workspace": root.display().to_string(),
+                    "status": "report_ready",
+                    "result": {
+                        "report_ready": true,
+                        "context_packet": {
+                            "report_path": report_rel,
+                            "workspace": root.display().to_string()
+                        }
+                    }
+                }
+            }),
+        )
+        .unwrap();
+
+        let accepted = accept_report_for_session(&state, "worker-a");
+        assert_eq!(accepted["ok"], true);
+        assert_eq!(accepted["validation"]["daemon_observed_write"], true);
+        assert_eq!(accepted["confidence"]["overall"], "high");
+        assert_eq!(accepted["confidence"]["daemon_write"], "high");
         let _ = std::fs::remove_dir_all(root);
     }
 
