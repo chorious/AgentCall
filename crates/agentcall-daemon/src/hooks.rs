@@ -550,7 +550,7 @@ fn context_injection(
         .unwrap_or(0);
     let structured_reports = count_reports(&state.workspace.join(".agentcall"));
     let mut context = format!(
-        "# AgentCall Context\n\n- runtime: {runtime}\n- workspace: {}\n- active_sessions: {active_sessions}\n- active_file_claims: {active_claims}\n- structured_reports: {structured_reports}\n\nAgentCall discipline:\n- Inspect the board before delegation or handoff.\n- Use AgentCall PTY utility workers for child work.\n- Respect allowed_paths and file claims; do not write outside assigned ownership.\n- Require a concise report or exact change summary at lifecycle end.\n- Write review only for drift, blockers, failed validation, or revision.\n",
+        "# AgentCall Context\n\n- runtime: {runtime}\n- workspace: {}\n- active_sessions: {active_sessions}\n- active_file_claims: {active_claims}\n- structured_reports: {structured_reports}\n\nAgentCall discipline:\n- Inspect the board before delegation or handoff.\n- Use AgentCall PTY utility workers for child work.\n- Respect write_paths and file claims; do not write outside assigned ownership.\n- Require a concise report or exact change summary at lifecycle end.\n- Write review only for drift, blockers, failed validation, or revision.\n",
         state.workspace.display()
     );
     if let Some(wrapper) = wrapper_session {
@@ -905,7 +905,7 @@ pub(crate) fn pre_tool_use_claim_locked(
                     "policy": {
                         "runtime": "pty",
                         "mode": policy.mode.clone(),
-                        "allowed_paths": policy.allowed_paths.clone(),
+                        "write_paths_input": policy.write_paths_input.clone(),
                         "writable_paths": policy.writable_paths.clone(),
                         "writable_roots": policy_writable_roots_json(&policy),
                         "scratch_path": policy.scratch_path.clone(),
@@ -1381,7 +1381,7 @@ fn binding_untrusted_denial(
 
 #[derive(Clone)]
 struct PtyPathPolicy {
-    allowed_paths: Vec<String>,
+    write_paths_input: Vec<String>,
     writable_paths: Vec<String>,
     writable_roots: Vec<WritableRoot>,
     mode: String,
@@ -1410,29 +1410,36 @@ fn pty_path_policy_for_wrapper(state: &AppState, wrapper_session: &str) -> Optio
     }
     let result = route.get("result")?;
     let containment = result.get("containment")?;
-    let mut allowed_paths = string_array(
+    let mut write_paths_input = string_array(
         result
             .get("containment")
-            .and_then(|containment| containment.get("allowed_paths")),
+            .and_then(|containment| containment.get("write_paths_input")),
     );
     let mut writable_paths = string_array(containment.get("writable_paths"));
-    if allowed_paths.is_empty() {
-        allowed_paths = string_array(
+    if write_paths_input.is_empty() {
+        write_paths_input = string_array(
             result
                 .get("context_packet")
-                .and_then(|packet| packet.get("allowed_paths")),
+                .and_then(|packet| packet.get("write_paths")),
         );
     }
     if writable_paths.is_empty() {
-        writable_paths = allowed_paths.clone();
+        writable_paths = write_paths_input.clone();
     }
     let writable_roots = writable_roots_from_containment(containment);
     let roots = containment.get("roots");
-    if allowed_paths.is_empty() && writable_paths.is_empty() && writable_roots.is_empty() {
+    if containment
+        .get("mode")
+        .and_then(serde_json::Value::as_str)
+        != Some("read_only")
+        && write_paths_input.is_empty()
+        && writable_paths.is_empty()
+        && writable_roots.is_empty()
+    {
         return None;
     }
     Some(PtyPathPolicy {
-        allowed_paths,
+        write_paths_input,
         writable_paths,
         writable_roots,
         mode: containment
@@ -1522,12 +1529,12 @@ fn pty_path_policy_denial(
             return None;
         }
         return Some(
-            "PTY path policy denies write outside allowed_paths or writable_paths".to_string(),
+            "PTY path policy denies write outside write_paths or writable_roots".to_string(),
         );
     }
     if tool_name == "Bash" && !bash_readonly_allowed(payload) {
         return Some(
-            "PTY path policy denies non-read-only bash when allowed_paths are enforced".to_string(),
+            "PTY path policy denies non-read-only bash when write_paths are enforced".to_string(),
         );
     }
     None
@@ -1614,13 +1621,13 @@ fn record_policy_denial_locked(
     let category = policy_denial_category(tool_name, reason);
     let path_diagnosis = policy_path_diagnosis(tool_name, payload, policy, "deny");
     let recommended_action = match category.as_str() {
-        "missing_scratch_or_report_path" => "extend_allowed_paths_or_use_write_tool",
+        "missing_scratch_or_report_path" => "extend_write_paths_or_use_write_tool",
         _ => "interrupt_or_send_blocker_instruction",
     };
-    let mut suggested_allowed_paths = vec![];
+    let mut suggested_write_paths = vec![];
     if category == "missing_scratch_or_report_path" {
         if let Some(scratch) = &policy.scratch_path {
-            suggested_allowed_paths.push(serde_json::json!(scratch));
+            suggested_write_paths.push(serde_json::json!(scratch));
         }
     }
     let block = serde_json::json!({
@@ -1638,7 +1645,7 @@ fn record_policy_denial_locked(
         "category": category,
         "recommended_action": recommended_action,
         "path_diagnosis": path_diagnosis,
-        "suggested_allowed_paths": suggested_allowed_paths,
+        "suggested_write_paths": suggested_write_paths,
         "guidance_injected": previous
             .get("guidance_injected")
             .and_then(serde_json::Value::as_bool)
@@ -1647,7 +1654,7 @@ fn record_policy_denial_locked(
         "last_seen": now,
         "policy": {
             "mode": policy.mode.clone(),
-            "allowed_paths": policy.allowed_paths.clone(),
+            "write_paths_input": policy.write_paths_input.clone(),
             "writable_paths": policy.writable_paths.clone(),
             "writable_roots": policy_writable_roots_json(policy),
             "scratch_path": policy.scratch_path.clone(),
@@ -2262,7 +2269,7 @@ mod tests {
         .unwrap();
     }
 
-    fn install_pty_auto_route(state: &AppState, wrapper_session: &str, allowed_paths: &[&str]) {
+    fn install_pty_auto_route(state: &AppState, wrapper_session: &str, write_paths: &[&str]) {
         let path = state
             .workspace
             .join(".agentcall")
@@ -2282,7 +2289,7 @@ mod tests {
                         "permission_mode": "auto",
                         "containment": {
                             "mode": "enforced",
-                            "allowed_paths": allowed_paths
+                            "write_paths_input": write_paths
                         }
                     }
                 }
@@ -2328,11 +2335,11 @@ mod tests {
                         "permission_mode": "auto",
                         "context_packet": {
                             "report_path": report_path,
-                            "allowed_paths": ["docs/reports"]
+                            "write_paths": ["docs/reports"]
                         },
                         "containment": {
                             "mode": mode,
-                            "allowed_paths": ["docs/reports"],
+                            "write_paths_input": ["docs/reports"],
                             "writable_paths": writable_paths,
                             "scratch_path": if read_only { serde_json::Value::Null } else { serde_json::json!(scratch) },
                             "bash_write_policy": "readonly_only"
@@ -2739,7 +2746,7 @@ mod tests {
     }
 
     #[test]
-    fn pty_auto_route_denies_write_outside_allowed_paths() {
+    fn pty_auto_route_denies_write_outside_write_paths() {
         let state = test_state("pty-auto-deny-outside");
         install_pty_auto_route(&state, "pty-a", &["src"]);
         let mut payload = write_payload("claude-a", "docs/report.md");
@@ -2758,12 +2765,12 @@ mod tests {
             result["decision"]["reason"]
                 .as_str()
                 .unwrap()
-                .contains("outside allowed_paths")
+                .contains("outside write_paths")
         );
     }
 
     #[test]
-    fn pty_auto_route_allows_write_inside_allowed_paths() {
+    fn pty_auto_route_allows_write_inside_write_paths() {
         let state = test_state("pty-auto-allow-inside");
         install_pty_auto_route(&state, "pty-a", &["src"]);
         let mut payload = write_payload("claude-a", "src/lib.rs");
@@ -2803,7 +2810,7 @@ mod tests {
                         "permission_mode": "auto",
                         "containment": {
                             "mode": "enforced_readonly_bash",
-                            "allowed_paths": ["."],
+                            "write_paths_input": ["."],
                             "writable_paths": ["."],
                             "roots": {
                                 "process_cwd": "D:\\guKimi",
@@ -2908,7 +2915,7 @@ mod tests {
                         },
                         "containment": {
                             "mode": "enforced_readonly_bash",
-                            "allowed_paths": ["src"],
+                            "write_paths_input": ["src"],
                             "writable_paths": ["src"],
                             "bash_write_policy": "readonly_only"
                         }
@@ -2952,7 +2959,7 @@ mod tests {
                         "permission_mode": "auto",
                         "containment": {
                             "mode": "enforced_readonly_bash",
-                            "allowed_paths": ["src"],
+                            "write_paths_input": ["src"],
                             "writable_paths": [".agentcall/workspaces/pty-a", "docs/report.md"],
                             "scratch_path": ".agentcall/workspaces/pty-a",
                             "bash_write_policy": "readonly_only"
@@ -2999,7 +3006,7 @@ mod tests {
                         "permission_mode": "auto",
                         "containment": {
                             "mode": "enforced_readonly_bash",
-                            "allowed_paths": ["src"],
+                            "write_paths_input": ["src"],
                             "writable_paths": [".agentcall/workspaces/pty-a", "docs/report.md"],
                             "scratch_path": ".agentcall/workspaces/pty-a",
                             "roots": {
@@ -3061,7 +3068,7 @@ mod tests {
                         "permission_mode": "auto",
                         "containment": {
                             "mode": "enforced_readonly_bash",
-                            "allowed_paths": [],
+                            "write_paths_input": [],
                             "writable_paths": [],
                             "scratch_path": ".agentcall/workspaces/pty-a",
                             "roots": {

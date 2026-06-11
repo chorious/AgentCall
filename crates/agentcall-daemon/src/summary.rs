@@ -914,7 +914,7 @@ pub(crate) fn session_summary(state: &AppState, session: &Arc<Session>) -> serde
             .get_mut("warnings")
             .and_then(|value| value.as_array_mut())
         {
-            warnings.push(serde_json::json!("policy deny loop detected; do not wait inside the patience window. Change allowed_paths/task, request a blocker report, or interrupt/stop the worker."));
+            warnings.push(serde_json::json!("policy deny loop detected; do not wait inside the patience window. Change write_paths/task, request a blocker report, or interrupt/stop the worker."));
         }
     }
     if let Some(object) = payload.as_object_mut() {

@@ -1,3 +1,5 @@
+use crate::actor::submit_session_command;
+use crate::commands::{PreparedCommand, prepare_session_send_command};
 use crate::routes::{patch_route_record, route_for_wrapper_session};
 use crate::state::AppState;
 use crate::util::now_ms;
@@ -128,6 +130,11 @@ pub(crate) fn refresh_prompt_gate_timeouts_for_session(
     wrapper_session: &str,
 ) -> PromptGateView {
     let view = prompt_gate_for_session(state, wrapper_session);
+    if view.can_submit_pending_prompt() {
+        if daemon_auto_submit_pending_prompt(state, wrapper_session, &view).is_ok() {
+            return prompt_gate_for_session(state, wrapper_session);
+        }
+    }
     if matches!(view.state, PromptGateState::PromptCommitUnacknowledged) {
         if let Some(route_id) = view.route_id.as_deref() {
             let _ = patch_route_record(
@@ -153,6 +160,98 @@ pub(crate) fn refresh_prompt_gate_timeouts_for_session(
         }
     }
     view
+}
+
+fn daemon_auto_submit_pending_prompt(
+    state: &AppState,
+    wrapper_session: &str,
+    view: &PromptGateView,
+) -> Result<(), String> {
+    let route_id = view
+        .route_id
+        .clone()
+        .ok_or_else(|| "missing route_id for prompt gate".to_string())?;
+    let attempt_index = view.commit_attempts.saturating_add(1);
+    let attempt_id = prompt_commit_attempt_id(&route_id, wrapper_session, attempt_index);
+    let sent_at_ms = now_ms();
+    let args = json!({
+        "idempotency_key": attempt_id,
+        "owner_id": "codex"
+    });
+    let mut command = match prepare_session_send_command(
+        state,
+        wrapper_session,
+        "submit_pending_prompt",
+        &args,
+    )? {
+        PreparedCommand::Submit(command) => command,
+        PreparedCommand::Deduped(_) => return Ok(()),
+    };
+    command.payload["text"] = json!(" ");
+    command.payload["enter"] = json!(true);
+    command.payload["attempt_id"] = json!(attempt_id.clone());
+    command.payload["prompt_id"] = view
+        .prompt_id
+        .clone()
+        .map(Value::String)
+        .unwrap_or(Value::Null);
+    let _ = submit_session_command(state, wrapper_session, command)?;
+    let attempts = prompt_commit_attempts_for_session(state, wrapper_session, &attempt_id, sent_at_ms);
+    patch_route_record(
+        state,
+        &route_id,
+        json!({
+            "status": "prompt_commit_signal_sent",
+            "updated_at": now_ms(),
+            "result": {
+                "prompt": {
+                    "state": "commit_signal_sent",
+                    "task_started": false,
+                    "active_commit_attempt_id": attempt_id,
+                    "active_commit_sent_at_ms": sent_at_ms,
+                    "commit_ack_deadline_ms": DEFAULT_COMMIT_ACK_DEADLINE_MS,
+                    "awaiting_hook": "UserPromptSubmit",
+                    "commit_attempts": attempts
+                },
+                "prompt_gate": {
+                    "schema_version": 2,
+                    "state": "commit_signal_sent",
+                    "task_started": false,
+                    "active_commit_attempt_id": attempt_id,
+                    "active_commit_sent_at_ms": sent_at_ms,
+                    "commit_ack_deadline_ms": DEFAULT_COMMIT_ACK_DEADLINE_MS,
+                    "awaiting_hook": "UserPromptSubmit",
+                    "commit_attempts": attempts
+                }
+            }
+        }),
+    )
+}
+
+fn prompt_commit_attempts_for_session(
+    state: &AppState,
+    wrapper_session: &str,
+    attempt_id: &str,
+    sent_at_ms: u64,
+) -> Value {
+    let mut attempts = route_for_wrapper_session(state, wrapper_session)
+        .and_then(|(_, route)| {
+            route
+                .pointer("/result/prompt_gate/commit_attempts")
+                .and_then(Value::as_array)
+                .cloned()
+        })
+        .unwrap_or_default();
+    let next_index = attempts.len() + 1;
+    attempts.push(json!({
+        "attempt_id": attempt_id,
+        "kind": "daemon_auto",
+        "state": "signal_sent",
+        "sent_at_ms": sent_at_ms,
+        "ack_deadline_ms": DEFAULT_COMMIT_ACK_DEADLINE_MS,
+        "index": next_index,
+    }));
+    Value::Array(attempts)
 }
 
 pub(crate) fn prompt_gate_from_route(route_id: &str, route: &Value) -> PromptGateView {

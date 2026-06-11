@@ -15,11 +15,11 @@ v6.0 是 slim Codex control plane：
 - 当前默认 runtime 是 Claude Code PTY utility worker。
 - ACP/SDK 不再作为默认产品路线。
 - `agentcall_route(...)` 默认启动 daemon-owned PTY worker；Codex 不需要选择 runtime 或估算任务大小。
-- `agentcall_session(name)` 默认返回归一化 worker state、why、next_actions、report 和短期 control token。
+- `agentcall_session(name)` 默认返回归一化 worker state、why、primary_action、available/debug actions、report 和短期 control token。
 - Claude Code worker 强制在 daemon config 的 `claude_workspace` 下启动，读取该目录的 `.claude/settings.local.json`。
 - Codex plugin 提供 MCP server 和 AgentCall supervisor skill，降低不同 Codex session 看不到工具的问题。
 - board/session 默认读取 compact projection，不把历史 session、raw terminal、tool output 混入正常控制面。
-- prompt gate 把 `UserPromptSubmit` 作为任务真正开始的结构化确认；未确认的卡住 prompt 可用 `submit_pending_prompt` 恢复。
+- prompt gate 把 `UserPromptSubmit` 作为任务真正开始的结构化确认；未确认的卡住 prompt 默认继续等待，`submit_pending_prompt` 只作为 debug/recovery 动作。
 - 写入 route `report_path` 会把 worker 标记为 `report_ready`，让 Codex 可以验收而不是继续盲等。
 - read-only worker 默认拒绝 `TaskCreate`，防止审查任务漂移成实现任务。
 

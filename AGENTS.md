@@ -72,9 +72,9 @@ Preferred flow:
 ```text
 agentcall_daemon(action=start)
 agentcall_board(view=compact, filter=attention)
-agentcall_route(objective=..., workspace=..., allowed_paths=...)
+agentcall_route(objective=..., workspace=..., write_paths=..., reference_paths=...)
 agentcall_session(name=...)
-agentcall_session_send(action=<one of returned next_actions>)
+agentcall_session_send(action=<primary_action.kind when applicable>)
 agentcall_report(action=request|accept)
 ```
 
@@ -85,7 +85,7 @@ Use `agentcall_daemon(action=status)` as the real availability check. `tool_sear
 ## Worker Discipline
 
 - Ask for a report or exact change summary at lifecycle end.
-- Do not write outside assigned `allowed_paths`, scratch, or `report_path`.
+- Do not write outside assigned `write_paths`, scratch, or `report_path`.
 - Do not use raw PTY output as the primary status source when projection is available.
 - Review only when there is drift, blocker, failed validation, low confidence, or requested review.
 - Do not mechanically review a clean report.
@@ -134,7 +134,7 @@ See `docs/v6.2-code-plan.md` for the frozen target. Do not edit that plan during
 - `agentcall_route` mints a unique per-route report path under the target workspace when `report_path` is omitted.
 - `agentcall_session_send(action=request_report)` is a finite report state transition; observe `report_requested`, `report_drafting`, `report_ready`, or `report_overdue`.
 - Report acceptance confidence is split into `overall`, `artifact`, `daemon_write`, and `route_match`; `overall=high` requires daemon-observed evidence.
-- `agentcall_session` default summary must expose `state`, `why`, `can_wait`, `next_actions`, report info, workspace projection, and a short-lived control token if available.
+- `agentcall_session` default summary must expose `state`, `why`, `can_wait`, `primary_action`, `available_actions`, `debug_actions`, report info, workspace projection, and a short-lived control token if available.
 - Compact board must list current live workers and attention only; historical projections belong in debug/raw views.
 - Board/session must distinguish daemon workspace, target workspace, Claude cwd, and report workspace.
 - `/api/*` requires daemon token unless `dev_open_loopback=true` is explicitly set in local config.

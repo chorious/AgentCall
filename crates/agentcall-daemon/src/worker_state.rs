@@ -8,6 +8,9 @@ use crate::state::AppState;
 use crate::util::now_ms;
 use serde_json::{Value, json};
 use std::path::PathBuf;
+use std::sync::atomic::Ordering;
+
+const PATIENCE_FLOOR_SECONDS: u64 = 60;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum WorkerStateKind {
@@ -62,7 +65,10 @@ pub(crate) struct WorkerStateView {
     pub(crate) state: WorkerStateKind,
     pub(crate) why: String,
     pub(crate) can_wait: bool,
-    pub(crate) next_actions: Vec<Value>,
+    pub(crate) primary_action: Value,
+    pub(crate) available_actions: Vec<Value>,
+    pub(crate) debug_actions: Vec<Value>,
+    pub(crate) patience: Value,
     pub(crate) report: Value,
     pub(crate) workspace: Value,
     pub(crate) debug_refs: Value,
@@ -79,8 +85,10 @@ impl WorkerStateView {
             "state": self.state.as_str(),
             "why": self.why,
             "can_wait": self.can_wait,
-            "next_action": self.next_actions.first().and_then(|item| item.get("kind")).cloned().unwrap_or(Value::Null),
-            "next_actions": self.next_actions,
+            "primary_action": self.primary_action,
+            "available_actions": self.available_actions,
+            "debug_actions": self.debug_actions,
+            "patience": self.patience,
             "report": self.report,
             "workspace": self.workspace,
             "pending_interaction": pending_interaction_for_state(&self.state, &self.why),
@@ -97,8 +105,10 @@ impl WorkerStateView {
             "state": self.state.as_str(),
             "why": self.why,
             "can_wait": self.can_wait,
-            "next_action": self.next_actions.first().and_then(|item| item.get("kind")).cloned().unwrap_or(Value::Null),
-            "next_actions": self.next_actions,
+            "primary_action": self.primary_action,
+            "available_actions": self.available_actions,
+            "debug_actions": self.debug_actions,
+            "patience": self.patience,
             "report": self.report,
             "workspace": self.workspace,
             "pending_interaction": pending_interaction_for_state(&self.state, &self.why),
@@ -149,7 +159,13 @@ pub(crate) fn worker_state_for_session(state: &AppState, session_name: &str) -> 
         .get("terminal")
         .and_then(Value::as_bool)
         .unwrap_or(false);
-    let live = state.sessions.lock().unwrap().contains_key(session_name);
+    let session_updated_at = {
+        let sessions = state.sessions.lock().unwrap();
+        sessions
+            .get(session_name)
+            .map(|session| session.updated_at.load(Ordering::Relaxed))
+    };
+    let live = session_updated_at.is_some();
 
     let (state_kind, why, can_wait) = if terminal
         || matches!(liveness, "completed" | "stopped" | "killed")
@@ -276,13 +292,26 @@ pub(crate) fn worker_state_for_session(state: &AppState, session_name: &str) -> 
         )
     };
 
-    let next_actions = next_actions_for_state(session_name, &state_kind, report_ready);
+    let last_progress_age_seconds = session_updated_at
+        .map(|updated_at| now_ms().saturating_sub(updated_at) / 1000)
+        .or_else(|| {
+            projection
+                .get("last_progress_age_seconds")
+                .and_then(Value::as_u64)
+        })
+        .unwrap_or(0);
+    let patience = patience_for_state(&state_kind, last_progress_age_seconds);
+    let (primary_action, available_actions, debug_actions) =
+        actions_for_state(session_name, &state_kind, report_ready, &patience);
     WorkerStateView {
         worker: session_name.to_string(),
         state: state_kind,
         why,
         can_wait,
-        next_actions,
+        primary_action,
+        available_actions,
+        debug_actions,
+        patience,
         report,
         workspace,
         debug_refs,
@@ -384,100 +413,172 @@ fn report_is_overdue(report: &Value) -> bool {
         .is_some_and(|deadline| deadline <= now_ms())
 }
 
-fn next_actions_for_state(
+fn patience_for_state(state: &WorkerStateKind, last_progress_age_seconds: u64) -> Value {
+    let can_wait = matches!(
+        state,
+        WorkerStateKind::Starting
+            | WorkerStateKind::PromptPending
+            | WorkerStateKind::PromptSubmitted
+            | WorkerStateKind::Working
+            | WorkerStateKind::ReportRequested
+            | WorkerStateKind::ReportDrafting
+            | WorkerStateKind::Stopping
+    );
+    if !can_wait {
+        return json!({
+            "status": "not_waitable",
+            "last_progress_age_seconds": last_progress_age_seconds,
+            "suggested_wait_seconds": 0,
+            "do_not_retry_before_seconds": 0,
+            "hard_gate": false
+        });
+    }
+    let remaining = PATIENCE_FLOOR_SECONDS.saturating_sub(last_progress_age_seconds);
+    if remaining > 0 {
+        json!({
+            "status": "inside_patience_window",
+            "last_progress_age_seconds": last_progress_age_seconds,
+            "suggested_wait_seconds": remaining,
+            "do_not_retry_before_seconds": remaining,
+            "hard_gate": true,
+            "hint": "Worker is inside the patience window. Wait before sending continue or requesting a report unless the user explicitly wants to close the task."
+        })
+    } else {
+        json!({
+            "status": "patience_window_elapsed",
+            "last_progress_age_seconds": last_progress_age_seconds,
+            "suggested_wait_seconds": 0,
+            "do_not_retry_before_seconds": 0,
+            "hard_gate": true
+        })
+    }
+}
+
+fn actions_for_state(
     session_name: &str,
     state: &WorkerStateKind,
     report_ready: bool,
-) -> Vec<Value> {
+    patience: &Value,
+) -> (Value, Vec<Value>, Vec<Value>) {
+    let wait = wait_action(patience);
     match state {
-        WorkerStateKind::PromptMissing => vec![
-            action(
-                session_name,
-                "submit_pending_prompt",
-                "agentcall_session_send",
-                false,
-            ),
-            action(session_name, "stop", "agentcall_session_send", true),
-        ],
-        WorkerStateKind::PromptCommitUnacknowledged => vec![
-            action(
-                session_name,
-                "submit_pending_prompt",
-                "agentcall_session_send",
-                false,
-            ),
+        WorkerStateKind::PromptMissing => (
+            wait.clone(),
+            vec![],
+            vec![
+                action(
+                    session_name,
+                    "submit_pending_prompt",
+                    "agentcall_session_send",
+                    false,
+                ),
+                action(session_name, "stop", "agentcall_session_send", true),
+            ],
+        ),
+        WorkerStateKind::PromptCommitUnacknowledged => (
             json!({"kind": "inspect_screen_or_retry_prompt_commit"}),
-            action(session_name, "stop", "agentcall_session_send", true),
-        ],
-        WorkerStateKind::PromptPending | WorkerStateKind::Starting => vec![json!({"kind": "wait"})],
-        WorkerStateKind::PromptSubmitted => vec![json!({"kind": "wait"})],
-        WorkerStateKind::Working => vec![
-            json!({"kind": "wait"}),
+            vec![],
+            vec![
+                action(
+                    session_name,
+                    "submit_pending_prompt",
+                    "agentcall_session_send",
+                    false,
+                ),
+                action(session_name, "stop", "agentcall_session_send", true),
+            ],
+        ),
+        WorkerStateKind::PromptPending
+        | WorkerStateKind::Starting
+        | WorkerStateKind::PromptSubmitted
+        | WorkerStateKind::Working
+        | WorkerStateKind::Stopping => (wait, vec![], vec![json!({"kind": "inspect_events", "view": "events"})]),
+        WorkerStateKind::IdleAfterTurn => (
             action(
                 session_name,
                 "request_report",
                 "agentcall_session_send",
                 false,
             ),
-        ],
-        WorkerStateKind::IdleAfterTurn => vec![action(
-            session_name,
-            "request_report",
-            "agentcall_session_send",
-            false,
-        )],
-        WorkerStateKind::NeedsPermission => vec![
+            vec![],
+            vec![json!({"kind": "inspect_events", "view": "events"})],
+        ),
+        WorkerStateKind::NeedsPermission => (
             json!({"kind": "select_option", "tool": "agentcall_session_send", "args": {"name": session_name, "action": "select_option"}, "choice_required": true}),
-            action(session_name, "interrupt", "agentcall_session_send", true),
-        ],
-        WorkerStateKind::BlockedByPolicy => vec![
+            vec![],
+            vec![action(session_name, "interrupt", "agentcall_session_send", true)],
+        ),
+        WorkerStateKind::BlockedByPolicy => (
             action(
                 session_name,
                 "request_report",
                 "agentcall_session_send",
                 false,
             ),
-            action(session_name, "interrupt", "agentcall_session_send", true),
-            action(session_name, "stop", "agentcall_session_send", true),
-        ],
-        WorkerStateKind::CheckpointDue => vec![
+            vec![],
+            vec![
+                action(session_name, "interrupt", "agentcall_session_send", true),
+                action(session_name, "stop", "agentcall_session_send", true),
+            ],
+        ),
+        WorkerStateKind::CheckpointDue => (
             json!({"kind": "inspect_or_accept_report"}),
-            action(
+            vec![action(
                 session_name,
                 "request_report",
                 "agentcall_session_send",
                 false,
-            ),
-        ],
+            )],
+            vec![json!({"kind": "inspect_events", "view": "events"})],
+        ),
         WorkerStateKind::ReportRequested | WorkerStateKind::ReportDrafting => {
-            vec![json!({"kind": "wait"})]
+            (wait, vec![], vec![json!({"kind": "inspect_events", "view": "events"})])
         }
-        WorkerStateKind::ReportOverdue => vec![
+        WorkerStateKind::ReportOverdue => (
             json!({"kind": "inspect_session"}),
-            action(session_name, "interrupt", "agentcall_session_send", true),
-            action(session_name, "stop", "agentcall_session_send", true),
-        ],
-        WorkerStateKind::ReportReady => vec![
+            vec![],
+            vec![
+                action(session_name, "interrupt", "agentcall_session_send", true),
+                action(session_name, "stop", "agentcall_session_send", true),
+            ],
+        ),
+        WorkerStateKind::ReportReady => (
             json!({"kind": "accept_report", "tool": "agentcall_report", "args": {"action": "accept", "session_id": session_name}}),
+            vec![],
+            vec![action(session_name, "stop", "agentcall_session_send", true)],
+        ),
+        WorkerStateKind::ReportAccepted => (
             action(session_name, "stop", "agentcall_session_send", true),
-        ],
-        WorkerStateKind::ReportAccepted => {
-            vec![action(session_name, "stop", "agentcall_session_send", true)]
-        }
-        WorkerStateKind::Stopping => vec![json!({"kind": "wait"})],
+            vec![],
+            vec![],
+        ),
         WorkerStateKind::Done => {
             if report_ready {
-                vec![
+                (
                     json!({"kind": "accept_report", "tool": "agentcall_report", "args": {"action": "accept", "session_id": session_name}}),
-                ]
+                    vec![],
+                    vec![],
+                )
             } else {
-                vec![]
+                (Value::Null, vec![], vec![])
             }
         }
-        WorkerStateKind::Failed => {
-            vec![action(session_name, "kill", "agentcall_session_send", true)]
-        }
+        WorkerStateKind::Failed => (
+            action(session_name, "kill", "agentcall_session_send", true),
+            vec![],
+            vec![],
+        ),
     }
+}
+
+fn wait_action(patience: &Value) -> Value {
+    json!({
+        "kind": "wait",
+        "sleep_seconds": patience
+            .get("suggested_wait_seconds")
+            .and_then(Value::as_u64)
+            .unwrap_or(PATIENCE_FLOOR_SECONDS)
+    })
 }
 
 fn pending_interaction_for_state(state: &WorkerStateKind, why: &str) -> Value {

@@ -182,9 +182,9 @@ Recommended Codex flow:
 ```text
 agentcall_daemon(action=start)
 agentcall_board(view=compact, filter=attention)
-agentcall_route(objective=..., workspace=..., allowed_paths=...)
+agentcall_route(objective=..., workspace=..., write_paths=..., reference_paths=...)
 agentcall_session(name=...)
-agentcall_session_send(action=<one of returned next_actions>)
+agentcall_session_send(action=<primary_action.kind when applicable>)
 agentcall_report(action=request|accept)
 ```
 
@@ -198,7 +198,9 @@ agentcall_report(action=request|accept)
 
 Route/session/report projections distinguish `daemon_workspace`, `target_workspace`, `claude_cwd`, and `report_workspace`. The route `workspace` is the task target; it does not override Claude Code cwd.
 
-If `agentcall_session` returns `state=prompt_missing` or `state=prompt_commit_unacknowledged`, use `agentcall_session_send(action=submit_pending_prompt)`. A successful call means only that the commit signal was sent; it returns `not_completed=true` and must be followed by `agentcall_session(name=...)` until `UserPromptSubmit`, tool progress, report evidence, or explicit failure appears.
+`write_paths` define where Write/Edit/MultiEdit may modify files. `reference_paths` are read/context recommendations for the worker, not daemon-enforced read permissions.
+
+If `agentcall_session` returns `state=prompt_pending`, `state=prompt_missing`, or `state=prompt_commit_unacknowledged`, follow `primary_action`. `submit_pending_prompt` is a debug/recovery action, not the default path. A successful call means only that the commit signal was sent; it returns `not_completed=true` and must be followed by `agentcall_session(name=...)` until `UserPromptSubmit`, tool progress, report evidence, or explicit failure appears.
 
 Use `agentcall_session_send(action=request_report)` when the worker should close. It returns `report_requested` with a request id/deadline. Then refresh `agentcall_session` until `report_drafting`, `report_ready`, or `report_overdue`; do not keep sending closure prompts.
 

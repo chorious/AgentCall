@@ -35,7 +35,8 @@ pub(crate) struct RouteRequest {
     call_id: Option<String>,
     phase: Option<String>,
     role: Option<String>,
-    allowed_paths: Option<Vec<String>>,
+    reference_paths: Option<Vec<String>>,
+    write_paths: Option<Vec<String>>,
     acceptance_criteria: Option<Vec<String>>,
     persist_context: Option<bool>,
     report_path: Option<String>,
@@ -171,7 +172,8 @@ pub(crate) fn handle_route(state: &Arc<AppState>, req: RouteRequest) -> Result<V
                 role: req.role.clone(),
                 runtime: Some(decision.runtime.clone()),
                 workspace: req.workspace.clone(),
-                allowed_paths: req.allowed_paths.clone(),
+                reference_paths: req.reference_paths.clone(),
+                write_paths: req.write_paths.clone(),
                 acceptance_criteria: req.acceptance_criteria.clone(),
                 persist: req.persist_context,
                 report_path: req.report_path.clone(),
@@ -255,7 +257,8 @@ pub(crate) struct ContextRequest {
     role: Option<String>,
     runtime: Option<String>,
     workspace: Option<String>,
-    allowed_paths: Option<Vec<String>>,
+    reference_paths: Option<Vec<String>>,
+    write_paths: Option<Vec<String>>,
     acceptance_criteria: Option<Vec<String>>,
     persist: Option<bool>,
     report_path: Option<String>,
@@ -279,7 +282,8 @@ pub(crate) fn create_context(state: &Arc<AppState>, req: ContextRequest) -> Resu
         "runtime": req.runtime.unwrap_or_else(|| "pty".to_string()),
         "workspace": req.workspace,
         "objective": req.objective,
-        "allowed_paths": req.allowed_paths.unwrap_or_default(),
+        "write_paths": req.write_paths.unwrap_or_default(),
+        "reference_paths": req.reference_paths.unwrap_or_default(),
         "acceptance_criteria": req.acceptance_criteria.unwrap_or_default(),
         "report_path": req.report_path,
     });
@@ -748,7 +752,8 @@ fn route_target_workspace(state: &AppState, req: &RouteRequest) -> std::path::Pa
 
 fn pty_containment(state: &AppState, req: &RouteRequest, session_name: &str) -> Value {
     let read_only = req.read_only.unwrap_or(false);
-    let explicit_allowed = req.allowed_paths.clone().unwrap_or_default();
+    let write_paths_input = req.write_paths.clone().unwrap_or_default();
+    let reference_paths = req.reference_paths.clone().unwrap_or_default();
     let scratch_path = format!(".agentcall/workspaces/{session_name}");
     let process_cwd =
         configured_claude_workspace(state).unwrap_or_else(|_| state.workspace.clone());
@@ -775,11 +780,11 @@ fn pty_containment(state: &AppState, req: &RouteRequest, session_name: &str) -> 
                 "abs": materialize_route_path(&target_workspace, report_path).display().to_string()
             }));
         }
-        for path in &explicit_allowed {
+        for path in &write_paths_input {
             if !path.trim().is_empty() && !writable_paths.iter().any(|item| item == path) {
                 writable_paths.push(path.clone());
                 writable_roots.push(json!({
-                    "kind": "allowed_path",
+                    "kind": "write_path",
                     "display": path,
                     "abs": materialize_route_path(&target_workspace, path).display().to_string()
                 }));
@@ -796,7 +801,8 @@ fn pty_containment(state: &AppState, req: &RouteRequest, session_name: &str) -> 
     json!({
         "mode": if read_only { "read_only" } else { "enforced_readonly_bash" },
         "read_only": read_only,
-        "allowed_paths": explicit_allowed,
+        "write_paths_input": write_paths_input,
+        "reference_paths": reference_paths,
         "writable_paths": writable_paths,
         "scratch_path": if read_only { Value::Null } else { json!(scratch_path) },
         "roots": {
@@ -944,7 +950,8 @@ fn route_has_context_fields(req: &RouteRequest) -> bool {
         || req.call_id.is_some()
         || req.phase.is_some()
         || req.role.is_some()
-        || req.allowed_paths.is_some()
+        || req.reference_paths.is_some()
+        || req.write_paths.is_some()
         || req.acceptance_criteria.is_some()
         || req.persist_context.is_some()
         || req.report_path.is_some()
@@ -1232,11 +1239,11 @@ fn pty_prompt(state: &AppState, req: &RouteRequest, containment: &Value) -> Stri
         PtyWorkflow::from_request(req.pty_workflow.as_deref()).unwrap_or(PtyWorkflow::Normal);
     match workflow {
         PtyWorkflow::PlanThenAuto => format!(
-            "AgentCall PTY handoff. Start in PLAN MODE.\n\nStep 0 - control envelope:\n{}\n\nKnown local toolchain:\n{}\n\nObjective:\n{}\n\nAllowed paths / ownership:\n- {}\n\nAcceptance criteria:\n- {}\n\nPlan-phase rules:\n- Inspect the code and write a concrete plan only.\n- If anything important is unclear, ask concise clarification questions instead of guessing.\n- Do not modify project files during plan phase.\n- When the plan is ready, use ExitPlanMode and wait for approval. After approval, continue in auto mode and write the requested report.\n",
+            "AgentCall PTY handoff. Start in PLAN MODE.\n\nStep 0 - control envelope:\n{}\n\nKnown local toolchain:\n{}\n\nObjective:\n{}\n\nRead/write boundaries:\n- {}\n\nAcceptance criteria:\n- {}\n\nPlan-phase rules:\n- Inspect the code and write a concrete plan only.\n- If anything important is unclear, ask concise clarification questions instead of guessing.\n- Do not modify project files during plan phase.\n- When the plan is ready, use ExitPlanMode and wait for approval. After approval, continue in auto mode and write the requested report.\n",
             envelope, toolchain, req.objective, allowed, criteria
         ),
         PtyWorkflow::Normal => format!(
-            "AgentCall utility PTY worker.\n\nStep 0 - control envelope:\n{}\n\nKnown local toolchain:\n{}\n\nObjective:\n{}\n\nAllowed paths / ownership:\n- {}\n\nAcceptance criteria:\n- {}\n\nRules:\n- Work in auto mode.\n- If key context is unclear, ask a concise question in this PTY.\n- Respect allowed_paths. Do not write outside them.\n- When finished, write the requested report or summarize exact changes, tests, risks, and remaining questions.\n- Stop at the prompt for supervisor review.\n",
+            "AgentCall utility PTY worker.\n\nStep 0 - control envelope:\n{}\n\nKnown local toolchain:\n{}\n\nObjective:\n{}\n\nRead/write boundaries:\n- {}\n\nAcceptance criteria:\n- {}\n\nRules:\n- Work in auto mode.\n- If key context is unclear, ask a concise question in this PTY.\n- Respect write boundaries. Do not write outside them.\n- Use reference paths for reading context when provided.\n- When finished, write the requested report or summarize exact changes, tests, risks, and remaining questions.\n- Stop at the prompt for supervisor review.\n",
             envelope, toolchain, req.objective, allowed, criteria
         ),
     }
@@ -1379,9 +1386,14 @@ fn pty_prompt_containment(containment: &Value) -> String {
             }
         }
     }
-    if let Some(paths) = containment.get("allowed_paths").and_then(Value::as_array) {
+    if let Some(paths) = containment.get("write_paths_input").and_then(Value::as_array) {
         for path in paths.iter().filter_map(Value::as_str) {
-            lines.push(format!("owned path: {path}"));
+            lines.push(format!("write boundary: {path}"));
+        }
+    }
+    if let Some(paths) = containment.get("reference_paths").and_then(Value::as_array) {
+        for path in paths.iter().filter_map(Value::as_str) {
+            lines.push(format!("reference path: {path}"));
         }
     }
     if let Some(scratch) = containment.get("scratch_path").and_then(Value::as_str) {
@@ -1459,7 +1471,8 @@ mod tests {
                 call_id: None,
                 phase: None,
                 role: None,
-                allowed_paths: None,
+                reference_paths: None,
+                write_paths: None,
                 acceptance_criteria: None,
                 persist_context: None,
                 report_path: None,
@@ -1495,7 +1508,8 @@ mod tests {
                 call_id: None,
                 phase: None,
                 role: None,
-                allowed_paths: None,
+                reference_paths: None,
+                write_paths: None,
                 acceptance_criteria: None,
                 persist_context: None,
                 report_path: None,
@@ -1538,7 +1552,8 @@ mod tests {
                 call_id: None,
                 phase: None,
                 role: None,
-                allowed_paths: None,
+                reference_paths: None,
+                write_paths: None,
                 acceptance_criteria: None,
                 persist_context: None,
                 report_path: None,
@@ -1584,7 +1599,8 @@ mod tests {
                 call_id: Some("call-a".to_string()),
                 phase: Some("execute".to_string()),
                 role: Some("reviewer".to_string()),
-                allowed_paths: Some(vec!["src".to_string()]),
+                reference_paths: Some(vec!["docs".to_string()]),
+                write_paths: Some(vec!["src".to_string()]),
                 acceptance_criteria: Some(vec!["report risks".to_string()]),
                 persist_context: Some(true),
                 report_path: Some("src/report.md".to_string()),
@@ -1626,7 +1642,8 @@ mod tests {
             call_id: None,
             phase: None,
             role: None,
-            allowed_paths: Some(vec![".agents/agentcall".to_string()]),
+            reference_paths: None,
+            write_paths: Some(vec![".agents/agentcall".to_string()]),
             acceptance_criteria: None,
             persist_context: None,
             report_path: None,
@@ -1684,7 +1701,8 @@ mod tests {
             call_id: None,
             phase: None,
             role: None,
-            allowed_paths: Some(vec!["reports".to_string()]),
+            reference_paths: None,
+            write_paths: Some(vec!["reports".to_string()]),
             acceptance_criteria: None,
             persist_context: None,
             report_path: Some("reports/shared.md".to_string()),
@@ -1782,7 +1800,8 @@ mod tests {
             call_id: None,
             phase: None,
             role: None,
-            allowed_paths: None,
+            reference_paths: None,
+            write_paths: None,
             acceptance_criteria: None,
             persist_context: None,
             report_path: None,
@@ -1866,7 +1885,8 @@ mod tests {
             call_id: None,
             phase: None,
             role: None,
-            allowed_paths: Some(vec!["src".to_string()]),
+            reference_paths: None,
+            write_paths: Some(vec!["src".to_string()]),
             acceptance_criteria: None,
             persist_context: None,
             report_path: Some("docs/report.md".to_string()),
@@ -1945,7 +1965,8 @@ mod tests {
             call_id: None,
             phase: None,
             role: None,
-            allowed_paths: Some(vec![".agentcall/reports".to_string()]),
+            reference_paths: None,
+            write_paths: Some(vec![".agentcall/reports".to_string()]),
             acceptance_criteria: None,
             persist_context: None,
             report_path: Some(".agentcall/reports/report.md".to_string()),
@@ -1991,7 +2012,8 @@ mod tests {
             call_id: None,
             phase: None,
             role: None,
-            allowed_paths: Some(vec!["src".to_string()]),
+            reference_paths: None,
+            write_paths: Some(vec!["src".to_string()]),
             acceptance_criteria: None,
             persist_context: None,
             report_path: Some("docs/report.md".to_string()),
@@ -2049,7 +2071,8 @@ mod tests {
                 role: None,
                 runtime: None,
                 workspace: None,
-                allowed_paths: None,
+                reference_paths: None,
+                write_paths: None,
                 acceptance_criteria: None,
                 persist: Some(true),
                 report_path: None,

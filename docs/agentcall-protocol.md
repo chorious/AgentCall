@@ -24,9 +24,9 @@ Do not call deprecated delegate/workflow tools. Do not use raw terminal output a
 
 ```text
 1. Inspect board: agentcall_board(view=compact, filter=attention).
-2. Route work: agentcall_route(objective, workspace, allowed_paths).
+2. Route work: agentcall_route(objective, workspace, write_paths/reference_paths).
 3. Inspect worker: agentcall_session(name).
-4. Take one of the returned next_actions.
+4. Follow `primary_action` for the normal path.
 5. Use request_report only when the worker should close.
 6. Accept report only after reading report confidence and evidence.
 ```
@@ -39,16 +39,16 @@ Board and session projections are project-aware. Read `workspace.daemon_workspac
 
 | Worker state | Codex action |
 | --- | --- |
-| `starting` / `prompt_pending` with `can_wait=true` | Wait briefly, then refresh `agentcall_session`. |
-| `prompt_missing` | Use `agentcall_session_send(action=submit_pending_prompt)`. Do not queue natural language. |
-| `prompt_commit_unacknowledged` | Use `submit_pending_prompt` only if it is in `next_actions`; otherwise inspect or stop. |
+| `starting` / `prompt_pending` with `can_wait=true` | Follow `primary_action=wait`, then refresh `agentcall_session`. |
+| `prompt_missing` | Follow `primary_action`; `submit_pending_prompt` is debug/recovery only. Do not queue natural language. |
+| `prompt_commit_unacknowledged` | Inspect screen or use debug recovery; do not treat prompt commit as the normal path. |
 | `prompt_submitted` | Wait for hook/tool/report progress; do not send more text yet. |
-| `working` | Wait, or request a report only when the task should close. |
+| `working` | Follow `primary_action=wait`. `request_report` requires explicit closure intent after the patience window or `user_explicit_close=true`. |
 | `idle_after_turn` | Request a report or inspect progress before sending more text. |
 | `report_requested` / `report_drafting` | Wait inside the deadline; refresh `agentcall_session` rather than sending more prompts. |
 | `report_overdue` | Inspect, interrupt, or stop; do not keep waiting as if it were ordinary working. |
 | `needs_permission` | Use `agentcall_session_send(action=select_option, choice="1|2|3")` only after reading the structured interaction. |
-| `blocked_by_policy` | Do not repeat the denied command. Adjust allowed paths/task, request a blocker report, interrupt, or stop. |
+| `blocked_by_policy` | Do not repeat the denied command. Adjust write paths/task, add reference paths as context if useful, request a blocker report, interrupt, or stop. |
 | `report_ready` | Call `agentcall_report(action=accept, session_id=...)` and inspect validation/confidence. |
 | `confidence.overall=medium` | Report artifact exists, but daemon evidence is incomplete; inspect before final closure. |
 | `confidence.overall=low` | Treat the report as unproven. Inspect evidence or request a revised report. |
@@ -69,7 +69,7 @@ Permission menus are structured interactions, not free-form chat prompts.
 
 Use `select_option` with `choice` for numbered menus. Do not send natural language into a permission menu unless the wrapper explicitly classifies the interaction as a question.
 
-When a worker is still running, ordinary `send` may be queued and not heard immediately by Claude Code. If the worker is in `prompt_pending`, `prompt_missing`, or `prompt_commit_unacknowledged`, do not queue text; use the returned `next_actions`. `submit_pending_prompt` returns `prompt_commit_signal_sent` with `not_completed=true`; keep observing until `prompt_submitted`, tool progress, report evidence, or explicit failure appears.
+When a worker is still running, ordinary `send` may be queued and not heard immediately by Claude Code. If the worker is in `prompt_pending`, `prompt_missing`, or `prompt_commit_unacknowledged`, do not queue text; follow `primary_action`. `submit_pending_prompt` is only a debug/recovery action and returns `prompt_commit_signal_sent` with `not_completed=true`; keep observing until `prompt_submitted`, tool progress, report evidence, or explicit failure appears.
 
 ## Runtime Rules
 

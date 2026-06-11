@@ -282,7 +282,7 @@ def start_route(
         "runtime": "pty",
         "session_name": session_name,
         "command": command,
-        "allowed_paths": [".agentcall/reports"],
+        "write_paths": [".agentcall/reports"],
         "read_only": False,
     }
     if report_path:
@@ -460,8 +460,9 @@ def assert_report_ready(summary: dict[str, Any], session_name: str) -> None:
         raise SmokeError(f"summary report_ready missing for {session_name}: {summary}")
     if summary.get("state") != "report_ready":
         raise SmokeError(f"summary state should be report_ready for {session_name}: {summary}")
-    if summary.get("next_action") != "accept_report":
-        raise SmokeError(f"summary next_action should be accept_report for {session_name}: {summary}")
+    primary = summary.get("primary_action") if isinstance(summary.get("primary_action"), dict) else {}
+    if primary.get("kind") != "accept_report":
+        raise SmokeError(f"summary primary_action should be accept_report for {session_name}: {summary}")
 
 
 def accept_report(base_url: str, session_name: str) -> dict[str, Any]:

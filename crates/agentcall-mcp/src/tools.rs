@@ -62,7 +62,8 @@ fn route_tool() -> Value {
                 "objective": {"type": "string"},
                 "workspace": {"type": "string"},
                 "session_name": {"type": "string"},
-                "allowed_paths": {"type": "array", "items": {"type": "string"}},
+                "write_paths": {"type": "array", "items": {"type": "string"}, "description": "Paths the worker may modify, plus daemon-minted scratch/report paths."},
+                "reference_paths": {"type": "array", "items": {"type": "string"}, "description": "Recommended read/context paths for the worker. This is not a read permission boundary."},
                 "acceptance_criteria": {"type": "array", "items": {"type": "string"}},
                 "report_path": {"type": "string"},
                 "read_only": {"type": "boolean", "default": false}
@@ -76,7 +77,7 @@ fn route_tool() -> Value {
 fn session_tool() -> Value {
     json!({
         "name": "agentcall_session",
-        "description": "Return one daemon PTY session view. Default view=summary is compact and projection-first, including state/why/can_wait/next_actions/report/control/prompt_gate. Use view=tui for dashboard data, view=events for compact events, and view=debug/raw only for explicit inspection.",
+        "description": "Return one daemon PTY session view. Default view=summary is compact and projection-first, including state/why/can_wait/primary_action/available_actions/debug_actions/report/control/prompt_gate. Use view=tui for dashboard data, view=events for compact events, and view=debug/raw only for explicit inspection.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -98,7 +99,7 @@ fn session_tool() -> Value {
 fn session_send_tool() -> Value {
     json!({
         "name": "agentcall_session_send",
-        "description": "Send text or a high-level action to a daemon PTY session. Use only returned next_actions. submit_pending_prompt sends a finite prompt commit signal and returns not_completed=true until UserPromptSubmit, tool progress, or report evidence is observed.",
+        "description": "Send text or a high-level action to a daemon PTY session. Use the returned primary_action for normal flow; available_actions are explicit alternatives, and debug_actions are recovery-only. submit_pending_prompt is a debug/recovery signal, not the normal route path.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -107,7 +108,8 @@ fn session_send_tool() -> Value {
                     "action": {"type": "string", "enum": ["send", "continue", "request_report", "submit_pending_prompt", "select_option", "interrupt", "stop", "kill", "revise_plan", "approve_plan", "start_auto"], "default": "send"},
                     "text": {"type": "string"},
                     "control_token": {"type": "string", "description": "Short-lived daemon-minted control token from agentcall_session(summary). Required for destructive or phase-changing actions."},
-                    "choice": {"type": "string", "description": "Menu/permission choice for select_option, such as 1, 2, or 3."}
+                    "choice": {"type": "string", "description": "Menu/permission choice for select_option, such as 1, 2, or 3."},
+                    "user_explicit_close": {"type": "boolean", "default": false, "description": "Set true only when the human explicitly wants to close/reclaim the worker before the patience window elapses."}
                 },
             "required": ["name"],
             "additionalProperties": false
@@ -185,7 +187,8 @@ mod tests {
         let properties = &tool["inputSchema"]["properties"];
         assert!(properties.get("objective").is_some());
         assert!(properties.get("workspace").is_some());
-        assert!(properties.get("allowed_paths").is_some());
+        assert!(properties.get("write_paths").is_some());
+        assert!(properties.get("allowed_paths").is_none());
         assert!(properties.get("report_path").is_some());
         for hidden in [
             "mode",

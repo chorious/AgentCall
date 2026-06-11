@@ -8,8 +8,8 @@ use crate::events::EventEnvelopeV1;
 use crate::hooks::{policy_denials_state, runtime_bindings_state};
 use crate::projection::session_projection_summary;
 use crate::prompt_gate::{
-    DEFAULT_COMMIT_ACK_DEADLINE_MS, prompt_commit_attempt_id, prompt_gate_from_route,
-    refresh_prompt_gate_timeouts_for_session,
+    DEFAULT_COMMIT_ACK_DEADLINE_MS, prompt_commit_attempt_id, prompt_gate_for_session,
+    prompt_gate_from_route,
 };
 use crate::routes::{
     RouteRequest, checkpoint_session, handle_route, patch_route_record, route_for_wrapper_session,
@@ -68,7 +68,8 @@ pub(crate) fn mcp_tools() -> Vec<Value> {
                     "objective": {"type": "string"},
                     "workspace": {"type": "string"},
                     "session_name": {"type": "string"},
-                    "allowed_paths": {"type": "array", "items": {"type": "string"}},
+                    "write_paths": {"type": "array", "items": {"type": "string"}, "description": "Paths the worker may modify, plus daemon-minted scratch/report paths."},
+                    "reference_paths": {"type": "array", "items": {"type": "string"}, "description": "Recommended read/context paths for the worker. This is not a read permission boundary."},
                     "acceptance_criteria": {"type": "array", "items": {"type": "string"}},
                     "report_path": {"type": "string"},
                     "read_only": {"type": "boolean", "default": false}
@@ -79,7 +80,7 @@ pub(crate) fn mcp_tools() -> Vec<Value> {
         }),
         json!({
             "name": "agentcall_session",
-            "description": "Return one daemon PTY session view. Default view=summary is compact and projection-first, including state/why/can_wait/next_actions/report/control/prompt_gate. Use view=tui for dashboard data, view=events for compact events, and view=debug/raw only for explicit inspection.",
+            "description": "Return one daemon PTY session view. Default view=summary is compact and projection-first, including state/why/can_wait/primary_action/available_actions/debug_actions/report/control/prompt_gate. Use view=tui for dashboard data, view=events for compact events, and view=debug/raw only for explicit inspection.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -98,7 +99,7 @@ pub(crate) fn mcp_tools() -> Vec<Value> {
         }),
         json!({
             "name": "agentcall_session_send",
-            "description": "Send text or a high-level action to a daemon PTY session. Use only returned next_actions. submit_pending_prompt sends a finite prompt commit signal and returns not_completed=true until UserPromptSubmit, tool progress, or report evidence is observed.",
+            "description": "Send text or a high-level action to a daemon PTY session. Use the returned primary_action for normal flow; available_actions are explicit alternatives, and debug_actions are recovery-only. submit_pending_prompt is a debug/recovery signal, not the normal route path.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -107,7 +108,8 @@ pub(crate) fn mcp_tools() -> Vec<Value> {
                     "action": {"type": "string", "enum": ["send", "continue", "request_report", "submit_pending_prompt", "select_option", "interrupt", "stop", "kill", "revise_plan", "approve_plan", "start_auto"], "default": "send"},
                     "text": {"type": "string"},
                     "control_token": {"type": "string", "description": "Short-lived daemon-minted control token from agentcall_session(summary). Required for destructive or phase-changing actions."},
-                    "choice": {"type": "string", "description": "Menu/permission choice for select_option, such as 1, 2, or 3."}
+                    "choice": {"type": "string", "description": "Menu/permission choice for select_option, such as 1, 2, or 3."},
+                    "user_explicit_close": {"type": "boolean", "default": false, "description": "Set true only when the human explicitly wants to close/reclaim the worker before the patience window elapses."}
                 },
                 "required": ["name"],
                 "additionalProperties": false
@@ -218,8 +220,10 @@ fn route_mcp_response(state: &AppState, route: &Value) -> Value {
             "state": worker.state.as_str(),
             "why": worker.why,
             "can_wait": worker.can_wait,
-            "next_action": worker.next_actions.first().and_then(|item| item.get("kind")).cloned().unwrap_or(Value::Null),
-            "next_actions": worker.next_actions,
+            "primary_action": worker.primary_action,
+            "available_actions": worker.available_actions,
+            "debug_actions": worker.debug_actions,
+            "patience": worker.patience,
             "report": if report.get("path").is_some() { report } else { worker.report }
         });
     }
@@ -230,7 +234,9 @@ fn route_mcp_response(state: &AppState, route: &Value) -> Value {
         "state": "done",
         "why": "Route did not start a live PTY worker. Start a route without debug-only recommend mode for normal Codex flow.",
         "can_wait": false,
-        "next_action": "start_worker",
+        "primary_action": {"kind": "start_worker"},
+        "available_actions": [],
+        "debug_actions": [],
         "report": report
     })
 }
@@ -309,7 +315,9 @@ fn session_summary_view(state: &AppState, name: &str, include: &[String]) -> Val
             "session_seq": projection.get("projection_last_session_seq").cloned().unwrap_or_else(|| json!(0)),
             "observed_at": projection.get("projection_last_updated_at").cloned().unwrap_or(Value::Null)
         },
-        "next_action": projection.get("next_recommended_action").cloned().unwrap_or_else(|| json!("inspect_session")),
+        "primary_action": {
+            "kind": projection.get("next_recommended_action").cloned().unwrap_or_else(|| json!("inspect_session"))
+        },
         "report_ready": projection.get("report_ready").cloned().unwrap_or_else(|| json!(false)),
         "projection_seq": projection.get("projection_last_session_seq").cloned().unwrap_or_else(|| json!(0)),
         "projection_stale": projection.get("projection_stale").cloned().unwrap_or_else(|| json!(true)),
@@ -432,7 +440,7 @@ fn session_tui_view(state: &AppState, name: &str, args: &Value) -> Result<Value,
         },
         "activity": events.get("events").cloned().unwrap_or_else(|| json!([])),
         "current_blocker": current_blocker,
-        "next_action": {
+        "primary_action": {
             "kind": projection.get("next_recommended_action").cloned().unwrap_or_else(|| json!("inspect_session")),
             "safe_to_wait": attention == "none",
             "recommended_tool": if attention == "none" { "agentcall_session" } else { "agentcall_session_send" },
@@ -1066,6 +1074,10 @@ fn mcp_session_send(state: &AppState, args: &Value) -> Result<Value, String> {
         Ok(args) => args,
         Err(value) => return Ok(value),
     };
+    let user_explicit_close = args
+        .get("user_explicit_close")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
     let mut command = match prepare_session_send_command(state, name, action, &args)? {
         PreparedCommand::Submit(command) => command,
         PreparedCommand::Deduped(value) => return Ok(value),
@@ -1074,7 +1086,7 @@ fn mcp_session_send(state: &AppState, args: &Value) -> Result<Value, String> {
         return submit_session_command(state, name, command);
     }
     if action == "submit_pending_prompt" {
-        let gate = refresh_prompt_gate_timeouts_for_session(state, name);
+        let gate = prompt_gate_for_session(state, name);
         if !gate.can_submit_pending_prompt() {
             return Ok(json!({
                 "ok": false,
@@ -1242,18 +1254,32 @@ fn mcp_session_send(state: &AppState, args: &Value) -> Result<Value, String> {
     ) {
         return Ok(json!({
             "ok": false,
-            "status": "prompt_not_submitted",
+            "status": if worker_state.state == WorkerStateKind::PromptPending { "inside_patience_window" } else { "prompt_not_submitted" },
             "state": worker_state.state.as_str(),
             "reason": worker_state.why,
             "can_wait": worker_state.can_wait,
-            "next_actions": worker_state.next_actions,
+            "primary_action": worker_state.primary_action,
+            "available_actions": worker_state.available_actions,
+            "debug_actions": worker_state.debug_actions,
+            "patience": worker_state.patience,
             "prompt_gate": worker_state.prompt_gate.to_value(),
-            "next_action": "submit_pending_prompt",
-            "recommended_args": {"action": "submit_pending_prompt"},
-            "hint": "The route prompt has not been acknowledged by UserPromptSubmit or worker progress. Do not queue supervisor text."
+            "hint": "The route prompt has not been acknowledged by UserPromptSubmit or worker progress. Do not queue supervisor text; follow primary_action unless using debug_actions for recovery."
         }));
     }
     let summary = session_summary(state, &session);
+    if action == "request_report"
+        && matches!(
+            worker_state.state,
+            WorkerStateKind::ReportRequested | WorkerStateKind::ReportDrafting
+        )
+    {
+        return Ok(report_request_already_active(&worker_state));
+    }
+    if matches!(action, "request_report" | "continue") && !user_explicit_close {
+        if let Some(response) = inside_patience_window_response(name, action, &worker_state) {
+            return Ok(response);
+        }
+    }
     let liveness_status = summary
         .get("liveness_status")
         .and_then(Value::as_str)
@@ -1278,7 +1304,7 @@ fn mcp_session_send(state: &AppState, args: &Value) -> Result<Value, String> {
             "liveness_status": liveness_status,
             "attention_status": attention_status,
             "policy_block": summary.get("policy_block").cloned().unwrap_or(Value::Null),
-            "hint": "The worker is repeating a denied action. Do not wait or resend the same prompt; update allowed_paths/task, request a blocker report after interrupt, or stop the worker."
+            "hint": "The worker is repeating a denied action. Do not wait or resend the same prompt; adjust write_paths or task scope, add reference_paths as context if useful, request a blocker report after interrupt, or stop the worker."
         }));
     }
     if liveness_status == "working" && attention_status == "none" {
@@ -1334,6 +1360,57 @@ fn mcp_session_send(state: &AppState, args: &Value) -> Result<Value, String> {
         );
     }
     Ok(actor_result)
+}
+
+fn report_request_already_active(worker_state: &crate::worker_state::WorkerStateView) -> Value {
+    json!({
+        "ok": true,
+        "action": "request_report",
+        "status": worker_state.report.get("status").cloned().unwrap_or_else(|| json!("report_requested")),
+        "not_completed": true,
+        "awaiting": "report_write",
+        "state": worker_state.state.as_str(),
+        "why": worker_state.why,
+        "primary_action": worker_state.primary_action,
+        "available_actions": worker_state.available_actions,
+        "debug_actions": worker_state.debug_actions,
+        "report": worker_state.report,
+        "hint": "A report request is already active. Do not issue another request_report; wait for report_ready or report_overdue."
+    })
+}
+
+fn inside_patience_window_response(
+    session_name: &str,
+    action: &str,
+    worker_state: &crate::worker_state::WorkerStateView,
+) -> Option<Value> {
+    if !matches!(
+        worker_state.state,
+        WorkerStateKind::Starting | WorkerStateKind::PromptSubmitted | WorkerStateKind::Working
+    ) {
+        return None;
+    }
+    if worker_state
+        .patience
+        .get("status")
+        .and_then(Value::as_str)
+        != Some("inside_patience_window")
+    {
+        return None;
+    }
+    Some(json!({
+        "ok": false,
+        "action": action,
+        "status": "inside_patience_window",
+        "session": session_name,
+        "state": worker_state.state.as_str(),
+        "why": worker_state.why,
+        "primary_action": worker_state.primary_action,
+        "available_actions": worker_state.available_actions,
+        "debug_actions": worker_state.debug_actions,
+        "patience": worker_state.patience,
+        "hint": "The worker is healthy and inside the daemon-enforced patience window. Wait instead of sending continue/request_report, unless the human explicitly asks to close with user_explicit_close=true."
+    }))
 }
 
 fn mark_report_requested(state: &AppState, session_name: &str) -> Result<Value, String> {
@@ -1793,7 +1870,9 @@ fn accept_report_for_session(state: &AppState, session_id: &str) -> Value {
             "daemon_write": daemon_write_confidence,
             "route_match": route_match_confidence
         },
-        "next_action": if accepted { "stop_worker" } else { "inspect_session_or_request_report" }
+        "primary_action": {
+            "kind": if accepted { "stop_worker" } else { "inspect_session_or_request_report" }
+        }
     })
 }
 
@@ -1927,7 +2006,8 @@ mod tests {
         let properties = &route_tool["inputSchema"]["properties"];
         assert!(properties.get("objective").is_some());
         assert!(properties.get("workspace").is_some());
-        assert!(properties.get("allowed_paths").is_some());
+        assert!(properties.get("write_paths").is_some());
+        assert!(properties.get("allowed_paths").is_none());
         assert!(properties.get("report_path").is_some());
         for hidden in [
             "mode",
@@ -2145,6 +2225,51 @@ mod tests {
     }
 
     #[test]
+    fn prompt_gate_refresh_auto_submits_missing_prompt() {
+        let root = std::env::temp_dir().join(format!(
+            "agentcall-mcp-auto-submit-pending-v63-{}",
+            std::process::id()
+        ));
+        let state = AppState::test(root.clone());
+        install_prompt_gate_route(
+            &state,
+            "route-pty",
+            "worker-a",
+            json!({
+                "schema_version": 2,
+                "state": "prompt_missing",
+                "task_started": false,
+                "prompt_id": "route_prompt:route-pty:worker-a",
+                "prompt_written_at_ms": now_ms().saturating_sub(20_000),
+                "awaiting_hook": "UserPromptSubmit",
+                "ack_deadline_ms": 15_000,
+                "commit_ack_deadline_ms": DEFAULT_COMMIT_ACK_DEADLINE_MS,
+                "commit_attempts": []
+            }),
+        );
+        install_ok_actor(&state, "worker-a");
+
+        let gate = crate::prompt_gate::refresh_prompt_gate_timeouts_for_session(&state, "worker-a");
+
+        assert_eq!(gate.state, crate::prompt_gate::PromptGateState::CommitSignalSent);
+        let routes = crate::state::read_json_file(
+            &state
+                .workspace
+                .join(".agentcall")
+                .join("state")
+                .join("routes.json"),
+            json!({}),
+        );
+        let route = routes.get("route-pty").unwrap();
+        assert_eq!(route["status"], "prompt_commit_signal_sent");
+        assert_eq!(
+            route["result"]["prompt_gate"]["commit_attempts"][0]["kind"],
+            "daemon_auto"
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn prompt_commit_signal_sent_expires_to_unacknowledged() {
         let root = std::env::temp_dir().join(format!(
             "agentcall-mcp-commit-unack-v61-{}",
@@ -2346,7 +2471,7 @@ mod tests {
         let writable_roots: Vec<Value> = (0..800)
             .map(|idx| {
                 json!({
-                    "kind": "allowed_path",
+                    "kind": "write_path",
                     "display": format!("very/long/generated/path/{idx}/{}", "x".repeat(80)),
                     "abs": format!("E:/Project/AgentCall/very/long/generated/path/{idx}/{}", "x".repeat(80))
                 })
@@ -2363,7 +2488,7 @@ mod tests {
                     "result": {
                         "phase": "execute",
                         "containment": {
-                            "allowed_paths": ["src"],
+                            "write_paths_input": ["src"],
                             "writable_paths": ["src"],
                             "writable_roots": writable_roots,
                             "roots": {
