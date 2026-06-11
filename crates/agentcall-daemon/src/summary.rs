@@ -1,7 +1,9 @@
 use crate::hooks::{
     pending_supervisor_instructions_state, policy_denials_state, runtime_bindings_state,
 };
-use crate::ownership::{owner_leases_summary, workspace_leases_summary};
+use crate::ownership::{
+    owner_leases_summary, release_orphaned_runtime_leases, workspace_leases_summary,
+};
 use crate::process::default_process_controller_kind;
 use crate::projection::board_attention_projection;
 use crate::routes::routes_state;
@@ -400,6 +402,7 @@ fn cleanup_stale_runtime_state(state: &AppState, live_sessions: &[SessionInfo]) 
         .filter(|session| session.status == "running")
         .map(|session| session.name.clone())
         .collect();
+    let _ = release_orphaned_runtime_leases(state, &live_names);
     let agent_dir = state.workspace.join(".agentcall");
     let state_dir = agent_dir.join("state");
     let now = now_ms();

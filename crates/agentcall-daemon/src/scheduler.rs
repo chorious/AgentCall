@@ -1,6 +1,9 @@
-use crate::ownership::{owner_lease_is_active, prune_expired_leases};
+use crate::ownership::{
+    owner_lease_is_active, prune_expired_leases, release_orphaned_runtime_leases,
+};
 use crate::state::AppState;
 use serde_json::{Value, json};
+use std::collections::HashSet;
 
 const DEFAULT_MAX_SESSIONS: usize = 6;
 const DEFAULT_PER_OWNER_MAX_SESSIONS: usize = 6;
@@ -36,6 +39,14 @@ pub(crate) fn enforce_start_capacity(
 
 pub(crate) fn scheduler_decision(state: &AppState, owner_id: &str) -> SchedulerDecision {
     let _ = prune_expired_leases(state);
+    let live_session_names = state
+        .sessions
+        .lock()
+        .unwrap()
+        .keys()
+        .cloned()
+        .collect::<HashSet<_>>();
+    let _ = release_orphaned_runtime_leases(state, &live_session_names);
     let max_sessions = state
         .config
         .max_sessions
@@ -46,7 +57,7 @@ pub(crate) fn scheduler_decision(state: &AppState, owner_id: &str) -> SchedulerD
         .per_owner_max_sessions
         .unwrap_or(DEFAULT_PER_OWNER_MAX_SESSIONS)
         .max(1);
-    let live_sessions = state.sessions.lock().unwrap().len();
+    let live_sessions = live_session_names.len();
     let now = chrono::Utc::now();
     let owner_leases = state.owner_leases.lock().unwrap();
     let active_leases = owner_leases
@@ -166,6 +177,19 @@ mod tests {
         );
     }
 
+    #[test]
+    fn scheduler_releases_old_orphaned_owner_leases() {
+        let state = test_state(Some(1), Some(1));
+        insert_old_lease(&state, "worker-a", "codex");
+
+        let decision = scheduler_decision(&state, "codex");
+
+        assert_eq!(decision.status, "start_now");
+        assert_eq!(decision.active_sessions, 0);
+        assert_eq!(decision.active_owner_sessions, 0);
+        assert!(!state.owner_leases.lock().unwrap().contains_key("worker-a"));
+    }
+
     fn test_state(max_sessions: Option<usize>, per_owner: Option<usize>) -> AppState {
         let root = PathBuf::from(format!(
             "{}\\agentcall-scheduler-test-{}",
@@ -220,6 +244,27 @@ mod tests {
                 last_heartbeat_at: expired.clone(),
                 renewed_at: expired.clone(),
                 expires_at: expired,
+                status: LeaseStatus::Active,
+                recoverable: true,
+            },
+        );
+    }
+
+    fn insert_old_lease(state: &AppState, session_id: &str, owner_id: &str) {
+        let now = chrono::Utc::now();
+        let old = (now - chrono::Duration::minutes(10)).to_rfc3339();
+        let expires_at = (now + chrono::Duration::minutes(20)).to_rfc3339();
+        state.owner_leases.lock().unwrap().insert(
+            session_id.to_string(),
+            OwnerLease {
+                lease_id: format!("lease-{session_id}"),
+                owner_id: owner_id.to_string(),
+                session_id: session_id.to_string(),
+                lease_generation: 1,
+                acquired_at: old.clone(),
+                last_heartbeat_at: old.clone(),
+                renewed_at: old,
+                expires_at,
                 status: LeaseStatus::Active,
                 recoverable: true,
             },

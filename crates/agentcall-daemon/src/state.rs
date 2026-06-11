@@ -1,5 +1,6 @@
 use crate::actor::ActorHandle;
 use crate::config::LocalConfig;
+use crate::control::ControlTokenClaims;
 use crate::events::{EventEnvelopeV1, build_event_envelope, event_session_key};
 use crate::ownership::{OwnerLease, WorkspaceLease};
 use crate::projection::{SessionProjectionV1, apply_event_to_projection, read_session_projection};
@@ -27,6 +28,7 @@ pub(crate) struct AppState {
     pub(crate) actors: Mutex<HashMap<String, ActorHandle>>,
     pub(crate) owner_leases: Mutex<HashMap<String, OwnerLease>>,
     pub(crate) workspace_leases: Mutex<HashMap<String, WorkspaceLease>>,
+    pub(crate) control_tokens: Mutex<HashMap<String, ControlTokenClaims>>,
     pub(crate) store: Arc<dyn RuntimeStore>,
     pub(crate) seq: AtomicU64,
     pub(crate) event_seq: AtomicU64,
@@ -53,6 +55,7 @@ impl AppState {
             actors: Mutex::new(HashMap::new()),
             owner_leases: Mutex::new(HashMap::new()),
             workspace_leases: Mutex::new(HashMap::new()),
+            control_tokens: Mutex::new(HashMap::new()),
             store,
             seq: AtomicU64::new(next_seq),
             event_seq: AtomicU64::new(next_event_seq),

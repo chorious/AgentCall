@@ -1,5 +1,5 @@
 use crate::actor::submit_session_command;
-use crate::commands::build_session_send_command;
+use crate::commands::{PreparedCommand, prepare_session_send_command};
 use crate::ownership::{
     install_reserved_route_leases, release_owner_lease, release_workspace_lease,
     reserve_route_leases,
@@ -535,9 +535,19 @@ fn start_pty_route(
             let _ = release_workspace_lease(state, &session_name, "route_start_failed");
         })?;
     let prompt_gate = if is_claude_command(&runtime_session.info.command) {
-        submit_pty_prompt_with_ack(state, &session_name, pty_prompt(req, &containment))
+        submit_pty_prompt_with_ack(
+            state,
+            &record.route_id,
+            &session_name,
+            pty_prompt(req, &containment),
+        )
     } else {
-        submit_pty_prompt_without_hook_ack(state, &session_name, pty_prompt(req, &containment))
+        submit_pty_prompt_without_hook_ack(
+            state,
+            &record.route_id,
+            &session_name,
+            pty_prompt(req, &containment),
+        )
     };
     let prompt_status = prompt_gate
         .get("status")
@@ -808,17 +818,48 @@ fn merge_result_field(result: &mut Value, key: &str, value: Value) {
 
 fn submit_pty_prompt_with_ack(
     state: &Arc<AppState>,
+    route_id: &str,
     wrapper_session: &str,
     prompt: String,
 ) -> Value {
-    let idempotency_key = format!("route-prompt-{wrapper_session}");
+    let idempotency_key = format!("route_prompt:{route_id}:{wrapper_session}");
     let args = json!({
         "text": prompt,
         "enter": true,
         "idempotency_key": idempotency_key.clone(),
         "owner_id": "codex"
     });
-    let command = build_session_send_command(wrapper_session, "send", &idempotency_key, &args);
+    let command = match prepare_session_send_command(state, wrapper_session, "send", &args) {
+        Ok(PreparedCommand::Submit(command)) => command,
+        Ok(PreparedCommand::Deduped(previous)) => {
+            return json!({
+                "status": "started_pending_prompt_ack",
+                "command_status": "deduped",
+                "idempotency_key": idempotency_key,
+                "dispatched": true,
+                "acknowledged": false,
+                "ack_expected": "hook.UserPromptSubmit",
+                "expected_hook": "UserPromptSubmit",
+                "ack_deadline_hint_seconds": 15,
+                "next_observation": "agentcall_session(view=summary)",
+                "previous": previous
+            });
+        }
+        Err(err) => {
+            return json!({
+                "status": "started_pending_prompt_dispatch",
+                "command_status": "prepare_failed",
+                "idempotency_key": idempotency_key,
+                "dispatched": false,
+                "acknowledged": false,
+                "ack_expected": "hook.UserPromptSubmit",
+                "expected_hook": "UserPromptSubmit",
+                "ack_deadline_hint_seconds": 15,
+                "next_observation": "agentcall_session(view=summary)",
+                "last_error": err
+            });
+        }
+    };
     let command_id = command.command_id.clone();
     match submit_session_command(state, wrapper_session, command) {
         Ok(actor_result) => json!({
@@ -852,23 +893,43 @@ fn submit_pty_prompt_with_ack(
 
 fn submit_pty_prompt_without_hook_ack(
     state: &Arc<AppState>,
+    route_id: &str,
     wrapper_session: &str,
     prompt: String,
 ) -> Value {
+    let idempotency_key = format!("route_prompt:{route_id}:{wrapper_session}");
     let args = json!({
         "text": prompt,
         "enter": true,
-        "idempotency_key": format!("route-prompt-{wrapper_session}-custom-worker"),
+        "idempotency_key": idempotency_key,
         "owner_id": "codex"
     });
-    let command = build_session_send_command(
-        wrapper_session,
-        "send",
-        args.get("idempotency_key")
-            .and_then(Value::as_str)
-            .unwrap_or("route-prompt"),
-        &args,
-    );
+    let command = match prepare_session_send_command(state, wrapper_session, "send", &args) {
+        Ok(PreparedCommand::Submit(command)) => command,
+        Ok(PreparedCommand::Deduped(previous)) => {
+            return json!({
+                "status": "started_prompt_dispatched_without_hook_ack",
+                "command_status": "deduped",
+                "idempotency_key": args.get("idempotency_key").and_then(Value::as_str),
+                "dispatched": true,
+                "expected_hook": Value::Null,
+                "acknowledged": false,
+                "previous": previous,
+                "reason": "custom PTY command is not expected to emit Claude Code UserPromptSubmit hooks"
+            });
+        }
+        Err(err) => {
+            return json!({
+                "status": "started_pending_prompt_dispatch",
+                "command_status": "prepare_failed",
+                "idempotency_key": args.get("idempotency_key").and_then(Value::as_str),
+                "dispatched": false,
+                "expected_hook": Value::Null,
+                "acknowledged": false,
+                "last_error": err
+            });
+        }
+    };
     let command_id = command.command_id.clone();
     match submit_session_command(state, wrapper_session, command) {
         Ok(result) => json!({
@@ -951,18 +1012,48 @@ fn pty_prompt(req: &RouteRequest, containment: &Value) -> String {
         .filter(|value| !value.is_empty())
         .unwrap_or_else(|| "Complete the requested task and write a report.".to_string());
     let allowed = pty_prompt_containment(containment);
+    let envelope = pty_prompt_control_envelope(req, containment);
     let workflow =
         PtyWorkflow::from_request(req.pty_workflow.as_deref()).unwrap_or(PtyWorkflow::Normal);
     match workflow {
         PtyWorkflow::PlanThenAuto => format!(
-            "AgentCall PTY handoff. Start in PLAN MODE.\n\nObjective:\n{}\n\nAllowed paths / ownership:\n- {}\n\nAcceptance criteria:\n- {}\n\nPlan-phase rules:\n- Inspect the code and write a concrete plan only.\n- If anything important is unclear, ask concise clarification questions instead of guessing.\n- Do not modify project files during plan phase.\n- When the plan is ready, use ExitPlanMode and wait for approval. After approval, continue in auto mode and write the requested report.\n",
-            req.objective, allowed, criteria
+            "AgentCall PTY handoff. Start in PLAN MODE.\n\nStep 0 - control envelope:\n{}\n\nObjective:\n{}\n\nAllowed paths / ownership:\n- {}\n\nAcceptance criteria:\n- {}\n\nPlan-phase rules:\n- Inspect the code and write a concrete plan only.\n- If anything important is unclear, ask concise clarification questions instead of guessing.\n- Do not modify project files during plan phase.\n- When the plan is ready, use ExitPlanMode and wait for approval. After approval, continue in auto mode and write the requested report.\n",
+            envelope, req.objective, allowed, criteria
         ),
         PtyWorkflow::Normal => format!(
-            "AgentCall utility PTY worker.\n\nObjective:\n{}\n\nAllowed paths / ownership:\n- {}\n\nAcceptance criteria:\n- {}\n\nRules:\n- Work in auto mode.\n- If key context is unclear, ask a concise question in this PTY.\n- Respect allowed_paths. Do not write outside them.\n- When finished, write the requested report or summarize exact changes, tests, risks, and remaining questions.\n- Stop at the prompt for supervisor review.\n",
-            req.objective, allowed, criteria
+            "AgentCall utility PTY worker.\n\nStep 0 - control envelope:\n{}\n\nObjective:\n{}\n\nAllowed paths / ownership:\n- {}\n\nAcceptance criteria:\n- {}\n\nRules:\n- Work in auto mode.\n- If key context is unclear, ask a concise question in this PTY.\n- Respect allowed_paths. Do not write outside them.\n- When finished, write the requested report or summarize exact changes, tests, risks, and remaining questions.\n- Stop at the prompt for supervisor review.\n",
+            envelope, req.objective, allowed, criteria
         ),
     }
+}
+
+fn pty_prompt_control_envelope(req: &RouteRequest, containment: &Value) -> String {
+    let mut lines = Vec::new();
+    lines.push(
+        "Confirm task id, ownership, allowed paths, and report target before editing.".to_string(),
+    );
+    if let Some(task_id) = req.task_id.as_ref() {
+        lines.push(format!("task_id: {task_id}"));
+    }
+    if let Some(call_id) = req.call_id.as_ref() {
+        lines.push(format!("call_id: {call_id}"));
+    }
+    if let Some(role) = req.role.as_ref() {
+        lines.push(format!("role: {role}"));
+    }
+    if let Some(phase) = req.phase.as_ref() {
+        lines.push(format!("phase: {phase}"));
+    }
+    if let Some(workspace) = req.workspace.as_ref() {
+        lines.push(format!("target_workspace: {workspace}"));
+    }
+    if let Some(report_path) = req.report_path.as_ref() {
+        lines.push(format!("report_path: {report_path}"));
+    }
+    if let Some(scratch) = containment.get("scratch_path").and_then(Value::as_str) {
+        lines.push(format!("scratch_path: {scratch}"));
+    }
+    lines.join("\n- ")
 }
 
 fn pty_prompt_containment(containment: &Value) -> String {
@@ -1227,11 +1318,19 @@ mod tests {
         let workspace = test_workspace("route-prompt-gate");
         let state = Arc::new(AppState::test(workspace));
 
-        let gate = submit_pty_prompt_with_ack(&state, "missing-worker", "do work".to_string());
+        let gate = submit_pty_prompt_with_ack(
+            &state,
+            "route-test",
+            "missing-worker",
+            "do work".to_string(),
+        );
 
         assert_eq!(gate["status"], "started_pending_prompt_dispatch");
         assert_eq!(gate["command_status"], "dispatch_failed");
-        assert_eq!(gate["idempotency_key"], "route-prompt-missing-worker");
+        assert_eq!(
+            gate["idempotency_key"],
+            "route_prompt:route-test:missing-worker"
+        );
         assert_eq!(gate["dispatched"], false);
         assert_eq!(gate["ack_expected"], "hook.UserPromptSubmit");
         assert_eq!(gate["ack_deadline_hint_seconds"], 15);

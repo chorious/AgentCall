@@ -1,7 +1,7 @@
 use crate::state::{AppState, read_json_file, write_json_file};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -46,6 +46,8 @@ pub(crate) struct RouteLeaseReservation {
     pub(crate) owner_lease: OwnerLease,
     pub(crate) workspace_lease: WorkspaceLease,
 }
+
+const ORPHANED_LEASE_GRACE_SECONDS: i64 = 30;
 
 pub(crate) fn prune_expired_leases(state: &AppState) -> Result<(), String> {
     let now = chrono::Utc::now();
@@ -110,6 +112,64 @@ pub(crate) fn prune_expired_leases(state: &AppState) -> Result<(), String> {
     Ok(())
 }
 
+pub(crate) fn release_orphaned_runtime_leases(
+    state: &AppState,
+    live_session_names: &HashSet<String>,
+) -> Result<usize, String> {
+    prune_expired_leases(state)?;
+    let now = chrono::Utc::now();
+    let grace = chrono::Duration::seconds(ORPHANED_LEASE_GRACE_SECONDS);
+    let owner_sessions = {
+        let leases = state.owner_leases.lock().unwrap();
+        leases
+            .values()
+            .filter(|lease| {
+                owner_lease_is_active(lease, now)
+                    && lease.recoverable
+                    && !live_session_names.contains(&lease.session_id)
+                    && lease_timestamp_older_than(&lease.last_heartbeat_at, now, grace)
+            })
+            .map(|lease| lease.session_id.clone())
+            .collect::<Vec<_>>()
+    };
+
+    let mut released = 0usize;
+    for session_id in owner_sessions {
+        if release_owner_lease(state, &session_id, "orphaned_no_live_session")?.is_some() {
+            released += 1;
+        }
+        let _ = release_workspace_lease(state, &session_id, "orphaned_no_live_session")?;
+    }
+
+    let active_owner_sessions = {
+        let leases = state.owner_leases.lock().unwrap();
+        leases
+            .values()
+            .filter(|lease| owner_lease_is_active(lease, now))
+            .map(|lease| lease.session_id.clone())
+            .collect::<HashSet<_>>()
+    };
+    let workspace_sessions = {
+        let leases = state.workspace_leases.lock().unwrap();
+        leases
+            .values()
+            .filter(|lease| {
+                workspace_lease_is_active(lease, now)
+                    && !live_session_names.contains(&lease.session_id)
+                    && !active_owner_sessions.contains(&lease.session_id)
+            })
+            .map(|lease| lease.session_id.clone())
+            .collect::<Vec<_>>()
+    };
+    for session_id in workspace_sessions {
+        if release_workspace_lease(state, &session_id, "orphaned_no_live_session")?.is_some() {
+            released += 1;
+        }
+    }
+
+    Ok(released)
+}
+
 pub(crate) fn owner_lease_is_active(
     lease: &OwnerLease,
     now: chrono::DateTime<chrono::Utc>,
@@ -129,6 +189,17 @@ fn lease_expired_at(expires_at: &str, now: chrono::DateTime<chrono::Utc>) -> boo
         return true;
     };
     expires.with_timezone(&chrono::Utc) <= now
+}
+
+fn lease_timestamp_older_than(
+    timestamp: &str,
+    now: chrono::DateTime<chrono::Utc>,
+    grace: chrono::Duration,
+) -> bool {
+    let Ok(parsed) = chrono::DateTime::parse_from_rfc3339(timestamp) else {
+        return true;
+    };
+    now.signed_duration_since(parsed.with_timezone(&chrono::Utc)) >= grace
 }
 
 pub(crate) fn ensure_owner_lease(
@@ -719,5 +790,88 @@ mod tests {
         let _ = acquire_workspace_lease(&state, "worker-a", &workspace, false).unwrap();
         let err = acquire_workspace_lease(&state, "worker-b", &dotted, false).unwrap_err();
         assert!(err.contains("workspace_busy"));
+    }
+
+    #[test]
+    fn old_orphaned_runtime_lease_releases_owner_and_workspace() {
+        let state = test_state("orphan-release");
+        let mut owner = build_owner_lease("worker-a", "codex");
+        let old = (chrono::Utc::now() - chrono::Duration::minutes(5)).to_rfc3339();
+        owner.acquired_at = old.clone();
+        owner.last_heartbeat_at = old.clone();
+        owner.renewed_at = old;
+        let workspace = build_workspace_lease("worker-a", "codex", &state.workspace, false);
+        state
+            .owner_leases
+            .lock()
+            .unwrap()
+            .insert("worker-a".to_string(), owner);
+        state
+            .workspace_leases
+            .lock()
+            .unwrap()
+            .insert("worker-a".to_string(), workspace);
+
+        let released = release_orphaned_runtime_leases(&state, &HashSet::new()).unwrap();
+
+        assert_eq!(released, 1);
+        assert!(!state.owner_leases.lock().unwrap().contains_key("worker-a"));
+        assert!(
+            !state
+                .workspace_leases
+                .lock()
+                .unwrap()
+                .contains_key("worker-a")
+        );
+    }
+
+    #[test]
+    fn fresh_orphaned_runtime_lease_keeps_startup_grace() {
+        let state = test_state("orphan-grace");
+        let owner = build_owner_lease("worker-a", "codex");
+        let workspace = build_workspace_lease("worker-a", "codex", &state.workspace, false);
+        state
+            .owner_leases
+            .lock()
+            .unwrap()
+            .insert("worker-a".to_string(), owner);
+        state
+            .workspace_leases
+            .lock()
+            .unwrap()
+            .insert("worker-a".to_string(), workspace);
+
+        let released = release_orphaned_runtime_leases(&state, &HashSet::new()).unwrap();
+
+        assert_eq!(released, 0);
+        assert!(state.owner_leases.lock().unwrap().contains_key("worker-a"));
+        assert!(
+            state
+                .workspace_leases
+                .lock()
+                .unwrap()
+                .contains_key("worker-a")
+        );
+    }
+
+    #[test]
+    fn live_session_keeps_old_recoverable_lease() {
+        let state = test_state("orphan-live");
+        let mut owner = build_owner_lease("worker-a", "codex");
+        let old = (chrono::Utc::now() - chrono::Duration::minutes(5)).to_rfc3339();
+        owner.acquired_at = old.clone();
+        owner.last_heartbeat_at = old.clone();
+        owner.renewed_at = old;
+        state
+            .owner_leases
+            .lock()
+            .unwrap()
+            .insert("worker-a".to_string(), owner);
+        let live = HashSet::from(["worker-a".to_string()]);
+
+        let released = release_orphaned_runtime_leases(&state, &live).unwrap();
+
+        assert_eq!(released, 0);
+        assert!(state.owner_leases.lock().unwrap().contains_key("worker-a"));
     }
 }

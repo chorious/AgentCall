@@ -21,6 +21,10 @@ pub(crate) struct CommandEnvelopeV1 {
     pub(crate) owner_lease_id: String,
     pub(crate) lease_generation: u64,
     pub(crate) idempotency_key: String,
+    #[serde(default)]
+    pub(crate) control_epoch: Option<u64>,
+    #[serde(default)]
+    pub(crate) control_token_hash: Option<String>,
     pub(crate) command_type: CommandType,
     pub(crate) payload: Value,
     pub(crate) precondition: Option<CommandPrecondition>,
@@ -83,7 +87,12 @@ pub(crate) fn prepare_session_send_command(
             "rejected_missing_idempotency_key: action={action} requires idempotency_key"
         ));
     }
-    if safety.requires_precondition {
+    let has_control_token = args
+        .get("control_token_hash")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .is_some_and(|value| !value.is_empty());
+    if safety.requires_precondition && !has_control_token {
         validate_required_destructive_precondition(state, session, action, args)?;
     }
     let idempotency_key = idempotency_key.unwrap_or("read-only");
@@ -305,6 +314,11 @@ pub(crate) fn build_session_send_command(
         owner_lease_id,
         lease_generation,
         idempotency_key: idempotency_key.to_string(),
+        control_epoch: args.get("control_epoch").and_then(Value::as_u64),
+        control_token_hash: args
+            .get("control_token_hash")
+            .and_then(Value::as_str)
+            .map(str::to_string),
         command_type: command_type_for_session_send(action),
         payload: session_send_payload(action, args),
         precondition,
@@ -562,6 +576,8 @@ mod tests {
             owner_lease_id: "lease-1".to_string(),
             lease_generation: 3,
             idempotency_key: "idem-1".to_string(),
+            control_epoch: None,
+            control_token_hash: None,
             command_type: CommandType::SendInput,
             payload: serde_json::json!({"text": "continue"}),
             precondition: Some(CommandPrecondition {

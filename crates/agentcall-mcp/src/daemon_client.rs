@@ -65,7 +65,9 @@ fn daemon_request(
             body_text
         )
     } else {
-        format!("GET {path} HTTP/1.1\r\nHost: {host}:{port}\r\n{token_header}Connection: close\r\n\r\n")
+        format!(
+            "GET {path} HTTP/1.1\r\nHost: {host}:{port}\r\n{token_header}Connection: close\r\n\r\n"
+        )
     };
     stream
         .write_all(request.as_bytes())

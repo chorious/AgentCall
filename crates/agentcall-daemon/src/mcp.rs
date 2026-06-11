@@ -1,6 +1,9 @@
 use crate::actor::submit_session_command;
 use crate::commands::{CommandType, PreparedCommand, prepare_session_send_command};
 use crate::confidence::attach_confidence_to_reports;
+use crate::control::{
+    control_summary_for_session, destructive_action_requires_control, validate_control_token,
+};
 use crate::events::EventEnvelopeV1;
 use crate::hooks::{policy_denials_state, runtime_bindings_state};
 use crate::projection::session_projection_summary;
@@ -112,7 +115,8 @@ pub(crate) fn mcp_tools() -> Vec<Value> {
                     "action": {"type": "string", "enum": ["send", "continue", "stop", "kill", "request_report", "revise_plan", "approve_plan", "start_auto", "select_option", "interrupt"], "default": "send"},
                     "text": {"type": "string"},
                     "enter": {"type": "boolean", "default": true},
-                    "idempotency_key": {"type": "string"},
+                    "idempotency_key": {"type": "string", "description": "Optional for MCP callers. If omitted, daemon MCP generates a stable key from session/action/projection/payload."},
+                    "control_token": {"type": "string", "description": "Short-lived daemon-minted control token from agentcall_session(summary). Required for destructive or phase-changing actions."},
                     "precondition": {"type": "object"},
                     "owner_id": {"type": "string"},
                     "owner_lease_id": {"type": "string"},
@@ -253,6 +257,7 @@ fn session_summary_view(state: &AppState, name: &str, include: &[String]) -> Val
         "report_ready": projection.get("report_ready").cloned().unwrap_or_else(|| json!(false)),
         "projection_seq": projection.get("projection_last_session_seq").cloned().unwrap_or_else(|| json!(0)),
         "projection_stale": projection.get("projection_stale").cloned().unwrap_or_else(|| json!(true)),
+        "control": control_summary_for_session(state, name, None),
         "workspace": projection.get("workspace").cloned().unwrap_or(Value::Null),
         "claude_cwd": projection.get("claude_cwd").cloned().unwrap_or(Value::Null),
         "warnings": projection.get("warnings").cloned().unwrap_or_else(|| json!([]))
@@ -473,7 +478,8 @@ fn session_debug_view(
     });
     let session = if wants_clean_tail || wants_screen || wants_plan {
         Some(get_session(state, name).ok_or_else(|| {
-            "session is not live; clean_tail/screen/plan require an in-memory PTY session".to_string()
+            "session is not live; clean_tail/screen/plan require an in-memory PTY session"
+                .to_string()
         })?)
     } else {
         None
@@ -991,7 +997,7 @@ fn should_redact_string(key: Option<&str>, text: &str) -> bool {
     let key = key.unwrap_or("").to_ascii_lowercase();
     matches!(
         key.as_str(),
-        "objective" | "text" | "prompt" | "content" | "tool_input" | "command"
+        "objective" | "text" | "prompt" | "content" | "tool_input" | "command" | "control_token"
     ) || text.len() > 1024
 }
 
@@ -1009,7 +1015,12 @@ fn truncate_utf8_owned(text: &str, cap_bytes: usize) -> String {
 fn mcp_session_send(state: &AppState, args: &Value) -> Result<Value, String> {
     let name = required_str(args, "name")?;
     let action = args.get("action").and_then(Value::as_str).unwrap_or("send");
-    let mut command = match prepare_session_send_command(state, name, action, args)? {
+    let args = session_send_args_with_default_idempotency(state, name, action, args)?;
+    let args = match session_send_args_with_control_token(state, name, action, &args) {
+        Ok(args) => args,
+        Err(value) => return Ok(value),
+    };
+    let mut command = match prepare_session_send_command(state, name, action, &args)? {
         PreparedCommand::Submit(command) => command,
         PreparedCommand::Deduped(value) => return Ok(value),
     };
@@ -1035,7 +1046,7 @@ fn mcp_session_send(state: &AppState, args: &Value) -> Result<Value, String> {
         );
     }
     if action == "select_option" {
-        let choice = menu_choice(args)?;
+        let choice = menu_choice(&args)?;
         let session = get_session(state, name).ok_or_else(|| "session not found".to_string())?;
         let process_status = session.status.lock().unwrap().clone();
         if process_status != "running" {
@@ -1168,6 +1179,64 @@ fn mcp_session_send(state: &AppState, args: &Value) -> Result<Value, String> {
     Ok(actor_result)
 }
 
+fn session_send_args_with_control_token(
+    state: &AppState,
+    session: &str,
+    action: &str,
+    args: &Value,
+) -> Result<Value, Value> {
+    if !destructive_action_requires_control(action) {
+        return Ok(args.clone());
+    }
+    let Some(token) = args
+        .get("control_token")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    else {
+        return Err(json!({
+            "ok": false,
+            "status": "missing_control_token",
+            "reason": format!("action {action} requires a fresh daemon-minted control token"),
+            "next_step": "call agentcall_session(view=summary), read control.token, then retry quickly",
+            "current": {
+                "session_id": session,
+                "action": action,
+                "control": "missing"
+            }
+        }));
+    };
+    let validated =
+        validate_control_token(state, session, action, token).map_err(|err| err.to_value())?;
+    let mut args = args.clone();
+    if !args.is_object() {
+        args = json!({});
+    }
+    let object = args.as_object_mut().unwrap();
+    object.insert(
+        "owner_id".to_string(),
+        json!(validated.claims.owner_id.clone()),
+    );
+    object.insert(
+        "owner_lease_id".to_string(),
+        json!(validated.claims.owner_lease_id.clone()),
+    );
+    object.insert(
+        "lease_generation".to_string(),
+        json!(validated.claims.lease_generation),
+    );
+    object.insert(
+        "control_epoch".to_string(),
+        json!(validated.claims.control_epoch),
+    );
+    object.insert(
+        "control_token_hash".to_string(),
+        json!(validated.token_hash),
+    );
+    object.remove("control_token");
+    Ok(args)
+}
+
 fn menu_choice(args: &Value) -> Result<String, String> {
     let choice = args
         .get("text")
@@ -1182,6 +1251,83 @@ fn menu_choice(args: &Value) -> Result<String, String> {
     } else {
         Err("select_option text must be exactly one digit from 1 to 9".to_string())
     }
+}
+
+fn session_send_args_with_default_idempotency(
+    state: &AppState,
+    session: &str,
+    action: &str,
+    args: &Value,
+) -> Result<Value, String> {
+    let mut args = if args.is_object() {
+        args.clone()
+    } else {
+        json!({})
+    };
+    let has_key = args
+        .get("idempotency_key")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .is_some_and(|value| !value.is_empty());
+    if has_key {
+        return Ok(args);
+    }
+    let key = default_session_send_idempotency_key(state, session, action, &args);
+    args.as_object_mut()
+        .ok_or_else(|| "session_send arguments must be an object".to_string())?
+        .insert("idempotency_key".to_string(), json!(key));
+    Ok(args)
+}
+
+fn default_session_send_idempotency_key(
+    state: &AppState,
+    session: &str,
+    action: &str,
+    args: &Value,
+) -> String {
+    let projection = session_projection_summary(state, session);
+    let projection_seq = projection
+        .get("projection_last_session_seq")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let mut fingerprint_args = args.clone();
+    if let Some(object) = fingerprint_args.as_object_mut() {
+        object.remove("idempotency_key");
+        object.remove("root");
+    }
+    let fingerprint = serde_json::to_string(&fingerprint_args).unwrap_or_default();
+    format!(
+        "mcp-{}-{}-{}-{}",
+        idempotency_key_part(session, 40),
+        idempotency_key_part(action, 24),
+        projection_seq,
+        stable_hash_hex(&fingerprint)
+    )
+}
+
+fn idempotency_key_part(value: &str, max_chars: usize) -> String {
+    let mut out = String::new();
+    for ch in value.chars().take(max_chars) {
+        if ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' {
+            out.push(ch);
+        } else {
+            out.push('-');
+        }
+    }
+    if out.is_empty() {
+        "value".to_string()
+    } else {
+        out
+    }
+}
+
+fn stable_hash_hex(value: &str) -> String {
+    let mut hash = 0xcbf29ce484222325u64;
+    for byte in value.as_bytes() {
+        hash ^= *byte as u64;
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    format!("{hash:016x}")
 }
 
 fn looks_like_menu_prompt(clean_output: &str) -> bool {
@@ -1425,6 +1571,84 @@ mod tests {
         )
         .unwrap_err();
         assert!(err.contains("session is not live"));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn session_send_mcp_generates_stable_idempotency_key_when_omitted() {
+        let root = std::env::temp_dir().join(format!(
+            "agentcall-mcp-session-idempotency-{}",
+            std::process::id()
+        ));
+        let state = AppState::test(root.clone());
+        append_agent_event(
+            &state,
+            "hook.SessionStart",
+            "started",
+            json!({"wrapper_session": "worker-a", "status": "working"}),
+        );
+        let args = json!({"name": "worker-a", "action": "continue"});
+
+        let first =
+            session_send_args_with_default_idempotency(&state, "worker-a", "continue", &args)
+                .unwrap();
+        let second =
+            session_send_args_with_default_idempotency(&state, "worker-a", "continue", &args)
+                .unwrap();
+
+        let key = first["idempotency_key"].as_str().unwrap();
+        assert!(key.starts_with("mcp-worker-a-continue-"));
+        assert_eq!(first["idempotency_key"], second["idempotency_key"]);
+        assert_ne!(key, "read-only");
+
+        let with_root = session_send_args_with_default_idempotency(
+            &state,
+            "worker-a",
+            "continue",
+            &json!({"name": "worker-a", "action": "continue", "root": "E:/elsewhere"}),
+        )
+        .unwrap();
+        assert_eq!(first["idempotency_key"], with_root["idempotency_key"]);
+
+        append_agent_event(
+            &state,
+            "hook.Stop",
+            "idle",
+            json!({"wrapper_session": "worker-a", "status": "idle"}),
+        );
+        let after_progress =
+            session_send_args_with_default_idempotency(&state, "worker-a", "continue", &args)
+                .unwrap();
+        assert_ne!(first["idempotency_key"], after_progress["idempotency_key"]);
+
+        let explicit = session_send_args_with_default_idempotency(
+            &state,
+            "worker-a",
+            "continue",
+            &json!({"name": "worker-a", "action": "continue", "idempotency_key": "caller-key"}),
+        )
+        .unwrap();
+        assert_eq!(explicit["idempotency_key"], "caller-key");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn destructive_session_send_without_control_token_returns_structured_refusal() {
+        let root = std::env::temp_dir().join(format!(
+            "agentcall-mcp-missing-control-token-{}",
+            std::process::id()
+        ));
+        let state = AppState::test(root.clone());
+
+        let result =
+            mcp_session_send(&state, &json!({"name": "worker-a", "action": "stop"})).unwrap();
+
+        assert_eq!(result["ok"], false);
+        assert_eq!(result["status"], "missing_control_token");
+        assert_eq!(
+            result["next_step"],
+            "call agentcall_session(view=summary), read control.token, then retry quickly"
+        );
         let _ = std::fs::remove_dir_all(root);
     }
 

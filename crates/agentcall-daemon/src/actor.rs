@@ -1,4 +1,5 @@
 use crate::commands::{CommandEnvelopeV1, CommandType};
+use crate::control::{command_type_needs_actor_revalidation, validate_envelope_control_at_actor};
 use crate::hooks::queue_supervisor_instruction;
 use crate::session::{Session, kill_session, request_stop_session};
 use crate::state::{AppState, append_agent_event, complete_command_event};
@@ -218,6 +219,46 @@ fn execute_command(
     command: &CommandEnvelopeV1,
     writer: &mut PtyWriter,
 ) -> Result<Value, String> {
+    if command.control_token_hash.is_some()
+        || command_type_needs_actor_revalidation(&command.command_type)
+    {
+        if let Err(err) = validate_envelope_control_at_actor(state, session_id, command) {
+            append_agent_event(
+                state,
+                "command.rejected_control",
+                "Session actor rejected a stale or invalid control token.",
+                json!({
+                    "session_id": session_id,
+                    "command_id": command.command_id,
+                    "idempotency_key": command.idempotency_key,
+                    "command_type": format!("{:?}", command.command_type),
+                    "owner_id": command.owner_id,
+                    "owner_lease_id": command.owner_lease_id,
+                    "lease_generation": command.lease_generation,
+                    "control_epoch": command.control_epoch,
+                    "control_token_hash": command.control_token_hash,
+                    "status": err.status,
+                    "reason": err.reason,
+                    "current": err.current
+                }),
+            );
+            let _ = complete_command_event(
+                state,
+                &command.command_id,
+                CommandStatus::Rejected,
+                "command.completed",
+                "Session command rejected by actor control validation.",
+                json!({
+                    "session_id": session_id,
+                    "command_id": command.command_id,
+                    "idempotency_key": command.idempotency_key,
+                    "status": "rejected",
+                    "reason": "actor_control_validation_failed"
+                }),
+            );
+            return Ok(err.to_value());
+        }
+    }
     append_agent_event(
         state,
         "command.accepted",
@@ -230,6 +271,8 @@ fn execute_command(
             "owner_id": command.owner_id,
             "owner_lease_id": command.owner_lease_id,
             "lease_generation": command.lease_generation,
+            "control_epoch": command.control_epoch,
+            "control_token_hash": command.control_token_hash,
         }),
     );
     let result = match command.command_type {
@@ -584,6 +627,8 @@ mod tests {
             owner_lease_id: "lease".to_string(),
             lease_generation: 1,
             idempotency_key: "idem".to_string(),
+            control_epoch: None,
+            control_token_hash: None,
             command_type,
             payload: json!({"text": "hello"}),
             precondition: None,

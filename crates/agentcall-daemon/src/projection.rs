@@ -36,6 +36,12 @@ pub(crate) struct SessionProjectionV1 {
     pub(crate) last_error_brief: Option<String>,
     pub(crate) warnings: Vec<String>,
     #[serde(default)]
+    pub(crate) control_epoch: u64,
+    #[serde(default)]
+    pub(crate) control_epoch_reason: Option<String>,
+    #[serde(default)]
+    pub(crate) control_epoch_updated_at: Option<String>,
+    #[serde(default)]
     pub(crate) terminal: bool,
     #[serde(default)]
     pub(crate) terminal_event_id: Option<String>,
@@ -86,6 +92,9 @@ pub(crate) fn default_session_projection(session: &SessionInfo) -> SessionProjec
         report_ready: false,
         last_error_brief: None,
         warnings: vec![],
+        control_epoch: 0,
+        control_epoch_reason: None,
+        control_epoch_updated_at: None,
         terminal: false,
         terminal_event_id: None,
         terminal_global_seq: None,
@@ -124,6 +133,9 @@ pub(crate) fn stale_projection_for_session_name(session_name: &str) -> SessionPr
         report_ready: false,
         last_error_brief: None,
         warnings: vec!["projection missing; default path did not scan cold logs".to_string()],
+        control_epoch: 0,
+        control_epoch_reason: None,
+        control_epoch_updated_at: None,
         terminal: false,
         terminal_event_id: None,
         terminal_global_seq: None,
@@ -192,6 +204,10 @@ pub(crate) fn apply_event_to_projection(
     projection.session_id = session_id;
     projection.run_id = event.run_id.clone();
     projection.owner = event.owner_id.clone();
+    let previous_attention_status = projection.attention_status.clone();
+    let previous_liveness_status = projection.liveness_status.clone();
+    let previous_report_ready = projection.report_ready;
+    let previous_terminal = projection.terminal;
 
     let mut reason = "event_reduced".to_string();
     if projection.terminal
@@ -306,6 +322,18 @@ pub(crate) fn apply_event_to_projection(
         _ => {
             projection.last_progress_brief = Some(event.message.clone());
         }
+    }
+
+    if should_bump_control_epoch(
+        &projection,
+        event,
+        &previous_liveness_status,
+        &previous_attention_status,
+        previous_report_ready,
+        previous_terminal,
+    ) {
+        bump_control_epoch(&mut projection, event);
+        reason = format!("{reason}+control_epoch");
     }
 
     ProjectionUpdate {
@@ -461,6 +489,75 @@ fn reduce_hook_event(projection: &mut SessionProjectionV1, event: &EventEnvelope
         projection.next_recommended_action = "accept_report_or_stop_worker".to_string();
         projection.last_progress_brief = Some("Worker wrote the requested report.".to_string());
     }
+}
+
+fn bump_control_epoch(projection: &mut SessionProjectionV1, event: &EventEnvelopeV1) {
+    projection.control_epoch = projection.control_epoch.saturating_add(1);
+    projection.control_epoch_reason = Some(event.event_type.clone());
+    projection.control_epoch_updated_at = Some(event.ts.clone());
+}
+
+fn should_bump_control_epoch(
+    projection: &SessionProjectionV1,
+    event: &EventEnvelopeV1,
+    previous_liveness_status: &str,
+    previous_attention_status: &str,
+    previous_report_ready: bool,
+    previous_terminal: bool,
+) -> bool {
+    if projection.terminal != previous_terminal {
+        return true;
+    }
+    if projection.report_ready && !previous_report_ready {
+        return true;
+    }
+    if projection.attention_status != previous_attention_status
+        && matches!(
+            projection.attention_status.as_str(),
+            "needs_permission"
+                | "waiting_input"
+                | "checkpoint_due"
+                | "blocked_by_policy"
+                | "failed"
+                | "report_ready"
+        )
+    {
+        return true;
+    }
+    if projection.liveness_status != previous_liveness_status
+        && matches!(
+            projection.liveness_status.as_str(),
+            "stopping" | "killing" | "failed_or_orphaned"
+        )
+    {
+        return true;
+    }
+    let event_type = event.event_type.as_str();
+    if matches!(
+        event_type,
+        "process.exited"
+            | "pty.session_ended"
+            | "pty.stop_requested"
+            | "pty.kill_requested"
+            | "session.actor_failed"
+            | "session.writer_failed"
+            | "session.writer_closed"
+            | "session.reader_failed"
+            | "session.orphaned"
+            | "command.rejected_precondition"
+            | "command.rejected_control"
+    ) {
+        return true;
+    }
+    if event_type.contains("policy") || event_type.contains("denial") {
+        return true;
+    }
+    event
+        .payload
+        .get("decision")
+        .and_then(|decision| decision.get("allowed"))
+        .and_then(Value::as_bool)
+        == Some(false)
 }
 
 fn update_last_command_status(projection: &mut SessionProjectionV1, event: &EventEnvelopeV1) {

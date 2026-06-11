@@ -174,10 +174,7 @@ pub(crate) fn screen_snapshot_tail(text: &str, max_lines: usize) -> (Vec<String>
         lines.push(line.to_string());
     }
     let joined = tail_lines(&lines.join("\n"), max_lines);
-    let tail = joined
-        .lines()
-        .map(str::to_string)
-        .collect::<Vec<String>>();
+    let tail = joined.lines().map(str::to_string).collect::<Vec<String>>();
     let truncated = lines.len().saturating_sub(tail.len());
     (tail, suppressed.saturating_add(truncated))
 }
@@ -189,7 +186,10 @@ fn stable_hash(text: &str) -> u64 {
 }
 
 fn looks_like_volatile_screen(text: &str) -> bool {
-    let semantic = text.lines().filter(|line| should_keep_snapshot_line(line)).count();
+    let semantic = text
+        .lines()
+        .filter(|line| should_keep_snapshot_line(line))
+        .count();
     let noise = text
         .lines()
         .filter(|line| !line.trim().is_empty() && !should_keep_snapshot_line(line))
@@ -252,8 +252,7 @@ fn looks_like_menu_option(line: &str) -> bool {
         .trim_start_matches(|ch: char| !ch.is_ascii_digit())
         .trim_start();
     let mut chars = trimmed.chars();
-    matches!(chars.next(), Some('0'..='9'))
-        && matches!(chars.next(), Some('.' | ')' | ':' | ' '))
+    matches!(chars.next(), Some('0'..='9')) && matches!(chars.next(), Some('.' | ')' | ':' | ' '))
 }
 
 fn looks_like_decorative_line(line: &str) -> bool {
@@ -310,7 +309,8 @@ mod tests {
     #[test]
     fn vt_replay_preserves_permission_menu_options() {
         let mut screen = TerminalScreen::new(10, 80);
-        screen.process(b"Permission requested\n\xE2\x9D\xAF 1. Yes, allow\n  2. No\nEsc to cancel\n");
+        screen
+            .process(b"Permission requested\n\xE2\x9D\xAF 1. Yes, allow\n  2. No\nEsc to cancel\n");
         let snapshot = screen.snapshot(10);
         let tail = snapshot.tail.join("\n");
         assert!(tail.contains("1. Yes, allow"));

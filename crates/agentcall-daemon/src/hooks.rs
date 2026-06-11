@@ -705,13 +705,9 @@ pub(crate) fn pre_tool_use_claim_locked(
 ) -> Result<serde_json::Value, String> {
     let tool_name = tool_name.unwrap_or("");
     if let Some(wrapper) = wrapper_session {
-        if let Some(decision) = binding_trust_policy_decision(
-            state,
-            state_dir,
-            Some(wrapper),
-            tool_name,
-            payload,
-        )? {
+        if let Some(decision) =
+            binding_trust_policy_decision(state, state_dir, Some(wrapper), tool_name, payload)?
+        {
             return Ok(decision);
         }
         if let Some(decision) =
@@ -1142,7 +1138,8 @@ fn route_requires_binding(route: &serde_json::Value) -> bool {
         return false;
     }
     !route_status_is_terminal(
-        route.get("status")
+        route
+            .get("status")
             .and_then(serde_json::Value::as_str)
             .unwrap_or(""),
     )
@@ -1955,7 +1952,10 @@ pub(crate) fn infer_hook_status(event: &str, payload: &serde_json::Value) -> Str
         }
         "Stop" => "idle".to_string(),
         "SubagentStop" => {
-            if payload.get("checkpoint_request").and_then(|value| value.as_bool()) == Some(true)
+            if payload
+                .get("checkpoint_request")
+                .and_then(|value| value.as_bool())
+                == Some(true)
                 || payload
                     .get("agentcall_checkpoint")
                     .and_then(|value| value.as_bool())

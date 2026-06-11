@@ -693,6 +693,8 @@ mod tests {
             owner_lease_id: "lease-worker-a-1".to_string(),
             lease_generation: 1,
             idempotency_key: idempotency_key.to_string(),
+            control_epoch: None,
+            control_token_hash: None,
             command_type: CommandType::SendInput,
             payload: json!({"text": text}),
             precondition: None,

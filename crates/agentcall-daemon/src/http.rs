@@ -542,6 +542,8 @@ fn websocket_input_command(
         owner_lease_id: format!("websocket-{}", session.name),
         lease_generation: 0,
         idempotency_key: format!("ws-{}-{seq}", session.name),
+        control_epoch: None,
+        control_token_hash: None,
         command_type: CommandType::SendInput,
         payload: serde_json::json!({
             "text": data,
@@ -852,10 +854,8 @@ mod tests {
     use crate::config::LocalConfig;
 
     fn test_state(name: &str, config: LocalConfig) -> Arc<AppState> {
-        let root = std::env::temp_dir().join(format!(
-            "agentcall-http-{name}-{}",
-            std::process::id()
-        ));
+        let root =
+            std::env::temp_dir().join(format!("agentcall-http-{name}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         Arc::new(AppState::new(root, config, None))
     }

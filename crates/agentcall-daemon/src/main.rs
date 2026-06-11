@@ -4,6 +4,7 @@ mod actor;
 mod commands;
 mod confidence;
 mod config;
+mod control;
 mod events;
 mod hooks;
 mod http;
