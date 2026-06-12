@@ -426,22 +426,24 @@ pub(crate) fn install_reserved_route_leases(
     state: &AppState,
     reservation: &RouteLeaseReservation,
 ) -> Result<(), String> {
-    {
+    let owner_snapshot = {
         let mut owner_leases = state.owner_leases.lock().unwrap();
         owner_leases.insert(
             reservation.owner_lease.session_id.clone(),
             reservation.owner_lease.clone(),
         );
-        persist_owner_leases(state, &owner_leases)?;
-    }
-    {
+        owner_leases.clone()
+    };
+    persist_owner_leases(state, &owner_snapshot)?;
+    let workspace_snapshot = {
         let mut workspace_leases = state.workspace_leases.lock().unwrap();
         workspace_leases.insert(
             reservation.workspace_lease.session_id.clone(),
             reservation.workspace_lease.clone(),
         );
-        persist_workspace_leases(state, &workspace_leases)?;
-    }
+        workspace_leases.clone()
+    };
+    persist_workspace_leases(state, &workspace_snapshot)?;
     Ok(())
 }
 
@@ -450,13 +452,16 @@ pub(crate) fn release_owner_lease(
     session_id: &str,
     reason: &str,
 ) -> Result<Option<OwnerLease>, String> {
-    let mut leases = state.owner_leases.lock().unwrap();
-    let Some(mut lease) = leases.remove(session_id) else {
-        return Ok(None);
+    let (lease, snapshot) = {
+        let mut leases = state.owner_leases.lock().unwrap();
+        let Some(mut lease) = leases.remove(session_id) else {
+            return Ok(None);
+        };
+        lease.status = LeaseStatus::Released;
+        lease.renewed_at = chrono::Utc::now().to_rfc3339();
+        (lease, leases.clone())
     };
-    lease.status = LeaseStatus::Released;
-    lease.renewed_at = chrono::Utc::now().to_rfc3339();
-    persist_owner_leases(state, &leases)?;
+    persist_owner_leases(state, &snapshot)?;
     state.store.release_owner_lease(session_id, reason)?;
     crate::state::append_agent_event(
         state,
@@ -482,35 +487,41 @@ pub(crate) fn acquire_workspace_lease(
     };
     let workspace_key = canonical_workspace_key(workspace);
     let now = chrono::Utc::now();
-    let mut leases = state.workspace_leases.lock().unwrap();
-    for existing in leases.values() {
-        if !workspace_lease_is_active(existing, now) {
-            continue;
+    let (lease, snapshot) = {
+        let mut leases = state.workspace_leases.lock().unwrap();
+        for existing in leases.values() {
+            if !workspace_lease_is_active(existing, now) {
+                continue;
+            }
+            if existing.workspace_key != workspace_key || existing.session_id == session_id {
+                continue;
+            }
+            if existing.mode == WorkspaceLeaseMode::Exclusive
+                || mode == WorkspaceLeaseMode::Exclusive
+            {
+                return Err(structured_error(
+                    ErrorCode::WorkspaceBusy,
+                    "Workspace has an incompatible active lease.",
+                    json!({
+                        "workspace": workspace.display().to_string(),
+                        "workspace_key": workspace_key.clone(),
+                        "requested_session": session_id,
+                        "requested_mode": mode.clone(),
+                        "existing_session": existing.session_id.clone(),
+                        "existing_owner": existing.owner_id.clone(),
+                        "existing_mode": existing.mode.clone(),
+                        "existing_expires_at": existing.expires_at.clone(),
+                        "suggested_action": "Use report-only shared routing, wait for the existing worker report, or stop/release the stale session explicitly."
+                    }),
+                ));
+            }
         }
-        if existing.workspace_key != workspace_key || existing.session_id == session_id {
-            continue;
-        }
-        if existing.mode == WorkspaceLeaseMode::Exclusive || mode == WorkspaceLeaseMode::Exclusive {
-            return Err(structured_error(
-                ErrorCode::WorkspaceBusy,
-                "Workspace has an incompatible active lease.",
-                json!({
-                    "workspace": workspace.display().to_string(),
-                    "workspace_key": workspace_key.clone(),
-                    "requested_session": session_id,
-                    "requested_mode": mode.clone(),
-                    "existing_session": existing.session_id.clone(),
-                    "existing_owner": existing.owner_id.clone(),
-                    "existing_mode": existing.mode.clone(),
-                    "existing_expires_at": existing.expires_at.clone(),
-                    "suggested_action": "Use report-only shared routing, wait for the existing worker report, or stop/release the stale session explicitly."
-                }),
-            ));
-        }
-    }
-    let lease = build_workspace_lease_with_key(session_id, "codex", workspace, workspace_key, mode);
-    leases.insert(session_id.to_string(), lease.clone());
-    persist_workspace_leases(state, &leases)?;
+        let lease =
+            build_workspace_lease_with_key(session_id, "codex", workspace, workspace_key, mode);
+        leases.insert(session_id.to_string(), lease.clone());
+        (lease, leases.clone())
+    };
+    persist_workspace_leases(state, &snapshot)?;
     state.store.upsert_workspace_lease(&lease)?;
     Ok(lease)
 }
@@ -520,11 +531,14 @@ pub(crate) fn release_workspace_lease(
     session_id: &str,
     reason: &str,
 ) -> Result<Option<WorkspaceLease>, String> {
-    let mut leases = state.workspace_leases.lock().unwrap();
-    let Some(lease) = leases.remove(session_id) else {
-        return Ok(None);
+    let (lease, snapshot) = {
+        let mut leases = state.workspace_leases.lock().unwrap();
+        let Some(lease) = leases.remove(session_id) else {
+            return Ok(None);
+        };
+        (lease, leases.clone())
     };
-    persist_workspace_leases(state, &leases)?;
+    persist_workspace_leases(state, &snapshot)?;
     state.store.release_workspace_lease(session_id, reason)?;
     crate::state::append_agent_event(
         state,

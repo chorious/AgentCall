@@ -266,22 +266,33 @@ def update_cargo_lock(path: Path, version: str, dry_run: bool) -> bool:
 def stop_existing_processes(root: Path) -> None:
     if os.name != "nt":
         return
-    for image in ["agentcall-mcp.exe", "agentcall-daemon.exe"]:
-        result = subprocess.run(
-            ["taskkill", "/IM", image, "/F"],
-            cwd=root,
-            text=True,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-        )
-        output = result.stdout.strip()
-        if output:
-            print(output)
-        if result.returncode not in (0, 128):
-            # taskkill returns 128 when no process matches on many Windows builds.
-            lowered = output.lower()
-            if "not found" not in lowered and "not running" not in lowered:
-                raise ReleaseError("stop_process_failed", f"taskkill {image} failed: {output}")
+    root_text = str(root.resolve())
+    script = rf"""
+$root = {json.dumps(root_text)}
+$names = @('agentcall-mcp', 'agentcall-daemon')
+$matches = Get-Process -Name $names -ErrorAction SilentlyContinue |
+  Where-Object {{ $_.Path -and $_.Path.StartsWith($root, [System.StringComparison]::OrdinalIgnoreCase) }}
+if (-not $matches) {{
+  Write-Output 'No stale AgentCall processes found under repo root.'
+  exit 0
+}}
+foreach ($proc in $matches) {{
+  Write-Output ("Stopping {{0}} pid={{1}} path={{2}}" -f $proc.ProcessName, $proc.Id, $proc.Path)
+  Stop-Process -Id $proc.Id -Force -ErrorAction Stop
+}}
+"""
+    result = subprocess.run(
+        ["powershell.exe", "-NoProfile", "-Command", script],
+        cwd=root,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+    )
+    output = result.stdout.strip()
+    if output:
+        print(output)
+    if result.returncode != 0:
+        raise ReleaseError("stop_process_failed", f"repo-scoped process stop failed: {output}")
 
 
 def start_daemon_breakaway(root: Path) -> int:

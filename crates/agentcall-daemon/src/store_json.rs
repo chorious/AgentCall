@@ -1,6 +1,7 @@
 #![allow(dead_code)]
 
 use crate::commands::CommandEnvelopeV1;
+use crate::crypto::sha256_hex;
 use crate::events::EventEnvelopeV1;
 use crate::ownership::{OwnerLease, WorkspaceLease};
 use crate::projection::{ProjectionUpdate, SessionProjectionV1};
@@ -566,13 +567,14 @@ fn command_record_from_value(value: &Value) -> Option<CommandRecord> {
 }
 
 fn command_fingerprint(command: &CommandEnvelopeV1) -> String {
-    serde_json::to_string(&json!({
+    let text = serde_json::to_string(&json!({
         "session_id": command.session_id,
         "command_type": command.command_type,
         "payload": command.payload,
         "precondition": command.precondition,
     }))
-    .unwrap_or_default()
+    .unwrap_or_default();
+    sha256_hex(&text)
 }
 
 fn safe_path_component(text: &str) -> String {

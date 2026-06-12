@@ -1,5 +1,18 @@
 # CHANGELOG
 
+## v6.7.0 - P0/P1 Control Hardening
+
+- `SessionProjectionV1` now uses an internal `ProjectionStatus` enum while preserving the existing snake_case JSON status strings.
+- Replaced FNV-style control/idempotency fingerprints with SHA-256 for control tokens, MCP idempotency keys, store command fingerprints, and policy-denial aggregation keys.
+- SQLite event reads now push `session_id`, `event_types`, cursor, and limit into SQL, and hot RuntimeStore paths reuse thread-local SQLite connections.
+- Hook PreToolUse path-policy evaluation is split into a pure decision function; repeated policy blocks still flow through daemon events and projection.
+- Control errors now carry `ErrorCode` internally while preserving existing `status` fields for MCP callers.
+- Worker summaries now derive common session actions from an enum and include a tested worker-state transition table.
+- Actor panic cleanup now terminalizes the session, removes the actor handle, releases owner/workspace leases, and runs wrapper cleanup.
+- Windows process fallback now attempts `taskkill /T /F` when JobObject control is unavailable, instead of reporting a no-op as successful.
+- Lease install/release/acquire paths avoid holding in-memory lease locks while persisting JSON/store updates.
+- Added `docs/reports/report_v6.7_p0_p1_closure_2026-06-13.md` to map the v6.6 open P0/P1 issues to v6.7 closure status.
+
 ## v6.6.0 - Error Enum, SQLite Writer Fanout, Prompt Gate Cleanup
 
 - daemon safety-lock error codes now flow through a Rust `ErrorCode` enum before being serialized as stable snake_case JSON codes.

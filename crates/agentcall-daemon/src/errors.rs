@@ -13,6 +13,9 @@ pub(crate) enum ErrorCode {
     MissingControlToken,
     InvalidControlToken,
     MissingPrecondition,
+    ControlUnavailable,
+    StaleControlToken,
+    ActionNotAllowed,
     AuthenticationRequired,
     Forbidden,
     BadRequest,
@@ -33,6 +36,9 @@ impl ErrorCode {
             Self::MissingControlToken => "missing_control_token",
             Self::InvalidControlToken => "invalid_control_token",
             Self::MissingPrecondition => "missing_precondition",
+            Self::ControlUnavailable => "control_unavailable",
+            Self::StaleControlToken => "stale_control_token",
+            Self::ActionNotAllowed => "action_not_allowed",
             Self::AuthenticationRequired => "authentication_required",
             Self::Forbidden => "forbidden",
             Self::BadRequest => "bad_request",
@@ -53,6 +59,9 @@ impl ErrorCode {
             "missing_control_token" => Self::MissingControlToken,
             "invalid_control_token" => Self::InvalidControlToken,
             "missing_precondition" => Self::MissingPrecondition,
+            "control_unavailable" => Self::ControlUnavailable,
+            "stale_control_token" => Self::StaleControlToken,
+            "action_not_allowed" => Self::ActionNotAllowed,
             "authentication_required" => Self::AuthenticationRequired,
             "forbidden" => Self::Forbidden,
             "bad_request" => Self::BadRequest,
@@ -71,9 +80,12 @@ impl ErrorCode {
             | Self::StaleLeaseGeneration
             | Self::ExpiredLease => 409,
             Self::CapacityExceeded => 429,
-            Self::MissingControlToken | Self::InvalidControlToken | Self::MissingPrecondition => {
-                428
-            }
+            Self::MissingControlToken
+            | Self::InvalidControlToken
+            | Self::MissingPrecondition
+            | Self::ControlUnavailable
+            | Self::StaleControlToken
+            | Self::ActionNotAllowed => 428,
             Self::AuthenticationRequired => 401,
             Self::Forbidden => 403,
             Self::InternalError => 500,
@@ -112,6 +124,21 @@ impl ErrorCode {
                 "safety_lock",
                 false,
                 "Use the control token and precondition returned by agentcall_session summary.",
+            ),
+            Self::ControlUnavailable => (
+                "safety_lock",
+                false,
+                "Control authority is unavailable for this session; refresh session summary or restart via route.",
+            ),
+            Self::StaleControlToken => (
+                "safety_lock",
+                false,
+                "Refresh session summary and retry with a fresh daemon-minted control token.",
+            ),
+            Self::ActionNotAllowed => (
+                "safety_lock",
+                false,
+                "The current session projection does not allow that control action.",
             ),
             Self::AuthenticationRequired => (
                 "auth",

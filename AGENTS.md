@@ -27,7 +27,7 @@ AgentCall lets Codex supervise Claude Code PTY utility workers through a local R
 
 ## Version Discipline
 
-- Current product version: `6.6.0`.
+- Current product version: `6.7.0`.
 - Product version is the single public version source. Keep these in lockstep: README/CHANGELOG, Rust crate versions, `pyproject.toml`, MCP `SERVER_VERSION`, Codex plugin manifest, `Cargo.lock`, and the live daemon build version.
 - Do not claim a version bump is complete after only editing source files. Rebuild and restart daemon/MCP where applicable, then verify `agentcall_daemon(action=status)` reports the same build version.
 - If source version and live daemon version differ, report version drift explicitly and rebuild/restart before continuing live validation.

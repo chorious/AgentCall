@@ -1,6 +1,7 @@
 #![allow(dead_code)]
 
 use crate::commands::CommandEnvelopeV1;
+use crate::crypto::sha256_hex;
 use crate::events::EventEnvelopeV1;
 use crate::ownership::{OwnerLease, WorkspaceLease};
 use crate::projection::{ProjectionUpdate, SessionProjectionV1};
@@ -8,10 +9,16 @@ use crate::store::{
     AppendResult, ArtifactIndexRecord, BoardQuery, CommandRecord, CommandStatus, EventQuery,
     IdempotencyDecisionV1, ReportIndexRecord, RouteDecisionV1, RuntimeStore, SessionRecord,
 };
-use rusqlite::{Connection, OptionalExtension, params};
+use rusqlite::{Connection, OptionalExtension, ToSql, params, params_from_iter};
 use serde_json::{Value, json};
+use std::cell::RefCell;
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
+
+thread_local! {
+    static SQLITE_CONNECTION_CACHE: RefCell<HashMap<PathBuf, Connection>> = RefCell::new(HashMap::new());
+}
 
 pub(crate) struct SqliteRuntimeStore {
     db_path: PathBuf,
@@ -45,6 +52,22 @@ impl SqliteRuntimeStore {
         open_connection(&self.db_path)
     }
 
+    fn with_connection<T>(
+        &self,
+        operation: impl FnOnce(&mut Connection) -> Result<T, String>,
+    ) -> Result<T, String> {
+        SQLITE_CONNECTION_CACHE.with(|cache| {
+            let mut cache = cache.borrow_mut();
+            if !cache.contains_key(&self.db_path) {
+                cache.insert(self.db_path.clone(), open_connection(&self.db_path)?);
+            }
+            let conn = cache
+                .get_mut(&self.db_path)
+                .ok_or_else(|| "sqlite_connection_cache_miss".to_string())?;
+            operation(conn)
+        })
+    }
+
     fn migrate(&self) -> Result<(), String> {
         let conn = self.connect()?;
         conn.execute_batch(SQLITE_SCHEMA)
@@ -62,243 +85,80 @@ impl RuntimeStore for SqliteRuntimeStore {
     }
 
     fn get_events(&self, query: EventQuery) -> Result<Vec<EventEnvelopeV1>, String> {
-        let conn = self.connect()?;
-        let requested_limit = if query.limit == 0 {
-            100
-        } else {
-            query.limit.min(1000)
-        };
-        let scan_limit = if query.event_types.is_empty() {
-            requested_limit
-        } else {
-            requested_limit.saturating_mul(10).min(5000)
-        } as i64;
-        let mut events = Vec::new();
-        if let Some(session_id) = query.session_id {
-            let after = query.after_global_seq.unwrap_or(0) as i64;
-            let mut stmt = conn
-                .prepare(
-                    "SELECT payload_json FROM events \
-                     WHERE session_id = ?1 AND global_seq > ?2 \
-                     ORDER BY global_seq ASC LIMIT ?3",
-                )
-                .map_err(|err| err.to_string())?;
+        self.with_connection(|conn| {
+            let requested_limit = if query.limit == 0 {
+                100
+            } else {
+                query.limit.min(1000)
+            };
+            let mut events = Vec::new();
+            let (sql, params) = build_events_query(&query, requested_limit);
+            let mut stmt = conn.prepare(&sql).map_err(|err| err.to_string())?;
             let rows = stmt
-                .query_map(params![session_id, after, scan_limit], |row| {
-                    row.get::<_, String>(0)
-                })
+                .query_map(
+                    params_from_iter(params.iter().map(|value| value.as_ref() as &dyn ToSql)),
+                    |row| row.get::<_, String>(0),
+                )
                 .map_err(|err| err.to_string())?;
             for row in rows {
                 push_event_json(&mut events, &row.map_err(|err| err.to_string())?);
             }
-        } else {
-            let after = query.after_global_seq.unwrap_or(0) as i64;
-            let mut stmt = conn
-                .prepare(
-                    "SELECT payload_json FROM events \
-                     WHERE global_seq > ?1 ORDER BY global_seq ASC LIMIT ?2",
-                )
-                .map_err(|err| err.to_string())?;
-            let rows = stmt
-                .query_map(params![after, scan_limit], |row| row.get::<_, String>(0))
-                .map_err(|err| err.to_string())?;
-            for row in rows {
-                push_event_json(&mut events, &row.map_err(|err| err.to_string())?);
-            }
-        }
-        if !query.event_types.is_empty() {
-            events.retain(|event| {
-                query
-                    .event_types
-                    .iter()
-                    .any(|event_type| event_type == &event.event_type)
-            });
-        }
-        if events.len() > requested_limit {
-            events.truncate(requested_limit);
-        }
-        Ok(events)
+            Ok(events)
+        })
     }
 
     fn get_session_projection(
         &self,
         session_id: &str,
     ) -> Result<Option<SessionProjectionV1>, String> {
-        let conn = self.connect()?;
-        let projection_json = conn
-            .query_row(
-                "SELECT projection_json FROM projections WHERE session_id = ?1",
-                params![session_id],
-                |row| row.get::<_, String>(0),
-            )
-            .optional()
-            .map_err(|err| err.to_string())?;
-        projection_json
-            .map(|text| serde_json::from_str(&text).map_err(|err| err.to_string()))
-            .transpose()
-    }
-
-    fn list_board_projection(&self, query: BoardQuery) -> Result<Value, String> {
-        let conn = self.connect()?;
-        let sql = if query.attention_only {
-            "SELECT projection_json FROM projections WHERE needs_attention = 1 ORDER BY updated_at DESC"
-        } else {
-            "SELECT projection_json FROM projections ORDER BY updated_at DESC"
-        };
-        let mut stmt = conn.prepare(sql).map_err(|err| err.to_string())?;
-        let rows = stmt
-            .query_map([], |row| row.get::<_, String>(0))
-            .map_err(|err| err.to_string())?;
-        let mut sessions = Vec::new();
-        for row in rows {
-            if let Ok(value) = serde_json::from_str::<Value>(&row.map_err(|err| err.to_string())?) {
-                if !projection_matches_owner(&value, query.owner_id.as_deref()) {
-                    continue;
-                }
-                sessions.push(value);
-            }
-        }
-        Ok(json!({"projection_only": true, "store_backend": "sqlite", "sessions": sessions}))
-    }
-
-    fn get_idempotency(&self, owner: &str, key: &str) -> Result<Option<CommandRecord>, String> {
-        let conn = self.connect()?;
-        let scope = idempotency_scope(owner, key);
-        conn.query_row(
-            "SELECT command_id, owner_id, idempotency_key, fingerprint, status \
-             FROM commands WHERE idempotency_scope = ?1 AND idempotency_key = ?2",
-            params![scope, key],
-            |row| {
-                Ok(CommandRecord {
-                    command_id: row.get(0)?,
-                    owner_id: row.get(1)?,
-                    idempotency_key: row.get(2)?,
-                    fingerprint: row.get(3)?,
-                    status: row.get(4)?,
-                })
-            },
-        )
-        .optional()
-        .map_err(|err| err.to_string())
-    }
-
-    fn save_report_index(&self, report: &ReportIndexRecord) -> Result<(), String> {
-        let conn = self.connect()?;
-        conn.execute(
-            "INSERT INTO reports(report_id, session_id, path, status, updated_at) \
-             VALUES(?1, ?2, ?3, ?4, ?5) \
-             ON CONFLICT(report_id) DO UPDATE SET \
-             session_id=excluded.session_id, path=excluded.path, status=excluded.status, updated_at=excluded.updated_at",
-            params![
-                report.report_id,
-                report.session_id,
-                report.path,
-                report.status,
-                report.updated_at
-            ],
-        )
-        .map(|_| ())
-        .map_err(|err| err.to_string())
-    }
-
-    fn save_artifact_index(&self, artifact: &ArtifactIndexRecord) -> Result<(), String> {
-        let conn = self.connect()?;
-        conn.execute(
-            "INSERT INTO artifacts(artifact_id, session_id, kind, path, created_at) \
-             VALUES(?1, ?2, ?3, ?4, ?5) \
-             ON CONFLICT(artifact_id) DO UPDATE SET \
-             session_id=excluded.session_id, kind=excluded.kind, path=excluded.path, created_at=excluded.created_at",
-            params![
-                artifact.artifact_id,
-                artifact.session_id,
-                artifact.kind,
-                artifact.path,
-                artifact.created_at
-            ],
-        )
-        .map(|_| ())
-        .map_err(|err| err.to_string())
-    }
-
-    fn upsert_owner_lease(&self, lease: &OwnerLease) -> Result<(), String> {
-        upsert_owner_lease(&self.connect()?, lease)
-    }
-
-    fn release_owner_lease(&self, session_id: &str, _reason: &str) -> Result<(), String> {
-        let conn = self.connect()?;
-        conn.execute(
-            "UPDATE owner_leases SET status = 'Released', renewed_at = ?1 WHERE session_id = ?2",
-            params![chrono::Utc::now().to_rfc3339(), session_id],
-        )
-        .map(|_| ())
-        .map_err(|err| err.to_string())
-    }
-
-    fn upsert_workspace_lease(&self, lease: &WorkspaceLease) -> Result<(), String> {
-        upsert_workspace_lease(&self.connect()?, lease)
-    }
-
-    fn release_workspace_lease(&self, session_id: &str, _reason: &str) -> Result<(), String> {
-        let conn = self.connect()?;
-        conn.execute(
-            "DELETE FROM workspace_leases WHERE session_id = ?1",
-            params![session_id],
-        )
-        .map(|_| ())
-        .map_err(|err| err.to_string())
-    }
-
-    fn renew_owner_lease(&self, lease_id: &str) -> Result<(), String> {
-        let conn = self.connect()?;
-        let now = chrono::Utc::now().to_rfc3339();
-        conn.execute(
-            "UPDATE owner_leases SET renewed_at = ?1, last_heartbeat_at = ?1 WHERE lease_id = ?2",
-            params![now, lease_id],
-        )
-        .map(|_| ())
-        .map_err(|err| err.to_string())
-    }
-
-    fn record_file_read(&self, session_id: &str, path: &str) -> Result<(), String> {
-        record_file_access(&self.connect()?, session_id, path, "read")
-    }
-
-    fn record_file_write(&self, session_id: &str, path: &str) -> Result<(), String> {
-        record_file_access(&self.connect()?, session_id, path, "write")
-    }
-
-    fn append_event_and_update_projection(
-        &self,
-        event: &EventEnvelopeV1,
-        projection_update: ProjectionUpdate,
-    ) -> Result<AppendResult, String> {
-        let mut conn = self.connect()?;
-        let tx = conn.transaction().map_err(|err| err.to_string())?;
-        insert_event(&tx, event)?;
-        let projection_updated = projection_update.changed;
-        if projection_updated {
-            upsert_projection(&tx, &projection_update.projection)?;
-        }
-        tx.commit().map_err(|err| err.to_string())?;
-        Ok(AppendResult {
-            global_seq: event.global_seq,
-            projection_updated,
+        self.with_connection(|conn| {
+            let projection_json = conn
+                .query_row(
+                    "SELECT projection_json FROM projections WHERE session_id = ?1",
+                    params![session_id],
+                    |row| row.get::<_, String>(0),
+                )
+                .optional()
+                .map_err(|err| err.to_string())?;
+            projection_json
+                .map(|text| serde_json::from_str(&text).map_err(|err| err.to_string()))
+                .transpose()
         })
     }
 
-    fn register_command_idempotently(
-        &self,
-        command: &CommandEnvelopeV1,
-    ) -> Result<IdempotencyDecisionV1, String> {
-        let mut conn = self.connect()?;
-        let tx = conn.transaction().map_err(|err| err.to_string())?;
-        let scope = idempotency_scope(&command.owner_id, &command.idempotency_key);
-        let fingerprint = command_fingerprint(command);
-        let existing = tx
-            .query_row(
+    fn list_board_projection(&self, query: BoardQuery) -> Result<Value, String> {
+        self.with_connection(|conn| {
+            let sql = if query.attention_only {
+                "SELECT projection_json FROM projections WHERE needs_attention = 1 ORDER BY updated_at DESC"
+            } else {
+                "SELECT projection_json FROM projections ORDER BY updated_at DESC"
+            };
+            let mut stmt = conn.prepare(sql).map_err(|err| err.to_string())?;
+            let rows = stmt
+                .query_map([], |row| row.get::<_, String>(0))
+                .map_err(|err| err.to_string())?;
+            let mut sessions = Vec::new();
+            for row in rows {
+                if let Ok(value) =
+                    serde_json::from_str::<Value>(&row.map_err(|err| err.to_string())?)
+                {
+                    if !projection_matches_owner(&value, query.owner_id.as_deref()) {
+                        continue;
+                    }
+                    sessions.push(value);
+                }
+            }
+            Ok(json!({"projection_only": true, "store_backend": "sqlite", "sessions": sessions}))
+        })
+    }
+
+    fn get_idempotency(&self, owner: &str, key: &str) -> Result<Option<CommandRecord>, String> {
+        self.with_connection(|conn| {
+            let scope = idempotency_scope(owner, key);
+            conn.query_row(
                 "SELECT command_id, owner_id, idempotency_key, fingerprint, status \
                  FROM commands WHERE idempotency_scope = ?1 AND idempotency_key = ?2",
-                params![scope, command.idempotency_key],
+                params![scope, key],
                 |row| {
                     Ok(CommandRecord {
                         command_id: row.get(0)?,
@@ -310,41 +170,180 @@ impl RuntimeStore for SqliteRuntimeStore {
                 },
             )
             .optional()
-            .map_err(|err| err.to_string())?;
-        if let Some(record) = existing {
-            tx.commit().map_err(|err| err.to_string())?;
-            if record.fingerprint == fingerprint {
-                return Ok(IdempotencyDecisionV1::Deduped(record));
+            .map_err(|err| err.to_string())
+        })
+    }
+
+    fn save_report_index(&self, report: &ReportIndexRecord) -> Result<(), String> {
+        self.with_connection(|conn| {
+            conn.execute(
+                "INSERT INTO reports(report_id, session_id, path, status, updated_at) \
+                 VALUES(?1, ?2, ?3, ?4, ?5) \
+                 ON CONFLICT(report_id) DO UPDATE SET \
+                 session_id=excluded.session_id, path=excluded.path, status=excluded.status, updated_at=excluded.updated_at",
+                params![
+                    report.report_id,
+                    report.session_id,
+                    report.path,
+                    report.status,
+                    report.updated_at
+                ],
+            )
+            .map(|_| ())
+            .map_err(|err| err.to_string())
+        })
+    }
+
+    fn save_artifact_index(&self, artifact: &ArtifactIndexRecord) -> Result<(), String> {
+        self.with_connection(|conn| {
+            conn.execute(
+                "INSERT INTO artifacts(artifact_id, session_id, kind, path, created_at) \
+                 VALUES(?1, ?2, ?3, ?4, ?5) \
+                 ON CONFLICT(artifact_id) DO UPDATE SET \
+                 session_id=excluded.session_id, kind=excluded.kind, path=excluded.path, created_at=excluded.created_at",
+                params![
+                    artifact.artifact_id,
+                    artifact.session_id,
+                    artifact.kind,
+                    artifact.path,
+                    artifact.created_at
+                ],
+            )
+            .map(|_| ())
+            .map_err(|err| err.to_string())
+        })
+    }
+
+    fn upsert_owner_lease(&self, lease: &OwnerLease) -> Result<(), String> {
+        self.with_connection(|conn| upsert_owner_lease(conn, lease))
+    }
+
+    fn release_owner_lease(&self, session_id: &str, _reason: &str) -> Result<(), String> {
+        self.with_connection(|conn| {
+            conn.execute(
+                "UPDATE owner_leases SET status = 'Released', renewed_at = ?1 WHERE session_id = ?2",
+                params![chrono::Utc::now().to_rfc3339(), session_id],
+            )
+            .map(|_| ())
+            .map_err(|err| err.to_string())
+        })
+    }
+
+    fn upsert_workspace_lease(&self, lease: &WorkspaceLease) -> Result<(), String> {
+        self.with_connection(|conn| upsert_workspace_lease(conn, lease))
+    }
+
+    fn release_workspace_lease(&self, session_id: &str, _reason: &str) -> Result<(), String> {
+        self.with_connection(|conn| {
+            conn.execute(
+                "DELETE FROM workspace_leases WHERE session_id = ?1",
+                params![session_id],
+            )
+            .map(|_| ())
+            .map_err(|err| err.to_string())
+        })
+    }
+
+    fn renew_owner_lease(&self, lease_id: &str) -> Result<(), String> {
+        self.with_connection(|conn| {
+            let now = chrono::Utc::now().to_rfc3339();
+            conn.execute(
+                "UPDATE owner_leases SET renewed_at = ?1, last_heartbeat_at = ?1 WHERE lease_id = ?2",
+                params![now, lease_id],
+            )
+            .map(|_| ())
+            .map_err(|err| err.to_string())
+        })
+    }
+
+    fn record_file_read(&self, session_id: &str, path: &str) -> Result<(), String> {
+        self.with_connection(|conn| record_file_access(conn, session_id, path, "read"))
+    }
+
+    fn record_file_write(&self, session_id: &str, path: &str) -> Result<(), String> {
+        self.with_connection(|conn| record_file_access(conn, session_id, path, "write"))
+    }
+
+    fn append_event_and_update_projection(
+        &self,
+        event: &EventEnvelopeV1,
+        projection_update: ProjectionUpdate,
+    ) -> Result<AppendResult, String> {
+        self.with_connection(|conn| {
+            let tx = conn.transaction().map_err(|err| err.to_string())?;
+            insert_event(&tx, event)?;
+            let projection_updated = projection_update.changed;
+            if projection_updated {
+                upsert_projection(&tx, &projection_update.projection)?;
             }
-            return Ok(IdempotencyDecisionV1::RejectedDifferentFingerprint(record));
-        }
-        let command_json = serde_json::to_string(command).map_err(|err| err.to_string())?;
-        tx.execute(
-            "INSERT INTO commands(command_id, session_id, owner_id, owner_lease_id, lease_generation, \
-             idempotency_scope, idempotency_key, fingerprint, status, command_json, created_at, updated_at) \
-             VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'accepted', ?9, ?10, ?10)",
-            params![
-                command.command_id,
-                command.session_id,
-                command.owner_id,
-                command.owner_lease_id,
-                command.lease_generation as i64,
-                scope,
-                command.idempotency_key,
+            tx.commit().map_err(|err| err.to_string())?;
+            Ok(AppendResult {
+                global_seq: event.global_seq,
+                projection_updated,
+            })
+        })
+    }
+
+    fn register_command_idempotently(
+        &self,
+        command: &CommandEnvelopeV1,
+    ) -> Result<IdempotencyDecisionV1, String> {
+        self.with_connection(|conn| {
+            let tx = conn.transaction().map_err(|err| err.to_string())?;
+            let scope = idempotency_scope(&command.owner_id, &command.idempotency_key);
+            let fingerprint = command_fingerprint(command);
+            let existing = tx
+                .query_row(
+                    "SELECT command_id, owner_id, idempotency_key, fingerprint, status \
+                     FROM commands WHERE idempotency_scope = ?1 AND idempotency_key = ?2",
+                    params![scope, command.idempotency_key],
+                    |row| {
+                        Ok(CommandRecord {
+                            command_id: row.get(0)?,
+                            owner_id: row.get(1)?,
+                            idempotency_key: row.get(2)?,
+                            fingerprint: row.get(3)?,
+                            status: row.get(4)?,
+                        })
+                    },
+                )
+                .optional()
+                .map_err(|err| err.to_string())?;
+            if let Some(record) = existing {
+                tx.commit().map_err(|err| err.to_string())?;
+                if record.fingerprint == fingerprint {
+                    return Ok(IdempotencyDecisionV1::Deduped(record));
+                }
+                return Ok(IdempotencyDecisionV1::RejectedDifferentFingerprint(record));
+            }
+            let command_json = serde_json::to_string(command).map_err(|err| err.to_string())?;
+            tx.execute(
+                "INSERT INTO commands(command_id, session_id, owner_id, owner_lease_id, lease_generation, \
+                 idempotency_scope, idempotency_key, fingerprint, status, command_json, created_at, updated_at) \
+                 VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'accepted', ?9, ?10, ?10)",
+                params![
+                    command.command_id,
+                    command.session_id,
+                    command.owner_id,
+                    command.owner_lease_id,
+                    command.lease_generation as i64,
+                    scope,
+                    command.idempotency_key,
+                    fingerprint,
+                    command_json,
+                    command.created_at
+                ],
+            )
+            .map_err(|err| err.to_string())?;
+            tx.commit().map_err(|err| err.to_string())?;
+            Ok(IdempotencyDecisionV1::Recorded(CommandRecord {
+                command_id: command.command_id.clone(),
+                owner_id: command.owner_id.clone(),
+                idempotency_key: command.idempotency_key.clone(),
                 fingerprint,
-                command_json,
-                command.created_at
-            ],
-        )
-        .map_err(|err| err.to_string())?;
-        tx.commit().map_err(|err| err.to_string())?;
-        Ok(IdempotencyDecisionV1::Recorded(CommandRecord {
-            command_id: command.command_id.clone(),
-            owner_id: command.owner_id.clone(),
-            idempotency_key: command.idempotency_key.clone(),
-            fingerprint,
-            status: "accepted".to_string(),
-        }))
+                status: "accepted".to_string(),
+            }))
+        })
     }
 
     fn complete_command_with_event(
@@ -354,26 +353,27 @@ impl RuntimeStore for SqliteRuntimeStore {
         event: &EventEnvelopeV1,
         projection_update: ProjectionUpdate,
     ) -> Result<(), String> {
-        let mut conn = self.connect()?;
-        let tx = conn.transaction().map_err(|err| err.to_string())?;
-        let updated = tx
-            .execute(
-                "UPDATE commands SET status = ?1, updated_at = ?2 WHERE command_id = ?3",
-                params![
-                    command_status_text(status),
-                    chrono::Utc::now().to_rfc3339(),
-                    command_id
-                ],
-            )
-            .map_err(|err| err.to_string())?;
-        if updated == 0 {
-            return Err(format!("unknown_command_id: {command_id}"));
-        }
-        insert_event(&tx, event)?;
-        if projection_update.changed {
-            upsert_projection(&tx, &projection_update.projection)?;
-        }
-        tx.commit().map_err(|err| err.to_string())
+        self.with_connection(|conn| {
+            let tx = conn.transaction().map_err(|err| err.to_string())?;
+            let updated = tx
+                .execute(
+                    "UPDATE commands SET status = ?1, updated_at = ?2 WHERE command_id = ?3",
+                    params![
+                        command_status_text(status),
+                        chrono::Utc::now().to_rfc3339(),
+                        command_id
+                    ],
+                )
+                .map_err(|err| err.to_string())?;
+            if updated == 0 {
+                return Err(format!("unknown_command_id: {command_id}"));
+            }
+            insert_event(&tx, event)?;
+            if projection_update.changed {
+                upsert_projection(&tx, &projection_update.projection)?;
+            }
+            tx.commit().map_err(|err| err.to_string())
+        })
     }
 
     fn acquire_route_leases_and_create_session(
@@ -382,28 +382,29 @@ impl RuntimeStore for SqliteRuntimeStore {
         owner_lease: &OwnerLease,
         workspace_lease: Option<&WorkspaceLease>,
     ) -> Result<RouteDecisionV1, String> {
-        let mut conn = self.connect()?;
-        let tx = conn.transaction().map_err(|err| err.to_string())?;
-        tx.execute(
-            "INSERT INTO sessions(session_id, owner_id, workspace, workspace_key, runtime, process_state, turn_state, attention_state, created_at, updated_at) \
-             VALUES(?1, ?2, ?3, ?4, ?5, 'spawning', 'idle', 'none', ?6, ?6) \
-             ON CONFLICT(session_id) DO UPDATE SET updated_at=excluded.updated_at",
-            params![
-                session.session_id,
-                session.owner_id,
-                session.workspace,
-                session.workspace_key,
-                session.runtime,
-                chrono::Utc::now().to_rfc3339()
-            ],
-        )
-        .map_err(|err| err.to_string())?;
-        upsert_owner_lease(&tx, owner_lease)?;
-        if let Some(workspace_lease) = workspace_lease {
-            upsert_workspace_lease(&tx, workspace_lease)?;
-        }
-        tx.commit().map_err(|err| err.to_string())?;
-        Ok(RouteDecisionV1::Created)
+        self.with_connection(|conn| {
+            let tx = conn.transaction().map_err(|err| err.to_string())?;
+            tx.execute(
+                "INSERT INTO sessions(session_id, owner_id, workspace, workspace_key, runtime, process_state, turn_state, attention_state, created_at, updated_at) \
+                 VALUES(?1, ?2, ?3, ?4, ?5, 'spawning', 'idle', 'none', ?6, ?6) \
+                 ON CONFLICT(session_id) DO UPDATE SET updated_at=excluded.updated_at",
+                params![
+                    session.session_id,
+                    session.owner_id,
+                    session.workspace,
+                    session.workspace_key,
+                    session.runtime,
+                    chrono::Utc::now().to_rfc3339()
+                ],
+            )
+            .map_err(|err| err.to_string())?;
+            upsert_owner_lease(&tx, owner_lease)?;
+            if let Some(workspace_lease) = workspace_lease {
+                upsert_workspace_lease(&tx, workspace_lease)?;
+            }
+            tx.commit().map_err(|err| err.to_string())?;
+            Ok(RouteDecisionV1::Created)
+        })
     }
 }
 
@@ -650,6 +651,31 @@ fn push_event_json(events: &mut Vec<EventEnvelopeV1>, text: &str) {
     }
 }
 
+fn build_events_query(query: &EventQuery, limit: usize) -> (String, Vec<Box<dyn ToSql>>) {
+    let mut sql = String::from("SELECT payload_json FROM events WHERE global_seq > ?");
+    let mut values: Vec<Box<dyn ToSql>> =
+        vec![Box::new(query.after_global_seq.unwrap_or(0) as i64)];
+    if let Some(session_id) = query.session_id.as_ref() {
+        sql.push_str(" AND session_id = ?");
+        values.push(Box::new(session_id.clone()));
+    }
+    if !query.event_types.is_empty() {
+        sql.push_str(" AND event_type IN (");
+        sql.push_str(
+            &std::iter::repeat_n("?", query.event_types.len())
+                .collect::<Vec<_>>()
+                .join(","),
+        );
+        sql.push(')');
+        for event_type in &query.event_types {
+            values.push(Box::new(event_type.clone()));
+        }
+    }
+    sql.push_str(" ORDER BY global_seq ASC LIMIT ?");
+    values.push(Box::new(limit as i64));
+    (sql, values)
+}
+
 fn idempotency_scope(owner: &str, key: &str) -> String {
     format!("{owner}:{key}")
 }
@@ -662,13 +688,14 @@ fn projection_matches_owner(value: &Value, owner_id: Option<&str>) -> bool {
 }
 
 fn command_fingerprint(command: &CommandEnvelopeV1) -> String {
-    serde_json::to_string(&json!({
+    let text = serde_json::to_string(&json!({
         "session_id": command.session_id,
         "command_type": command.command_type,
         "payload": command.payload,
         "precondition": command.precondition,
     }))
-    .unwrap_or_default()
+    .unwrap_or_default();
+    sha256_hex(&text)
 }
 
 fn command_status_text(status: CommandStatus) -> &'static str {
@@ -743,6 +770,45 @@ mod tests {
         );
         let projection = store.get_session_projection("worker-a").unwrap().unwrap();
         assert_eq!(projection.attention_status, "needs_permission");
+    }
+
+    #[test]
+    fn sqlite_get_events_filters_types_and_limits_in_query_contract() {
+        let store = test_store("event-filter-limit");
+        for (index, event_type) in [
+            "hook.Notification",
+            "command.completed",
+            "hook.Notification",
+            "pty.session_started",
+        ]
+        .iter()
+        .enumerate()
+        {
+            let global_seq = (index + 1) as u64;
+            let event = crate::events::build_event_envelope(
+                format!("evt-filter-{global_seq:06}"),
+                global_seq,
+                Some(global_seq),
+                event_type,
+                "event",
+                json!({"wrapper_session": "worker-filter"}),
+            );
+            let update = apply_event_to_projection(None, &event);
+            store
+                .append_event_and_update_projection(&event, update)
+                .unwrap();
+        }
+        let filtered = store
+            .get_events(EventQuery {
+                session_id: Some("worker-filter".to_string()),
+                after_global_seq: Some(0),
+                event_types: vec!["hook.Notification".to_string()],
+                limit: 1,
+            })
+            .unwrap();
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0].event_type, "hook.Notification");
+        assert_eq!(filtered[0].global_seq, 1);
     }
 
     #[test]

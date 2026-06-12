@@ -1,6 +1,6 @@
 # AgentCall
 
-当前版本 / Current version: `v6.6.0 - Error enum, SQLite writer fanout, prompt gate cleanup`
+当前版本 / Current version: `v6.7.0 - P0/P1 control hardening`
 
 AgentCall is a local coordination plane that lets **Codex supervise Claude Code PTY utility workers** through a daemon-backed MCP interface. Codex stays the parent agent: it reads a compact board, starts bounded workers, sends safe commands, waits with patience hints, asks for reports, and accepts or revises deliverables. Claude Code workers do the visible PTY work under hook-aware policy and file ownership.
 

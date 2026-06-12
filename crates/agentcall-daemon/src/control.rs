@@ -1,4 +1,6 @@
 use crate::commands::{CommandEnvelopeV1, CommandType};
+use crate::crypto::sha256_hex;
+use crate::errors::ErrorCode;
 use crate::ownership::{owner_lease_is_active, validate_owner_lease_precondition};
 use crate::projection::{SessionProjectionV1, read_session_projection};
 use crate::state::AppState;
@@ -30,7 +32,7 @@ pub(crate) struct ValidatedControlToken {
 
 #[derive(Clone, Debug)]
 pub(crate) struct ControlError {
-    pub(crate) status: &'static str,
+    pub(crate) status: ErrorCode,
     pub(crate) reason: String,
     pub(crate) next_step: &'static str,
     pub(crate) current: Value,
@@ -40,7 +42,10 @@ impl ControlError {
     pub(crate) fn to_value(&self) -> Value {
         json!({
             "ok": false,
-            "status": self.status,
+            "status": self.status.as_str(),
+            "error": {
+                "code": self.status.as_str()
+            },
             "reason": self.reason,
             "next_step": self.next_step,
             "current": self.current
@@ -91,7 +96,7 @@ pub(crate) fn mint_control_token(
     let live = state.sessions.lock().unwrap().contains_key(session_id);
     if !live {
         return Err(control_error(
-            "control_unavailable",
+            ErrorCode::ControlUnavailable,
             format!("session {session_id} is not live"),
             "inspect_session_summary",
             json!({"session_id": session_id, "live": false}),
@@ -101,7 +106,7 @@ pub(crate) fn mint_control_token(
         .unwrap_or_else(|| missing_projection(session_id));
     if projection.terminal {
         return Err(control_error(
-            "control_unavailable",
+            ErrorCode::ControlUnavailable,
             "terminal sessions cannot mint control tokens".to_string(),
             "inspect_report_or_cleanup",
             projection_current(&projection),
@@ -112,7 +117,7 @@ pub(crate) fn mint_control_token(
         let leases = state.owner_leases.lock().unwrap();
         let Some(lease) = leases.get(session_id) else {
             return Err(control_error(
-                "control_unavailable",
+                ErrorCode::ControlUnavailable,
                 "session has no active owner lease; refusing to mint hidden control authority"
                     .to_string(),
                 "restart_or_reacquire_session_via_route",
@@ -121,7 +126,7 @@ pub(crate) fn mint_control_token(
         };
         if lease.owner_id != owner_id {
             return Err(control_error(
-                "owner_mismatch",
+                ErrorCode::OwnerMismatch,
                 format!(
                     "session owner is {}, but caller requested {}",
                     lease.owner_id, owner_id
@@ -136,7 +141,7 @@ pub(crate) fn mint_control_token(
         }
         if !owner_lease_is_active(lease, now) {
             return Err(control_error(
-                "stale_control_token",
+                ErrorCode::StaleControlToken,
                 "session owner lease is not active".to_string(),
                 "refresh_session_summary",
                 json!({
@@ -153,7 +158,7 @@ pub(crate) fn mint_control_token(
 
     let token = random_control_token().map_err(|err| {
         control_error(
-            "control_unavailable",
+            ErrorCode::ControlUnavailable,
             format!("failed to generate control token: {err}"),
             "retry_or_restart_daemon",
             json!({"session_id": session_id}),
@@ -191,7 +196,7 @@ pub(crate) fn validate_control_token(
         let tokens = state.control_tokens.lock().unwrap();
         let Some(claims) = tokens.get(&token_hash) else {
             return Err(control_error(
-                "stale_control_token",
+                ErrorCode::StaleControlToken,
                 "control token is missing or expired".to_string(),
                 "refresh_session_summary",
                 json!({"session_id": session_id, "action": action}),
@@ -215,12 +220,7 @@ pub(crate) fn validate_envelope_control_at_actor(
 }
 
 pub(crate) fn control_token_hash(token: &str) -> String {
-    let mut hash = 0xcbf29ce484222325u64;
-    for byte in token.as_bytes() {
-        hash ^= *byte as u64;
-        hash = hash.wrapping_mul(0x100000001b3);
-    }
-    format!("{hash:016x}")
+    sha256_hex(token)
 }
 
 fn validate_control_claims(
@@ -231,7 +231,7 @@ fn validate_control_claims(
 ) -> Result<(), ControlError> {
     if claims.session_id != session_id {
         return Err(control_error(
-            "stale_control_token",
+            ErrorCode::StaleControlToken,
             format!(
                 "token belongs to session {}, not {session_id}",
                 claims.session_id
@@ -242,7 +242,7 @@ fn validate_control_claims(
     }
     if !claims.allowed_actions.iter().any(|item| item == action) {
         return Err(control_error(
-            "action_not_allowed",
+            ErrorCode::ActionNotAllowed,
             format!("control token does not allow action {action}"),
             "inspect_session_summary",
             json!({
@@ -267,7 +267,7 @@ fn validate_control_claims_for_command(
         .unwrap_or("");
     let Some(control_epoch) = command.control_epoch else {
         return Err(control_error(
-            "stale_control_token",
+            ErrorCode::StaleControlToken,
             "command is missing control_epoch".to_string(),
             "refresh_session_summary",
             json!({"session_id": session_id, "action": action}),
@@ -294,7 +294,7 @@ fn validate_owner_and_epoch(
 ) -> Result<(), ControlError> {
     if !state.sessions.lock().unwrap().contains_key(session_id) {
         return Err(control_error(
-            "stale_control_token",
+            ErrorCode::StaleControlToken,
             "session is no longer live".to_string(),
             "inspect_session_summary",
             json!({"session_id": session_id, "action": action, "live": false}),
@@ -309,7 +309,7 @@ fn validate_owner_and_epoch(
     )
     .map_err(|err| {
         control_error(
-            "stale_control_token",
+            ErrorCode::StaleControlToken,
             err,
             "refresh_session_summary",
             json!({
@@ -325,7 +325,7 @@ fn validate_owner_and_epoch(
         .unwrap_or_else(|| missing_projection(session_id));
     if projection.control_epoch != claims.control_epoch {
         return Err(control_error(
-            "stale_control_token",
+            ErrorCode::StaleControlToken,
             format!(
                 "control_epoch changed from {} to {}",
                 claims.control_epoch, projection.control_epoch
@@ -386,7 +386,7 @@ fn cleanup_expired_control_tokens(state: &AppState) {
 }
 
 fn control_error(
-    status: &'static str,
+    status: ErrorCode,
     reason: String,
     next_step: &'static str,
     current: Value,

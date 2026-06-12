@@ -1,3 +1,4 @@
+use crate::crypto::sha256_hex;
 use crate::routes::{patch_route_record_locked, route_for_wrapper_session};
 use crate::state::{
     AppState, append_agent_event, append_agent_event_locked, read_json_file, write_json_file,
@@ -899,7 +900,8 @@ pub(crate) fn pre_tool_use_claim_locked(
             return Ok(decision);
         }
         if let Some(policy) = pty_path_policy_for_wrapper(state, wrapper) {
-            if let Some(denial) = pty_path_policy_denial(tool_name, payload, &policy) {
+            let policy_decision = evaluate_pty_pre_tool_policy(tool_name, payload, &policy);
+            if let Some(denial) = policy_decision.denial.as_deref() {
                 let policy_block = record_policy_denial_locked(
                     state, state_dir, wrapper, tool_name, payload, &denial, &policy,
                 )?;
@@ -917,7 +919,7 @@ pub(crate) fn pre_tool_use_claim_locked(
                         "bash_write_policy": policy.bash_write_policy.clone()
                     },
                     "policy_block": policy_block,
-                    "files": extract_tool_files(payload),
+                    "files": policy_decision.files,
                     "conflicts": []
                 }));
             }
@@ -1501,40 +1503,69 @@ fn writable_roots_from_containment(containment: &serde_json::Value) -> Vec<Writa
         .unwrap_or_default()
 }
 
-fn pty_path_policy_denial(
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct HookPolicyDecision {
+    allowed: bool,
+    denial: Option<String>,
+    files: Vec<String>,
+}
+
+fn evaluate_pty_pre_tool_policy(
     tool_name: &str,
     payload: &serde_json::Value,
     policy: &PtyPathPolicy,
-) -> Option<String> {
+) -> HookPolicyDecision {
     if tool_name == "TaskCreate" && policy.mode == "report" {
-        return Some(
+        return HookPolicyDecision::deny(
             "PTY path policy denies TaskCreate during report route; request a coding worker for child implementation work"
                 .to_string(),
+            vec![],
         );
     }
     if is_write_tool(tool_name) {
         let files = extract_tool_files(payload);
         if files.is_empty() {
-            return Some(
+            return HookPolicyDecision::deny(
                 "PTY path policy denies write tool without explicit file path".to_string(),
+                files,
             );
         }
         if files
             .iter()
             .all(|file| write_path_allowed_by_policy(file, policy))
         {
-            return None;
+            return HookPolicyDecision::allow(files);
         }
-        return Some(
+        return HookPolicyDecision::deny(
             "PTY path policy denies write outside write_paths or writable_roots".to_string(),
+            files,
         );
     }
     if tool_name == "Bash" && !bash_readonly_allowed(payload) {
-        return Some(
+        return HookPolicyDecision::deny(
             "PTY path policy denies non-read-only bash when write_paths are enforced".to_string(),
+            extract_tool_files(payload),
         );
     }
-    None
+    HookPolicyDecision::allow(extract_tool_files(payload))
+}
+
+impl HookPolicyDecision {
+    fn allow(files: Vec<String>) -> Self {
+        Self {
+            allowed: true,
+            denial: None,
+            files,
+        }
+    }
+
+    fn deny(denial: String, files: Vec<String>) -> Self {
+        Self {
+            allowed: false,
+            denial: Some(denial),
+            files,
+        }
+    }
 }
 
 fn write_path_allowed_by_policy(file: &str, policy: &PtyPathPolicy) -> bool {
@@ -1991,12 +2022,7 @@ fn policy_denial_category(tool_name: &str, reason: &str) -> String {
 }
 
 fn stable_hash_hex(bytes: &[u8]) -> String {
-    let mut hash = 0xcbf29ce484222325u64;
-    for byte in bytes {
-        hash ^= *byte as u64;
-        hash = hash.wrapping_mul(0x100000001b3);
-    }
-    format!("{hash:016x}")
+    sha256_hex(&String::from_utf8_lossy(bytes))
 }
 
 fn is_claude_plan_file(path: &str) -> bool {

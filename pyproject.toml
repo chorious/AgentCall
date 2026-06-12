@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "agentcall"
-version = "6.6.0"
+version = "6.7.0"
 description = "Local control plane for Codex-led Claude Code agent clusters"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -19,5 +19,4 @@ where = ["src"]
 
 [tool.pytest.ini_options]
 pythonpath = ["src"]
-addopts = "--basetemp=.agentcall_pytest -p no:cacheprovider"
-cache_dir = ".agentcall_pytest/cache"
+addopts = "-p no:cacheprovider"

@@ -2,9 +2,146 @@ use crate::events::EventEnvelopeV1;
 use crate::session::{Session, SessionInfo, list_sessions};
 use crate::state::AppState;
 use crate::store::BoardQuery;
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use serde_json::Value;
+use std::fmt;
 use std::sync::Arc;
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum ProjectionStatus {
+    None,
+    Unknown,
+    Starting,
+    PromptPending,
+    WaitingInput,
+    NeedsPermission,
+    CheckpointDue,
+    Idle,
+    Working,
+    Stopping,
+    Killing,
+    Stopped,
+    Killed,
+    Completed,
+    Failed,
+    FailedOrOrphaned,
+    Blocked,
+    BlockedByPolicy,
+    LowConfidence,
+    NeedsRuntimeReconcile,
+    CleanupObserved,
+    ClaudeReady,
+    AwaitingObservation,
+    Terminal,
+    ReportReady,
+    Other(String),
+}
+
+impl ProjectionStatus {
+    pub(crate) fn as_str(&self) -> &str {
+        match self {
+            Self::None => "none",
+            Self::Unknown => "unknown",
+            Self::Starting => "starting",
+            Self::PromptPending => "prompt_pending",
+            Self::WaitingInput => "waiting_input",
+            Self::NeedsPermission => "needs_permission",
+            Self::CheckpointDue => "checkpoint_due",
+            Self::Idle => "idle",
+            Self::Working => "working",
+            Self::Stopping => "stopping",
+            Self::Killing => "killing",
+            Self::Stopped => "stopped",
+            Self::Killed => "killed",
+            Self::Completed => "completed",
+            Self::Failed => "failed",
+            Self::FailedOrOrphaned => "failed_or_orphaned",
+            Self::Blocked => "blocked",
+            Self::BlockedByPolicy => "blocked_by_policy",
+            Self::LowConfidence => "low_confidence",
+            Self::NeedsRuntimeReconcile => "needs_runtime_reconcile",
+            Self::CleanupObserved => "cleanup_observed",
+            Self::ClaudeReady => "claude_ready",
+            Self::AwaitingObservation => "awaiting_observation",
+            Self::Terminal => "terminal",
+            Self::ReportReady => "report_ready",
+            Self::Other(value) => value.as_str(),
+        }
+    }
+
+    pub(crate) fn contains(&self, needle: &str) -> bool {
+        self.as_str().contains(needle)
+    }
+}
+
+impl From<&str> for ProjectionStatus {
+    fn from(value: &str) -> Self {
+        match value {
+            "none" => Self::None,
+            "unknown" => Self::Unknown,
+            "starting" => Self::Starting,
+            "prompt_pending" => Self::PromptPending,
+            "waiting_input" => Self::WaitingInput,
+            "needs_permission" => Self::NeedsPermission,
+            "checkpoint_due" => Self::CheckpointDue,
+            "idle" => Self::Idle,
+            "working" => Self::Working,
+            "stopping" => Self::Stopping,
+            "killing" => Self::Killing,
+            "stopped" => Self::Stopped,
+            "killed" => Self::Killed,
+            "completed" => Self::Completed,
+            "failed" => Self::Failed,
+            "failed_or_orphaned" => Self::FailedOrOrphaned,
+            "blocked" => Self::Blocked,
+            "blocked_by_policy" => Self::BlockedByPolicy,
+            "low_confidence" => Self::LowConfidence,
+            "needs_runtime_reconcile" => Self::NeedsRuntimeReconcile,
+            "cleanup_observed" => Self::CleanupObserved,
+            "claude_ready" => Self::ClaudeReady,
+            "awaiting_observation" => Self::AwaitingObservation,
+            "terminal" => Self::Terminal,
+            "report_ready" => Self::ReportReady,
+            other => Self::Other(other.to_string()),
+        }
+    }
+}
+
+impl From<String> for ProjectionStatus {
+    fn from(value: String) -> Self {
+        Self::from(value.as_str())
+    }
+}
+
+impl PartialEq<&str> for ProjectionStatus {
+    fn eq(&self, other: &&str) -> bool {
+        self.as_str() == *other
+    }
+}
+
+impl fmt::Display for ProjectionStatus {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
+impl Serialize for ProjectionStatus {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_str(self.as_str())
+    }
+}
+
+impl<'de> Deserialize<'de> for ProjectionStatus {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        String::deserialize(deserializer).map(Self::from)
+    }
+}
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub(crate) struct SessionProjectionV1 {
@@ -20,15 +157,15 @@ pub(crate) struct SessionProjectionV1 {
     pub(crate) workspace: String,
     pub(crate) claude_cwd: String,
     pub(crate) runtime: String,
-    pub(crate) liveness_status: String,
-    pub(crate) turn_status: String,
-    pub(crate) attention_status: String,
+    pub(crate) liveness_status: ProjectionStatus,
+    pub(crate) turn_status: ProjectionStatus,
+    pub(crate) attention_status: ProjectionStatus,
     pub(crate) needs_attention: bool,
     pub(crate) current_task: String,
     pub(crate) pending_interaction: Value,
     pub(crate) last_progress_age_seconds: u64,
     pub(crate) last_progress_brief: Option<String>,
-    pub(crate) patience_status: String,
+    pub(crate) patience_status: ProjectionStatus,
     pub(crate) suggested_wait_seconds: u64,
     pub(crate) next_recommended_action: String,
     pub(crate) files_written_count: usize,
@@ -77,15 +214,15 @@ pub(crate) fn default_session_projection(session: &SessionInfo) -> SessionProjec
         workspace: session.cwd.clone(),
         claude_cwd: session.cwd.clone(),
         runtime: "pty".to_string(),
-        liveness_status: session.status.clone(),
-        turn_status: "unknown".to_string(),
-        attention_status: "none".to_string(),
+        liveness_status: session.status.clone().into(),
+        turn_status: "unknown".into(),
+        attention_status: "none".into(),
         needs_attention: false,
         current_task: String::new(),
         pending_interaction: serde_json::json!(null),
         last_progress_age_seconds: 0,
         last_progress_brief: None,
-        patience_status: "unknown".to_string(),
+        patience_status: "unknown".into(),
         suggested_wait_seconds: 60,
         next_recommended_action: "inspect_summary".to_string(),
         files_written_count: 0,
@@ -118,15 +255,15 @@ pub(crate) fn stale_projection_for_session_name(session_name: &str) -> SessionPr
         workspace: String::new(),
         claude_cwd: String::new(),
         runtime: "unknown".to_string(),
-        liveness_status: "unknown".to_string(),
-        turn_status: "unknown".to_string(),
-        attention_status: "low_confidence".to_string(),
+        liveness_status: "unknown".into(),
+        turn_status: "unknown".into(),
+        attention_status: "low_confidence".into(),
         needs_attention: true,
         current_task: String::new(),
         pending_interaction: serde_json::json!(null),
         last_progress_age_seconds: 0,
         last_progress_brief: None,
-        patience_status: "unknown".to_string(),
+        patience_status: "unknown".into(),
         suggested_wait_seconds: 0,
         next_recommended_action: "inspect_session_debug".to_string(),
         files_written_count: 0,
@@ -154,7 +291,7 @@ pub(crate) fn bootstrap_stale_projection_from_existing_session(
     projection.workspace = session.cwd.display().to_string();
     projection.claude_cwd = session.cwd.display().to_string();
     projection.runtime = "pty".to_string();
-    projection.liveness_status = session.status.lock().unwrap().clone();
+    projection.liveness_status = session.status.lock().unwrap().clone().into();
     projection
 }
 
@@ -244,17 +381,17 @@ pub(crate) fn apply_event_to_projection(
         }
         "pty.stop_requested" => {
             projection.stop_intent = Some("stop".to_string());
-            projection.liveness_status = "stopping".to_string();
-            projection.turn_status = "awaiting_observation".to_string();
-            projection.attention_status = "none".to_string();
+            projection.liveness_status = "stopping".into();
+            projection.turn_status = "awaiting_observation".into();
+            projection.attention_status = "none".into();
             projection.needs_attention = false;
             projection.last_progress_brief = Some(event.message.clone());
         }
         "pty.kill_requested" => {
             projection.stop_intent = Some("kill".to_string());
-            projection.liveness_status = "killing".to_string();
-            projection.turn_status = "awaiting_observation".to_string();
-            projection.attention_status = "none".to_string();
+            projection.liveness_status = "killing".into();
+            projection.turn_status = "awaiting_observation".into();
+            projection.attention_status = "none".into();
             projection.needs_attention = false;
             projection.last_progress_brief = Some(event.message.clone());
         }
@@ -280,8 +417,8 @@ pub(crate) fn apply_event_to_projection(
     if should_bump_control_epoch(
         &projection,
         event,
-        &previous_liveness_status,
-        &previous_attention_status,
+        previous_liveness_status.as_str(),
+        previous_attention_status.as_str(),
         previous_report_ready,
         previous_terminal,
     ) {
@@ -390,9 +527,9 @@ fn reduce_session_start_event(projection: &mut SessionProjectionV1, event: &Even
     projection.terminal_global_seq = None;
     projection.terminal_reason = None;
     projection.stop_intent = None;
-    projection.liveness_status = "starting".to_string();
-    projection.turn_status = "starting".to_string();
-    projection.attention_status = "none".to_string();
+    projection.liveness_status = "starting".into();
+    projection.turn_status = "starting".into();
+    projection.attention_status = "none".into();
     projection.needs_attention = false;
     projection.last_progress_brief = Some(event.message.clone());
     if let Some(target_workspace) = event
@@ -414,11 +551,11 @@ fn reduce_command_progress_event(projection: &mut SessionProjectionV1, event: &E
         projection.liveness_status.as_str(),
         "working" | "waiting_input"
     ) {
-        projection.liveness_status = "prompt_pending".to_string();
-        projection.turn_status = "prompt_pending".to_string();
+        projection.liveness_status = "prompt_pending".into();
+        projection.turn_status = "prompt_pending".into();
         projection.next_recommended_action = "wait_for_daemon_prompt_commit".to_string();
     }
-    projection.attention_status = "none".to_string();
+    projection.attention_status = "none".into();
     projection.needs_attention = false;
     projection.last_progress_brief = Some(event.message.clone());
 }
@@ -429,19 +566,19 @@ fn reduce_command_awaiting_event(projection: &mut SessionProjectionV1, event: &E
         projection.liveness_status.as_str(),
         "working" | "waiting_input"
     ) {
-        projection.liveness_status = "prompt_pending".to_string();
+        projection.liveness_status = "prompt_pending".into();
         projection.next_recommended_action = "wait_for_daemon_prompt_commit".to_string();
     }
-    projection.turn_status = "awaiting_observation".to_string();
-    projection.attention_status = "none".to_string();
+    projection.turn_status = "awaiting_observation".into();
+    projection.attention_status = "none".into();
     projection.needs_attention = false;
     projection.last_progress_brief = Some(event.message.clone());
 }
 
 fn reduce_cleanup_event(projection: &mut SessionProjectionV1, event: &EventEnvelopeV1) {
     if !projection.terminal {
-        projection.liveness_status = "cleanup_observed".to_string();
-        projection.attention_status = "needs_runtime_reconcile".to_string();
+        projection.liveness_status = "cleanup_observed".into();
+        projection.attention_status = "needs_runtime_reconcile".into();
         projection.needs_attention = true;
         projection.next_recommended_action = "inspect_runtime_health".to_string();
     }
@@ -453,9 +590,9 @@ fn reduce_runtime_failure_event(projection: &mut SessionProjectionV1, event: &Ev
     projection.terminal_event_id = Some(event.event_id.clone());
     projection.terminal_global_seq = Some(event.global_seq);
     projection.terminal_reason = Some(event.event_type.clone());
-    projection.liveness_status = "failed_or_orphaned".to_string();
-    projection.turn_status = "terminal".to_string();
-    projection.attention_status = "failed".to_string();
+    projection.liveness_status = "failed_or_orphaned".into();
+    projection.turn_status = "terminal".into();
+    projection.attention_status = "failed".into();
     projection.needs_attention = true;
     projection.last_error_brief = Some(
         event
@@ -470,7 +607,7 @@ fn reduce_runtime_failure_event(projection: &mut SessionProjectionV1, event: &Ev
 }
 
 fn reduce_policy_event(projection: &mut SessionProjectionV1, event: &EventEnvelopeV1) {
-    projection.attention_status = "blocked_by_policy".to_string();
+    projection.attention_status = "blocked_by_policy".into();
     projection.needs_attention = true;
     projection.last_error_brief = Some(event.message.clone());
 }
@@ -483,8 +620,8 @@ fn reduce_hook_event(projection: &mut SessionProjectionV1, event: &EventEnvelope
         .and_then(Value::as_bool)
         == Some(false)
     {
-        projection.liveness_status = "blocked".to_string();
-        projection.attention_status = "blocked_by_policy".to_string();
+        projection.liveness_status = "blocked".into();
+        projection.attention_status = "blocked_by_policy".into();
         projection.needs_attention = true;
         projection.last_error_brief = Some(
             event
@@ -500,9 +637,9 @@ fn reduce_hook_event(projection: &mut SessionProjectionV1, event: &EventEnvelope
         return;
     }
     if event.event_type == "hook.SessionStart" {
-        projection.liveness_status = "prompt_pending".to_string();
-        projection.turn_status = "claude_ready".to_string();
-        projection.attention_status = "none".to_string();
+        projection.liveness_status = "prompt_pending".into();
+        projection.turn_status = "claude_ready".into();
+        projection.attention_status = "none".into();
         projection.needs_attention = false;
         projection.next_recommended_action = "wait_for_daemon_prompt_commit".to_string();
         projection.last_progress_brief = Some(event.message.clone());
@@ -512,9 +649,9 @@ fn reduce_hook_event(projection: &mut SessionProjectionV1, event: &EventEnvelope
         return;
     }
     if event.event_type == "hook.UserPromptSubmit" {
-        projection.liveness_status = "working".to_string();
-        projection.turn_status = "working".to_string();
-        projection.attention_status = "none".to_string();
+        projection.liveness_status = "working".into();
+        projection.turn_status = "working".into();
+        projection.attention_status = "none".into();
         projection.needs_attention = false;
         projection.next_recommended_action = "wait_or_request_report".to_string();
         projection.last_progress_brief = Some(event.message.clone());
@@ -532,14 +669,14 @@ fn reduce_hook_event(projection: &mut SessionProjectionV1, event: &EventEnvelope
         "idle" => "idle",
         _ => "working",
     }
-    .to_string();
+    .into();
     projection.attention_status = match status {
         "needs_permission" => "needs_permission",
         "waiting_input" => "waiting_input",
         "checkpoint_due" => "checkpoint_due",
         _ => "none",
     }
-    .to_string();
+    .into();
     projection.needs_attention = projection.attention_status != "none";
     projection.last_progress_brief = Some(event.message.clone());
     if let Some(cwd) = event.payload.get("workspace").and_then(Value::as_str) {
@@ -548,8 +685,8 @@ fn reduce_hook_event(projection: &mut SessionProjectionV1, event: &EventEnvelope
     if hook_event_marks_report_ready(event) {
         projection.report_ready = true;
         projection.files_written_count = projection.files_written_count.saturating_add(1).max(1);
-        projection.liveness_status = "idle".to_string();
-        projection.attention_status = "report_ready".to_string();
+        projection.liveness_status = "idle".into();
+        projection.attention_status = "report_ready".into();
         projection.needs_attention = true;
         projection.next_recommended_action = "accept_report_or_stop_worker".to_string();
         projection.last_progress_brief = Some("Worker wrote the requested report.".to_string());
@@ -642,29 +779,29 @@ fn apply_terminal_event(projection: &mut SessionProjectionV1, event: &EventEnvel
     projection.terminal_event_id = Some(event.event_id.clone());
     projection.terminal_global_seq = Some(event.global_seq);
     projection.terminal_reason = Some(event.event_type.clone());
-    projection.turn_status = "terminal".to_string();
+    projection.turn_status = "terminal".into();
     projection.last_progress_brief = Some(event.message.clone());
 
     match projection.stop_intent.as_deref() {
         Some("kill") => {
-            projection.liveness_status = "killed".to_string();
-            projection.attention_status = "none".to_string();
+            projection.liveness_status = "killed".into();
+            projection.attention_status = "none".into();
             projection.needs_attention = false;
         }
         Some("stop") => {
-            projection.liveness_status = "stopped".to_string();
-            projection.attention_status = "none".to_string();
+            projection.liveness_status = "stopped".into();
+            projection.attention_status = "none".into();
             projection.needs_attention = false;
         }
         _ if terminal_exit_code(event).is_some_and(|code| code != 0) => {
-            projection.liveness_status = "failed".to_string();
-            projection.attention_status = "failed".to_string();
+            projection.liveness_status = "failed".into();
+            projection.attention_status = "failed".into();
             projection.needs_attention = true;
             projection.next_recommended_action = "inspect_failure_or_restart_worker".to_string();
         }
         _ => {
-            projection.liveness_status = "completed".to_string();
-            projection.attention_status = "none".to_string();
+            projection.liveness_status = "completed".into();
+            projection.attention_status = "none".into();
             projection.needs_attention = false;
         }
     }

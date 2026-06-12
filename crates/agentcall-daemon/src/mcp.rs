@@ -4,6 +4,8 @@ use crate::confidence::attach_confidence_to_reports;
 use crate::control::{
     control_summary_for_session, destructive_action_requires_control, validate_control_token,
 };
+use crate::crypto::sha256_hex;
+use crate::errors::error_value;
 use crate::events::EventEnvelopeV1;
 use crate::hooks::{policy_denials_state, runtime_bindings_state};
 use crate::projection::session_projection_summary;
@@ -142,6 +144,7 @@ pub(crate) fn mcp_call(state: &Arc<AppState>, req: McpCallRequest) -> Result<Val
         other => Err(format!("unknown daemon MCP tool: {other}")),
     };
     let status = if result.is_ok() { "ok" } else { "error" };
+    let error = result.as_ref().err().map(|message| error_value(message));
     let message = result.as_ref().err().map(String::as_str).unwrap_or("");
     let event_message = if message.is_empty() {
         format!("MCP tool {} completed.", req.name)
@@ -157,7 +160,8 @@ pub(crate) fn mcp_call(state: &Arc<AppState>, req: McpCallRequest) -> Result<Val
             "status": status,
             "arguments": redact_mcp_arguments(&args),
             "runtime": "daemon_mcp_bridge",
-            "error": message,
+            "error": error.unwrap_or(Value::Null),
+            "error_message": message,
         }),
     );
     result
@@ -1659,12 +1663,7 @@ fn idempotency_key_part(value: &str, max_chars: usize) -> String {
 }
 
 fn stable_hash_hex(value: &str) -> String {
-    let mut hash = 0xcbf29ce484222325u64;
-    for byte in value.as_bytes() {
-        hash ^= *byte as u64;
-        hash = hash.wrapping_mul(0x100000001b3);
-    }
-    format!("{hash:016x}")
+    sha256_hex(value)
 }
 
 fn looks_like_menu_prompt(clean_output: &str) -> bool {

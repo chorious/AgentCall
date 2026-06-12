@@ -74,11 +74,43 @@ impl ProcessHandle {
                 }
             }
         }
+        #[cfg(windows)]
+        if let Some(pid) = self.child_pid {
+            let output = std::process::Command::new("taskkill")
+                .args(["/PID", &pid.to_string(), "/T", "/F"])
+                .output();
+            return match output {
+                Ok(output) if output.status.success() => KillResult {
+                    requested: true,
+                    child_pid: self.child_pid,
+                    controller: ProcessControllerKind::PortablePtyBestEffort,
+                    cleanup_guarantee: "windows_taskkill_tree_fallback",
+                    fallback_used: true,
+                    error: None,
+                },
+                Ok(output) => KillResult {
+                    requested: false,
+                    child_pid: self.child_pid,
+                    controller: ProcessControllerKind::PortablePtyBestEffort,
+                    cleanup_guarantee: "windows_taskkill_tree_failed",
+                    fallback_used: true,
+                    error: Some(String::from_utf8_lossy(&output.stderr).trim().to_string()),
+                },
+                Err(err) => KillResult {
+                    requested: false,
+                    child_pid: self.child_pid,
+                    controller: ProcessControllerKind::PortablePtyBestEffort,
+                    cleanup_guarantee: "windows_taskkill_tree_spawn_failed",
+                    fallback_used: true,
+                    error: Some(err.to_string()),
+                },
+            };
+        }
         KillResult {
-            requested: true,
+            requested: self.child_pid.is_some(),
             child_pid: self.child_pid,
             controller: ProcessControllerKind::PortablePtyBestEffort,
-            cleanup_guarantee: "best_effort_parent_kill_only",
+            cleanup_guarantee: "best_effort_no_process_controller",
             fallback_used: true,
             error: None,
         }
@@ -107,8 +139,13 @@ struct WindowsJobHandle {
 struct WindowsJobHandle;
 
 #[cfg(windows)]
+// SAFETY: WindowsJobHandle owns an OS handle value and only exposes operations
+// that call Win32 APIs with that handle. The handle is closed exactly once in
+// Drop, and no borrowed Rust data is shared through it.
 unsafe impl Send for WindowsJobHandle {}
 #[cfg(windows)]
+// SAFETY: The underlying Win32 job handle can be used from multiple threads by
+// the OS. Methods take &self and do not mutate Rust-owned memory.
 unsafe impl Sync for WindowsJobHandle {}
 
 #[cfg(windows)]
@@ -202,9 +239,12 @@ mod tests {
             ProcessControllerKind::PortablePtyBestEffort
         );
         let result = handle.kill_tree();
-        assert!(result.requested);
+        assert!(!result.requested);
         assert!(result.fallback_used);
-        assert_eq!(result.cleanup_guarantee, "best_effort_parent_kill_only");
+        assert_eq!(
+            result.cleanup_guarantee,
+            "best_effort_no_process_controller"
+        );
     }
 
     #[cfg(windows)]

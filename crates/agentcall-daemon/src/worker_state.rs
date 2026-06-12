@@ -57,6 +57,99 @@ impl WorkerStateKind {
             Self::Failed => "failed",
         }
     }
+
+    pub(crate) fn is_terminal(&self) -> bool {
+        matches!(
+            self,
+            Self::ReportAccepted | Self::Done | Self::Failed | Self::ReportReady
+        )
+    }
+}
+
+#[allow(dead_code)]
+pub(crate) fn worker_transition_allowed(from: &WorkerStateKind, to: &WorkerStateKind) -> bool {
+    if from == to {
+        return true;
+    }
+    match from {
+        WorkerStateKind::Starting => matches!(
+            to,
+            WorkerStateKind::PromptPending
+                | WorkerStateKind::PromptMissing
+                | WorkerStateKind::PromptSubmitted
+                | WorkerStateKind::Working
+                | WorkerStateKind::Failed
+                | WorkerStateKind::Done
+        ),
+        WorkerStateKind::PromptPending => matches!(
+            to,
+            WorkerStateKind::PromptCommitUnacknowledged
+                | WorkerStateKind::PromptMissing
+                | WorkerStateKind::PromptSubmitted
+                | WorkerStateKind::Working
+                | WorkerStateKind::Failed
+                | WorkerStateKind::Done
+        ),
+        WorkerStateKind::PromptMissing | WorkerStateKind::PromptCommitUnacknowledged => {
+            matches!(
+                to,
+                WorkerStateKind::PromptPending
+                    | WorkerStateKind::PromptSubmitted
+                    | WorkerStateKind::Working
+                    | WorkerStateKind::Stopping
+                    | WorkerStateKind::Failed
+                    | WorkerStateKind::Done
+            )
+        }
+        WorkerStateKind::PromptSubmitted
+        | WorkerStateKind::Working
+        | WorkerStateKind::IdleAfterTurn
+        | WorkerStateKind::NeedsPermission
+        | WorkerStateKind::BlockedByPolicy
+        | WorkerStateKind::CheckpointDue => matches!(
+            to,
+            WorkerStateKind::Working
+                | WorkerStateKind::IdleAfterTurn
+                | WorkerStateKind::NeedsPermission
+                | WorkerStateKind::BlockedByPolicy
+                | WorkerStateKind::CheckpointDue
+                | WorkerStateKind::ReportRequested
+                | WorkerStateKind::ReportDrafting
+                | WorkerStateKind::ReportReady
+                | WorkerStateKind::ReportOverdue
+                | WorkerStateKind::Stopping
+                | WorkerStateKind::Failed
+                | WorkerStateKind::Done
+        ),
+        WorkerStateKind::ReportRequested | WorkerStateKind::ReportDrafting => matches!(
+            to,
+            WorkerStateKind::ReportDrafting
+                | WorkerStateKind::ReportReady
+                | WorkerStateKind::ReportOverdue
+                | WorkerStateKind::Stopping
+                | WorkerStateKind::Failed
+                | WorkerStateKind::Done
+        ),
+        WorkerStateKind::ReportOverdue => matches!(
+            to,
+            WorkerStateKind::ReportReady
+                | WorkerStateKind::Stopping
+                | WorkerStateKind::Failed
+                | WorkerStateKind::Done
+        ),
+        WorkerStateKind::ReportReady => matches!(
+            to,
+            WorkerStateKind::ReportAccepted | WorkerStateKind::Stopping | WorkerStateKind::Done
+        ),
+        WorkerStateKind::ReportAccepted => {
+            matches!(to, WorkerStateKind::Stopping | WorkerStateKind::Done)
+        }
+        WorkerStateKind::Stopping => matches!(
+            to,
+            WorkerStateKind::Done | WorkerStateKind::Failed | WorkerStateKind::Stopping
+        ),
+        WorkerStateKind::Done | WorkerStateKind::Failed => to.is_terminal(),
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -529,11 +622,16 @@ fn actions_for_state(
             vec![
                 action(
                     session_name,
-                    "submit_pending_prompt",
+                    WorkerActionKind::SubmitPendingPrompt,
                     "agentcall_session_send",
                     false,
                 ),
-                action(session_name, "stop", "agentcall_session_send", true),
+                action(
+                    session_name,
+                    WorkerActionKind::Stop,
+                    "agentcall_session_send",
+                    true,
+                ),
             ],
         ),
         WorkerStateKind::PromptCommitUnacknowledged => (
@@ -542,11 +640,16 @@ fn actions_for_state(
             vec![
                 action(
                     session_name,
-                    "submit_pending_prompt",
+                    WorkerActionKind::SubmitPendingPrompt,
                     "agentcall_session_send",
                     false,
                 ),
-                action(session_name, "stop", "agentcall_session_send", true),
+                action(
+                    session_name,
+                    WorkerActionKind::Stop,
+                    "agentcall_session_send",
+                    true,
+                ),
             ],
         ),
         WorkerStateKind::PromptPending
@@ -561,7 +664,7 @@ fn actions_for_state(
         WorkerStateKind::IdleAfterTurn => (
             action(
                 session_name,
-                "request_report",
+                WorkerActionKind::RequestReport,
                 "agentcall_session_send",
                 false,
             ),
@@ -573,7 +676,7 @@ fn actions_for_state(
             vec![],
             vec![action(
                 session_name,
-                "interrupt",
+                WorkerActionKind::Interrupt,
                 "agentcall_session_send",
                 true,
             )],
@@ -581,21 +684,31 @@ fn actions_for_state(
         WorkerStateKind::BlockedByPolicy => (
             action(
                 session_name,
-                "request_report",
+                WorkerActionKind::RequestReport,
                 "agentcall_session_send",
                 false,
             ),
             vec![],
             vec![
-                action(session_name, "interrupt", "agentcall_session_send", true),
-                action(session_name, "stop", "agentcall_session_send", true),
+                action(
+                    session_name,
+                    WorkerActionKind::Interrupt,
+                    "agentcall_session_send",
+                    true,
+                ),
+                action(
+                    session_name,
+                    WorkerActionKind::Stop,
+                    "agentcall_session_send",
+                    true,
+                ),
             ],
         ),
         WorkerStateKind::CheckpointDue => (
             json!({"kind": "inspect_or_accept_report"}),
             vec![action(
                 session_name,
-                "request_report",
+                WorkerActionKind::RequestReport,
                 "agentcall_session_send",
                 false,
             )],
@@ -610,17 +723,37 @@ fn actions_for_state(
             json!({"kind": "inspect_session"}),
             vec![],
             vec![
-                action(session_name, "interrupt", "agentcall_session_send", true),
-                action(session_name, "stop", "agentcall_session_send", true),
+                action(
+                    session_name,
+                    WorkerActionKind::Interrupt,
+                    "agentcall_session_send",
+                    true,
+                ),
+                action(
+                    session_name,
+                    WorkerActionKind::Stop,
+                    "agentcall_session_send",
+                    true,
+                ),
             ],
         ),
         WorkerStateKind::ReportReady => (
             json!({"kind": "accept_report", "tool": "agentcall_report", "args": {"action": "accept", "session_id": session_name}}),
             vec![],
-            vec![action(session_name, "stop", "agentcall_session_send", true)],
+            vec![action(
+                session_name,
+                WorkerActionKind::Stop,
+                "agentcall_session_send",
+                true,
+            )],
         ),
         WorkerStateKind::ReportAccepted => (
-            action(session_name, "stop", "agentcall_session_send", true),
+            action(
+                session_name,
+                WorkerActionKind::Stop,
+                "agentcall_session_send",
+                true,
+            ),
             vec![],
             vec![],
         ),
@@ -636,7 +769,12 @@ fn actions_for_state(
             }
         }
         WorkerStateKind::Failed => (
-            action(session_name, "kill", "agentcall_session_send", true),
+            action(
+                session_name,
+                WorkerActionKind::Kill,
+                "agentcall_session_send",
+                true,
+            ),
             vec![],
             vec![],
         ),
@@ -675,7 +813,29 @@ fn pending_interaction_for_state(state: &WorkerStateKind, why: &str) -> Value {
     }
 }
 
-fn action(session_name: &str, kind: &str, tool: &str, requires_control: bool) -> Value {
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum WorkerActionKind {
+    RequestReport,
+    SubmitPendingPrompt,
+    Interrupt,
+    Stop,
+    Kill,
+}
+
+impl WorkerActionKind {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::RequestReport => "request_report",
+            Self::SubmitPendingPrompt => "submit_pending_prompt",
+            Self::Interrupt => "interrupt",
+            Self::Stop => "stop",
+            Self::Kill => "kill",
+        }
+    }
+}
+
+fn action(session_name: &str, kind: WorkerActionKind, tool: &str, requires_control: bool) -> Value {
+    let kind = kind.as_str();
     json!({
         "kind": kind,
         "tool": tool,
@@ -685,4 +845,41 @@ fn action(session_name: &str, kind: &str, tool: &str, requires_control: bool) ->
         },
         "requires_control_token": requires_control,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn worker_transition_table_allows_expected_report_flow() {
+        assert!(worker_transition_allowed(
+            &WorkerStateKind::Working,
+            &WorkerStateKind::ReportRequested
+        ));
+        assert!(worker_transition_allowed(
+            &WorkerStateKind::ReportRequested,
+            &WorkerStateKind::ReportDrafting
+        ));
+        assert!(worker_transition_allowed(
+            &WorkerStateKind::ReportDrafting,
+            &WorkerStateKind::ReportReady
+        ));
+        assert!(worker_transition_allowed(
+            &WorkerStateKind::ReportReady,
+            &WorkerStateKind::ReportAccepted
+        ));
+    }
+
+    #[test]
+    fn worker_transition_table_rejects_terminal_regression() {
+        assert!(!worker_transition_allowed(
+            &WorkerStateKind::Done,
+            &WorkerStateKind::Working
+        ));
+        assert!(!worker_transition_allowed(
+            &WorkerStateKind::Failed,
+            &WorkerStateKind::ReportDrafting
+        ));
+    }
 }

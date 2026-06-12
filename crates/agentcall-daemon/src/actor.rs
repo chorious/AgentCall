@@ -1,6 +1,7 @@
 use crate::commands::{CommandEnvelopeV1, CommandType};
 use crate::control::{command_type_needs_actor_revalidation, validate_envelope_control_at_actor};
-use crate::hooks::queue_supervisor_instruction;
+use crate::hooks::{cleanup_wrapper_session, queue_supervisor_instruction};
+use crate::ownership::{release_owner_lease, release_workspace_lease};
 use crate::session::{Session, kill_session, request_stop_session};
 use crate::state::{AppState, append_agent_event, complete_command_event};
 use crate::store::CommandStatus;
@@ -93,7 +94,31 @@ fn run_session_actor_with_panic_guard(
             "Session actor panicked.",
             "actor panic",
         );
+        terminalize_actor_failure_session(&actor_state, &actor_session_id, "actor_panic");
     }
+}
+
+fn terminalize_actor_failure_session(state: &AppState, session_id: &str, reason: &str) {
+    state.actors.lock().unwrap().remove(session_id);
+    if let Some(session) = state.sessions.lock().unwrap().get(session_id).cloned() {
+        *session.status.lock().unwrap() = "failed".to_string();
+        session
+            .updated_at
+            .store(crate::util::now_ms(), std::sync::atomic::Ordering::Relaxed);
+    }
+    let _ = release_owner_lease(state, session_id, reason);
+    let _ = release_workspace_lease(state, session_id, reason);
+    let _ = cleanup_wrapper_session(state, session_id, reason);
+    append_agent_event(
+        state,
+        "session.actor_cleanup",
+        "Session actor failure cleanup completed.",
+        json!({
+            "session_id": session_id,
+            "reason": reason,
+            "lease_release": "attempted"
+        }),
+    );
 }
 
 pub(crate) fn submit_session_command(
@@ -237,7 +262,7 @@ fn execute_command(
                     "lease_generation": command.lease_generation,
                     "control_epoch": command.control_epoch,
                     "control_token_hash": command.control_token_hash,
-                    "status": err.status,
+                    "status": err.status.as_str(),
                     "reason": err.reason,
                     "current": err.current
                 }),
