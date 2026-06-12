@@ -336,7 +336,11 @@ fn workspace_projection(state: &AppState, route: Option<&Value>) -> Value {
             route
                 .and_then(|route| route.pointer("/result/report/abs_path"))
                 .and_then(Value::as_str)
-                .and_then(|path| PathBuf::from(path).parent().map(|parent| parent.display().to_string()))
+                .and_then(|path| {
+                    PathBuf::from(path)
+                        .parent()
+                        .map(|parent| parent.display().to_string())
+                })
         });
     json!({
         "daemon": state.workspace.display().to_string(),
@@ -373,7 +377,9 @@ fn report_projection_from_route(route: Option<&Value>) -> Value {
         report["ready"] = json!(false);
     }
     if report.get("path").is_none() {
-        report["path"] = route_report_path(route).map(Value::String).unwrap_or(Value::Null);
+        report["path"] = route_report_path(route)
+            .map(Value::String)
+            .unwrap_or(Value::Null);
     }
     if report.get("rel_path").is_none() {
         report["rel_path"] = report.get("path").cloned().unwrap_or(Value::Null);
@@ -393,7 +399,11 @@ fn route_report_path(route: &Value) -> Option<String> {
                 .pointer("/result/context_packet/report_path")
                 .and_then(Value::as_str)
         })
-        .or_else(|| route.pointer("/result/prompt_gate/report_path").and_then(Value::as_str))
+        .or_else(|| {
+            route
+                .pointer("/result/prompt_gate/report_path")
+                .and_then(Value::as_str)
+        })
         .or_else(|| route.pointer("/result/report_path").and_then(Value::as_str))
         .filter(|value| !value.trim().is_empty())
         .map(str::to_string)
@@ -492,7 +502,11 @@ fn actions_for_state(
         | WorkerStateKind::Starting
         | WorkerStateKind::PromptSubmitted
         | WorkerStateKind::Working
-        | WorkerStateKind::Stopping => (wait, vec![], vec![json!({"kind": "inspect_events", "view": "events"})]),
+        | WorkerStateKind::Stopping => (
+            wait,
+            vec![],
+            vec![json!({"kind": "inspect_events", "view": "events"})],
+        ),
         WorkerStateKind::IdleAfterTurn => (
             action(
                 session_name,
@@ -506,7 +520,12 @@ fn actions_for_state(
         WorkerStateKind::NeedsPermission => (
             json!({"kind": "select_option", "tool": "agentcall_session_send", "args": {"name": session_name, "action": "select_option"}, "choice_required": true}),
             vec![],
-            vec![action(session_name, "interrupt", "agentcall_session_send", true)],
+            vec![action(
+                session_name,
+                "interrupt",
+                "agentcall_session_send",
+                true,
+            )],
         ),
         WorkerStateKind::BlockedByPolicy => (
             action(
@@ -531,9 +550,11 @@ fn actions_for_state(
             )],
             vec![json!({"kind": "inspect_events", "view": "events"})],
         ),
-        WorkerStateKind::ReportRequested | WorkerStateKind::ReportDrafting => {
-            (wait, vec![], vec![json!({"kind": "inspect_events", "view": "events"})])
-        }
+        WorkerStateKind::ReportRequested | WorkerStateKind::ReportDrafting => (
+            wait,
+            vec![],
+            vec![json!({"kind": "inspect_events", "view": "events"})],
+        ),
         WorkerStateKind::ReportOverdue => (
             json!({"kind": "inspect_session"}),
             vec![],

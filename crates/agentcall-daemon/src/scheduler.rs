@@ -1,3 +1,4 @@
+use crate::errors::structured_error;
 use crate::ownership::{
     owner_lease_is_active, prune_expired_leases, release_orphaned_runtime_leases,
 };
@@ -26,14 +27,16 @@ pub(crate) fn enforce_start_capacity(
     if decision.status == "start_now" {
         return Ok(decision);
     }
-    Err(format!(
-        "{}: {}; active_sessions={}/{} active_owner_sessions={}/{} allow_queue=false",
-        decision.status,
-        decision.reason,
-        decision.active_sessions,
-        decision.max_sessions,
-        decision.active_owner_sessions,
-        decision.per_owner_max_sessions
+    Err(structured_error(
+        "capacity_exceeded",
+        decision.reason.clone(),
+        json!({
+            "active_sessions": decision.active_sessions,
+            "max_sessions": decision.max_sessions,
+            "active_owner_sessions": decision.active_owner_sessions,
+            "per_owner_max_sessions": decision.per_owner_max_sessions,
+            "allow_queue": false,
+        }),
     ))
 }
 
@@ -142,8 +145,9 @@ mod tests {
         insert_lease(&state, "worker-a", "codex");
         insert_lease(&state, "worker-b", "other");
         let err = enforce_start_capacity(&state, "codex").unwrap_err();
-        assert!(err.contains("capacity_exceeded"));
-        assert!(err.contains("allow_queue=false"));
+        let value: Value = serde_json::from_str(&err).unwrap();
+        assert_eq!(value["error"]["code"], "capacity_exceeded");
+        assert_eq!(value["error"]["details"]["allow_queue"], false);
     }
 
     #[test]
@@ -151,8 +155,14 @@ mod tests {
         let state = test_state(Some(10), Some(1));
         insert_lease(&state, "worker-a", "codex");
         let err = enforce_start_capacity(&state, "codex").unwrap_err();
-        assert!(err.contains("owner codex active session cap reached"));
-        assert!(err.contains("allow_queue=false"));
+        let value: Value = serde_json::from_str(&err).unwrap();
+        assert_eq!(value["error"]["code"], "capacity_exceeded");
+        assert!(
+            value["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("owner codex active session cap reached")
+        );
     }
 
     #[test]

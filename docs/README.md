@@ -1,6 +1,6 @@
 # AgentCall Docs
 
-这是 AgentCall 的文档索引。当前主线是 `v5.3.0 checkpoint`：Codex 通过 AgentCall MCP/daemon 指挥 Claude Code PTY utility workers，daemon 负责状态权威、hook-aware projection、bounded write policy 和 compact board。
+这是 AgentCall 的文档索引。当前主线是 `coding/report worker split`：Codex 通过 AgentCall MCP/daemon 指挥 Claude Code PTY utility workers，daemon 负责状态权威、hook-aware projection、bounded write policy、compact board 和结构化安全锁错误。正常 worker 只剩 `coding` 与 `report` 两类；`read_only` route 线已移除。
 
 ## 当前入口
 
@@ -9,6 +9,9 @@
 - [AGENTS.md](../AGENTS.md)
 - [Architecture](architecture.md)
 - [About AgentCall](about.md)
+- [v6.2 Code Plan](v6.2-code-plan.md)
+- [v6.1 Code Plan](v6.1-code-plan.md)
+- [v6.0 Code Plan](v6.0-code-plan.md)
 - [v5.3 Code Plan](v5.3-code-plan.md)
 - [v5.3 Closure Status](reports/v5.3-closure-status.md)
 - [v5 Implementation Deep Audit](reports/v5-implementation-deep-audit.md)

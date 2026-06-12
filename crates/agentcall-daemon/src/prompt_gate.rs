@@ -178,15 +178,12 @@ fn daemon_auto_submit_pending_prompt(
         "idempotency_key": attempt_id,
         "owner_id": "codex"
     });
-    let mut command = match prepare_session_send_command(
-        state,
-        wrapper_session,
-        "submit_pending_prompt",
-        &args,
-    )? {
-        PreparedCommand::Submit(command) => command,
-        PreparedCommand::Deduped(_) => return Ok(()),
-    };
+    let mut command =
+        match prepare_session_send_command(state, wrapper_session, "submit_pending_prompt", &args)?
+        {
+            PreparedCommand::Submit(command) => command,
+            PreparedCommand::Deduped(_) => return Ok(()),
+        };
     command.payload["text"] = json!(" ");
     command.payload["enter"] = json!(true);
     command.payload["attempt_id"] = json!(attempt_id.clone());
@@ -196,7 +193,8 @@ fn daemon_auto_submit_pending_prompt(
         .map(Value::String)
         .unwrap_or(Value::Null);
     let _ = submit_session_command(state, wrapper_session, command)?;
-    let attempts = prompt_commit_attempts_for_session(state, wrapper_session, &attempt_id, sent_at_ms);
+    let attempts =
+        prompt_commit_attempts_for_session(state, wrapper_session, &attempt_id, sent_at_ms);
     patch_route_record(
         state,
         &route_id,

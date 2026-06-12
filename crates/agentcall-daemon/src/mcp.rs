@@ -71,8 +71,7 @@ pub(crate) fn mcp_tools() -> Vec<Value> {
                     "write_paths": {"type": "array", "items": {"type": "string"}, "description": "Paths the worker may modify, plus daemon-minted scratch/report paths."},
                     "reference_paths": {"type": "array", "items": {"type": "string"}, "description": "Recommended read/context paths for the worker. This is not a read permission boundary."},
                     "acceptance_criteria": {"type": "array", "items": {"type": "string"}},
-                    "report_path": {"type": "string"},
-                    "read_only": {"type": "boolean", "default": false}
+                    "report_path": {"type": "string"}
                 },
                 "required": ["objective"],
                 "additionalProperties": false
@@ -204,13 +203,12 @@ fn route_mcp_response(state: &AppState, route: &Value) -> Value {
                 .and_then(Value::as_str)
                 .map(str::to_string)
         });
-    let report = route
-        .pointer("/result/report")
-        .cloned()
-        .unwrap_or_else(|| {
-            let path = route_report_path(route).map(Value::String).unwrap_or(Value::Null);
-            json!({"ready": false, "path": path})
-        });
+    let report = route.pointer("/result/report").cloned().unwrap_or_else(|| {
+        let path = route_report_path(route)
+            .map(Value::String)
+            .unwrap_or(Value::Null);
+        json!({"ready": false, "path": path})
+    });
     if let Some(worker_name) = worker_name {
         let worker = worker_state_for_session(state, &worker_name);
         return json!({
@@ -1390,11 +1388,7 @@ fn inside_patience_window_response(
     ) {
         return None;
     }
-    if worker_state
-        .patience
-        .get("status")
-        .and_then(Value::as_str)
-        != Some("inside_patience_window")
+    if worker_state.patience.get("status").and_then(Value::as_str) != Some("inside_patience_window")
     {
         return None;
     }
@@ -1460,21 +1454,20 @@ fn mark_report_requested(state: &AppState, session_name: &str) -> Result<Value, 
 }
 
 fn report_block_from_route(route: &Value) -> Value {
-    route
-        .pointer("/result/report")
-        .cloned()
-        .unwrap_or_else(|| {
-            let path = route_report_path(route).map(Value::String).unwrap_or(Value::Null);
-            json!({
-                "status": "report_not_requested",
-                "ready": false,
-                "path": path,
-                "rel_path": path,
-                "abs_path": Value::Null,
-                "target_workspace": route.get("workspace").cloned().unwrap_or(Value::Null),
-                "source": "unknown"
-            })
+    route.pointer("/result/report").cloned().unwrap_or_else(|| {
+        let path = route_report_path(route)
+            .map(Value::String)
+            .unwrap_or(Value::Null);
+        json!({
+            "status": "report_not_requested",
+            "ready": false,
+            "path": path,
+            "rel_path": path,
+            "abs_path": Value::Null,
+            "target_workspace": route.get("workspace").cloned().unwrap_or(Value::Null),
+            "source": "unknown"
         })
+    })
 }
 
 fn route_report_path(route: &Value) -> Option<String> {
@@ -1486,7 +1479,11 @@ fn route_report_path(route: &Value) -> Option<String> {
                 .pointer("/result/context_packet/report_path")
                 .and_then(Value::as_str)
         })
-        .or_else(|| route.pointer("/result/prompt_gate/report_path").and_then(Value::as_str))
+        .or_else(|| {
+            route
+                .pointer("/result/prompt_gate/report_path")
+                .and_then(Value::as_str)
+        })
         .or_else(|| route.pointer("/result/report_path").and_then(Value::as_str))
         .filter(|value| !value.trim().is_empty())
         .map(str::to_string)
@@ -2024,6 +2021,7 @@ mod tests {
             "call_id",
             "phase",
             "role",
+            "read_only",
         ] {
             assert!(
                 properties.get(hidden).is_none(),
@@ -2131,7 +2129,7 @@ mod tests {
         let key = first["idempotency_key"].as_str().unwrap();
         assert!(key.starts_with("mcp-worker-a-continue-"));
         assert_eq!(first["idempotency_key"], second["idempotency_key"]);
-        assert_ne!(key, "read-only");
+        assert_ne!(key, "implicit-action");
 
         let with_root = session_send_args_with_default_idempotency(
             &state,
@@ -2251,7 +2249,10 @@ mod tests {
 
         let gate = crate::prompt_gate::refresh_prompt_gate_timeouts_for_session(&state, "worker-a");
 
-        assert_eq!(gate.state, crate::prompt_gate::PromptGateState::CommitSignalSent);
+        assert_eq!(
+            gate.state,
+            crate::prompt_gate::PromptGateState::CommitSignalSent
+        );
         let routes = crate::state::read_json_file(
             &state
                 .workspace
@@ -2711,7 +2712,12 @@ mod tests {
         assert_eq!(report["ready"], false);
         assert_eq!(report["path"], report_rel);
         assert_eq!(report["source"], "daemon_minted");
-        assert!(report["request_id"].as_str().unwrap().starts_with("report-request-route-1-"));
+        assert!(
+            report["request_id"]
+                .as_str()
+                .unwrap()
+                .starts_with("report-request-route-1-")
+        );
         assert!(
             report["deadline_at_ms"].as_u64().unwrap()
                 > report["requested_at_ms"].as_u64().unwrap()

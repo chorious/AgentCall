@@ -760,7 +760,10 @@ pub(crate) fn json_response<T: Serialize>(value: &T) -> Response {
 }
 
 pub(crate) fn error_response(status: u16, message: &str) -> Response {
-    let body = serde_json::to_vec(&serde_json::json!({ "error": message })).unwrap();
+    let value = crate::errors::error_value(message);
+    let status = crate::errors::status_for_error(&value, status);
+    let body = serde_json::to_vec(&value)
+        .unwrap_or_else(|_| b"{\"error\":\"serialization failed\"}".to_vec());
     Response::Fixed {
         status,
         content_type: "application/json; charset=utf-8",
@@ -779,8 +782,11 @@ pub(crate) fn write_fixed(
         400 => "Bad Request",
         401 => "Unauthorized",
         403 => "Forbidden",
-        413 => "Payload Too Large",
         404 => "Not Found",
+        409 => "Conflict",
+        413 => "Payload Too Large",
+        428 => "Precondition Required",
+        429 => "Too Many Requests",
         _ => "Error",
     };
     stream.write_all(
@@ -880,6 +886,38 @@ mod tests {
             Response::Fixed { status, .. } => status,
             _ => panic!("expected fixed response"),
         }
+    }
+
+    fn fixed_json(response: Response) -> serde_json::Value {
+        match response {
+            Response::Fixed { body, .. } => serde_json::from_slice(&body).unwrap(),
+            _ => panic!("expected fixed response"),
+        }
+    }
+
+    #[test]
+    fn structured_safety_error_gets_specific_http_status_and_code() {
+        let response = error_response(
+            400,
+            &crate::errors::structured_error(
+                "workspace_busy",
+                "Workspace has an incompatible active lease.",
+                serde_json::json!({"existing_session": "worker-a"}),
+            ),
+        );
+        assert_eq!(fixed_status(response), 409);
+
+        let body = fixed_json(error_response(
+            400,
+            &crate::errors::structured_error(
+                "workspace_busy",
+                "Workspace has an incompatible active lease.",
+                serde_json::json!({"existing_session": "worker-a"}),
+            ),
+        ));
+        assert_eq!(body["error"]["code"], "workspace_busy");
+        assert_eq!(body["error"]["category"], "safety_lock");
+        assert_eq!(body["error"]["details"]["existing_session"], "worker-a");
     }
 
     #[test]

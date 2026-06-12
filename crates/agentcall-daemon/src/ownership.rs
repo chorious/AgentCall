@@ -1,3 +1,4 @@
+use crate::errors::structured_error;
 use crate::state::{AppState, read_json_file, write_json_file};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -28,7 +29,7 @@ pub(crate) struct OwnerLease {
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub(crate) enum WorkspaceLeaseMode {
     Exclusive,
-    SharedReadonly,
+    SharedReport,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -211,9 +212,14 @@ pub(crate) fn ensure_owner_lease(
     let mut leases = state.owner_leases.lock().unwrap();
     if let Some(existing) = leases.get(session_id) {
         if existing.owner_id != owner_id {
-            return Err(format!(
-                "rejected_owner_conflict: session={session_id} owner={} requested_owner={owner_id}",
-                existing.owner_id
+            return Err(structured_error(
+                "owner_conflict",
+                "Session is already owned by another owner.",
+                json!({
+                    "session_id": session_id,
+                    "existing_owner": existing.owner_id.clone(),
+                    "requested_owner": owner_id,
+                }),
             ));
         }
         if owner_lease_is_active(existing, chrono::Utc::now()) {
@@ -352,19 +358,26 @@ pub(crate) fn reserve_route_leases(
     session_id: &str,
     owner_id: &str,
     workspace: &Path,
-    read_only: bool,
+    shared_report: bool,
 ) -> Result<RouteLeaseReservation, String> {
     prune_expired_leases(state)?;
     let owner_lease = build_owner_lease(session_id, owner_id);
-    let workspace_lease = build_workspace_lease(session_id, owner_id, workspace, read_only);
+    let workspace_lease = build_workspace_lease(session_id, owner_id, workspace, shared_report);
     {
         let now = chrono::Utc::now();
         let owner_leases = state.owner_leases.lock().unwrap();
         if let Some(existing) = owner_leases.get(session_id) {
             if owner_lease_is_active(existing, now) {
-                return Err(format!(
-                    "rejected_existing_owner_lease: session={session_id} owner={}",
-                    existing.owner_id
+                return Err(structured_error(
+                    "owner_lease_exists",
+                    "Session already has an active owner lease.",
+                    json!({
+                        "session_id": session_id,
+                        "owner_id": existing.owner_id.clone(),
+                        "lease_id": existing.lease_id.clone(),
+                        "lease_generation": existing.lease_generation,
+                        "expires_at": existing.expires_at.clone(),
+                    }),
                 ));
             }
         }
@@ -384,11 +397,21 @@ pub(crate) fn reserve_route_leases(
             if existing.mode == WorkspaceLeaseMode::Exclusive
                 || workspace_lease.mode == WorkspaceLeaseMode::Exclusive
             {
-                return Err(format!(
-                    "workspace_busy: workspace={} existing_session={} existing_mode={:?}",
-                    workspace.display(),
-                    existing.session_id,
-                    existing.mode
+                return Err(structured_error(
+                    "workspace_busy",
+                    "Workspace has an incompatible active lease.",
+                    json!({
+                        "workspace": workspace.display().to_string(),
+                        "workspace_key": workspace_lease.workspace_key,
+                        "requested_session": session_id,
+                        "requested_owner": owner_id,
+                        "requested_mode": workspace_lease.mode.clone(),
+                        "existing_session": existing.session_id.clone(),
+                        "existing_owner": existing.owner_id.clone(),
+                        "existing_mode": existing.mode.clone(),
+                        "existing_expires_at": existing.expires_at.clone(),
+                        "suggested_action": "Use report-only shared routing, wait for the existing worker report, or stop/release the stale session explicitly."
+                    }),
                 ));
             }
         }
@@ -449,11 +472,11 @@ pub(crate) fn acquire_workspace_lease(
     state: &AppState,
     session_id: &str,
     workspace: &Path,
-    read_only: bool,
+    shared_report: bool,
 ) -> Result<WorkspaceLease, String> {
     prune_expired_leases(state)?;
-    let mode = if read_only {
-        WorkspaceLeaseMode::SharedReadonly
+    let mode = if shared_report {
+        WorkspaceLeaseMode::SharedReport
     } else {
         WorkspaceLeaseMode::Exclusive
     };
@@ -468,11 +491,20 @@ pub(crate) fn acquire_workspace_lease(
             continue;
         }
         if existing.mode == WorkspaceLeaseMode::Exclusive || mode == WorkspaceLeaseMode::Exclusive {
-            return Err(format!(
-                "workspace_busy: workspace={} existing_session={} existing_mode={:?}",
-                workspace.display(),
-                existing.session_id,
-                existing.mode
+            return Err(structured_error(
+                "workspace_busy",
+                "Workspace has an incompatible active lease.",
+                json!({
+                    "workspace": workspace.display().to_string(),
+                    "workspace_key": workspace_key.clone(),
+                    "requested_session": session_id,
+                    "requested_mode": mode.clone(),
+                    "existing_session": existing.session_id.clone(),
+                    "existing_owner": existing.owner_id.clone(),
+                    "existing_mode": existing.mode.clone(),
+                    "existing_expires_at": existing.expires_at.clone(),
+                    "suggested_action": "Use report-only shared routing, wait for the existing worker report, or stop/release the stale session explicitly."
+                }),
             ));
         }
     }
@@ -523,10 +555,10 @@ fn build_workspace_lease(
     session_id: &str,
     owner_id: &str,
     workspace: &Path,
-    read_only: bool,
+    shared_report: bool,
 ) -> WorkspaceLease {
-    let mode = if read_only {
-        WorkspaceLeaseMode::SharedReadonly
+    let mode = if shared_report {
+        WorkspaceLeaseMode::SharedReport
     } else {
         WorkspaceLeaseMode::Exclusive
     };
@@ -660,14 +692,14 @@ pub(crate) fn workspace_leases_summary(state: &AppState) -> serde_json::Value {
         .iter()
         .filter(|lease| lease.mode == WorkspaceLeaseMode::Exclusive)
         .count();
-    let shared_readonly = active_leases
+    let shared_report = active_leases
         .iter()
-        .filter(|lease| lease.mode == WorkspaceLeaseMode::SharedReadonly)
+        .filter(|lease| lease.mode == WorkspaceLeaseMode::SharedReport)
         .count();
     json!({
         "active": active_leases.len(),
         "exclusive": exclusive,
-        "shared_readonly": shared_readonly,
+        "shared_report": shared_report,
         "workspaces": active_leases.iter().map(|lease| json!({
             "session_id": lease.session_id,
             "workspace": lease.workspace,
@@ -769,13 +801,13 @@ mod tests {
     }
 
     #[test]
-    fn shared_readonly_allows_multiple_readers() {
-        let state = test_state("workspace-readers");
+    fn shared_report_allows_multiple_report_workers() {
+        let state = test_state("workspace-report");
         let workspace = state.workspace.clone();
-        let first = acquire_workspace_lease(&state, "reader-a", &workspace, true).unwrap();
-        let second = acquire_workspace_lease(&state, "reader-b", &workspace, true).unwrap();
-        assert_eq!(first.mode, WorkspaceLeaseMode::SharedReadonly);
-        assert_eq!(second.mode, WorkspaceLeaseMode::SharedReadonly);
+        let first = acquire_workspace_lease(&state, "report-a", &workspace, true).unwrap();
+        let second = acquire_workspace_lease(&state, "report-b", &workspace, true).unwrap();
+        assert_eq!(first.mode, WorkspaceLeaseMode::SharedReport);
+        assert_eq!(second.mode, WorkspaceLeaseMode::SharedReport);
     }
 
     #[test]

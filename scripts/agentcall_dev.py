@@ -79,6 +79,20 @@ def main() -> int:
     release.add_argument("--skip-plugin", action="store_true", help="Skip Codex plugin validation.")
     release.set_defaults(func=cmd_release_check)
 
+    runtime_release = sub.add_parser(
+        "runtime-release",
+        help="Align product version, build, stop stale AgentCall processes, start daemon, and verify live version.",
+    )
+    runtime_release.add_argument("--version", required=True, help="Product version, for example 6.3.0.")
+    runtime_release.add_argument("--release-label", default=None, help="README/docs version label.")
+    runtime_release.add_argument("--daemon-url", default=default_daemon_url(), help="Daemon URL.")
+    runtime_release.add_argument("--skip-tests", action="store_true", help="Skip cargo test and pytest.")
+    runtime_release.add_argument("--skip-release-check", action="store_true", help="Skip release-check.")
+    runtime_release.add_argument("--no-stop-existing", action="store_true", help="Do not stop old daemon/MCP processes.")
+    runtime_release.add_argument("--no-restart", action="store_true", help="Do not start daemon after build.")
+    runtime_release.add_argument("--dry-run", action="store_true", help="Print intended actions without writing.")
+    runtime_release.set_defaults(func=cmd_runtime_release)
+
     smoke = sub.add_parser("smoke", help="Run bounded integration smoke checks.")
     smoke_sub = smoke.add_subparsers(dest="smoke_command", required=True)
     real_worker = smoke_sub.add_parser(
@@ -260,6 +274,32 @@ def cmd_release_check(root: Path, args: argparse.Namespace) -> int:
 
     run_checked(["git", "-C", str(root), "diff", "--check"], root, "git diff whitespace check", env=env, timeout=60)
     print("[OK] release-check completed")
+    return 0
+
+
+def cmd_runtime_release(root: Path, args: argparse.Namespace) -> int:
+    cmd = [
+        sys.executable,
+        str(root / "scripts" / "agentcall_runtime_release.py"),
+        "--root",
+        str(root),
+        "--version",
+        args.version,
+        "--daemon-url",
+        args.daemon_url,
+    ]
+    if args.release_label:
+        cmd.extend(["--release-label", args.release_label])
+    for flag in [
+        "skip_tests",
+        "skip_release_check",
+        "no_stop_existing",
+        "no_restart",
+        "dry_run",
+    ]:
+        if getattr(args, flag):
+            cmd.append("--" + flag.replace("_", "-"))
+    run_checked(cmd, root, "runtime release", timeout=1200)
     return 0
 
 

@@ -18,7 +18,8 @@ use serde_json::{Value, json};
 use std::path::PathBuf;
 use std::sync::Arc;
 
-#[derive(Deserialize)]
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct RouteRequest {
     objective: String,
     workspace: Option<String>,
@@ -40,7 +41,6 @@ pub(crate) struct RouteRequest {
     acceptance_criteria: Option<Vec<String>>,
     persist_context: Option<bool>,
     report_path: Option<String>,
-    read_only: Option<bool>,
     pty_workflow: Option<String>,
     initial_permission_mode: Option<String>,
 }
@@ -440,7 +440,7 @@ fn route_decision(req: &RouteRequest) -> RouteDecision {
                 "decision_model": "pty_only_v3",
                 "requested_runtime": requested,
                 "recommended_runtime": "pty",
-                "worker_kind": "utility",
+                "worker_kind": route_worker_kind_hint(req),
                 "legacy_estimates_ignored": {
                     "estimated_minutes": req.estimated_minutes,
                     "estimated_files": req.estimated_files,
@@ -529,11 +529,7 @@ fn route_report_projection(
     }))
 }
 
-fn route_report_path_warning(
-    state: &AppState,
-    req: &RouteRequest,
-    source: &str,
-) -> Option<Value> {
+fn route_report_path_warning(state: &AppState, req: &RouteRequest, source: &str) -> Option<Value> {
     if source != "caller" {
         return None;
     }
@@ -569,8 +565,16 @@ fn route_report_path_from_value(route: &Value) -> Option<String> {
     route
         .pointer("/result/report/path")
         .and_then(Value::as_str)
-        .or_else(|| route.pointer("/result/context_packet/report_path").and_then(Value::as_str))
-        .or_else(|| route.pointer("/result/prompt_gate/report_path").and_then(Value::as_str))
+        .or_else(|| {
+            route
+                .pointer("/result/context_packet/report_path")
+                .and_then(Value::as_str)
+        })
+        .or_else(|| {
+            route
+                .pointer("/result/prompt_gate/report_path")
+                .and_then(Value::as_str)
+        })
         .or_else(|| route.pointer("/result/report_path").and_then(Value::as_str))
         .filter(|value| !value.trim().is_empty())
         .map(str::to_string)
@@ -638,12 +642,13 @@ fn start_pty_route(
     let containment = pty_containment(state, req, &session_name);
     let target_workspace = route_target_workspace(state, req);
     let schedule = enforce_start_capacity(state, "codex")?;
+    let shared_workspace_lease = route_uses_shared_workspace_lease(state, req);
     let leases = reserve_route_leases(
         state,
         &session_name,
         "codex",
         &target_workspace,
-        req.read_only.unwrap_or(false),
+        shared_workspace_lease,
     )?;
     let session_record = SessionRecord {
         session_id: session_name.clone(),
@@ -702,7 +707,7 @@ fn start_pty_route(
     let permission_mode = pty_initial_permission_mode(req, &workflow);
     record.result = json!({
         "runtime": "pty",
-        "worker_kind": "utility",
+        "worker_kind": route_worker_kind(state, req),
         "pty_workflow": workflow.as_str(),
         "workflow_status": if workflow == PtyWorkflow::PlanThenAuto { "plan_running" } else { "running" },
         "phase": if workflow == PtyWorkflow::PlanThenAuto { "plan" } else { "execute" },
@@ -750,8 +755,92 @@ fn route_target_workspace(state: &AppState, req: &RouteRequest) -> std::path::Pa
         .unwrap_or_else(|| state.workspace.clone())
 }
 
+fn route_uses_shared_workspace_lease(state: &AppState, req: &RouteRequest) -> bool {
+    route_worker_kind(state, req) == "report"
+}
+
+fn route_worker_kind(state: &AppState, req: &RouteRequest) -> &'static str {
+    if route_is_report_only_write(state, req) {
+        "report"
+    } else {
+        "coding"
+    }
+}
+
+fn route_worker_kind_hint(req: &RouteRequest) -> &'static str {
+    if req.write_paths.as_deref().unwrap_or(&[]).is_empty() {
+        "report"
+    } else if req.report_path.is_some()
+        && req
+            .write_paths
+            .as_deref()
+            .unwrap_or(&[])
+            .iter()
+            .all(|path| route_write_path_looks_like_report_scope(path))
+    {
+        "report"
+    } else {
+        "coding"
+    }
+}
+
+fn route_write_path_looks_like_report_scope(path: &str) -> bool {
+    let normalized = path.replace('\\', "/").to_ascii_lowercase();
+    normalized.contains("/.agents/")
+        || normalized.ends_with("/.agents")
+        || normalized == ".agents"
+        || normalized.starts_with(".agents/")
+        || normalized.contains("/.agentcall/")
+        || normalized.ends_with("/.agentcall")
+        || normalized == ".agentcall"
+        || normalized.starts_with(".agentcall/")
+        || normalized.contains("/docs/reports")
+        || normalized == "docs/reports"
+        || normalized.starts_with("docs/reports/")
+        || normalized.ends_with("/docs/report")
+        || normalized == "docs/report"
+}
+
+fn route_is_report_only_write(state: &AppState, req: &RouteRequest) -> bool {
+    let Some(report_path) = req
+        .report_path
+        .as_ref()
+        .filter(|value| !value.trim().is_empty())
+    else {
+        return false;
+    };
+    let write_paths = req.write_paths.as_deref().unwrap_or(&[]);
+    if write_paths.is_empty() {
+        return true;
+    }
+    let target_workspace = route_target_workspace(state, req);
+    let report = normalized_route_path_for_warning(&target_workspace, report_path);
+    write_paths
+        .iter()
+        .filter(|path| !path.trim().is_empty())
+        .all(|path| route_write_path_is_report_scope(&target_workspace, path, &report))
+}
+
+fn route_write_path_is_report_scope(root: &std::path::Path, path: &str, report: &str) -> bool {
+    let candidate = normalized_route_path_for_warning(root, path);
+    if candidate == report {
+        return true;
+    }
+    let prefix = format!("{}/", candidate.trim_end_matches('/'));
+    report.starts_with(&prefix) && report_scope_prefix(&candidate)
+}
+
+fn report_scope_prefix(path: &str) -> bool {
+    path.contains("/.agents/")
+        || path.ends_with("/.agents")
+        || path.contains("/.agentcall/")
+        || path.ends_with("/.agentcall")
+        || path.contains("/docs/reports")
+        || path.contains("/docs/reportnreview")
+        || path.ends_with("/docs/report")
+}
+
 fn pty_containment(state: &AppState, req: &RouteRequest, session_name: &str) -> Value {
-    let read_only = req.read_only.unwrap_or(false);
     let write_paths_input = req.write_paths.clone().unwrap_or_default();
     let reference_paths = req.reference_paths.clone().unwrap_or_default();
     let scratch_path = format!(".agentcall/workspaces/{session_name}");
@@ -761,58 +850,55 @@ fn pty_containment(state: &AppState, req: &RouteRequest, session_name: &str) -> 
     let scratch_abs = process_cwd.join(&scratch_path);
     let mut writable_paths = vec![];
     let mut writable_roots = vec![];
-    if !read_only {
-        writable_paths.push(scratch_path.clone());
+    writable_paths.push(scratch_path.clone());
+    writable_roots.push(json!({
+        "kind": "scratch",
+        "display": scratch_path.clone(),
+        "abs": scratch_abs.display().to_string()
+    }));
+    if let Some(report_path) = req
+        .report_path
+        .as_ref()
+        .filter(|value| !value.trim().is_empty())
+    {
+        writable_paths.push(report_path.clone());
         writable_roots.push(json!({
-            "kind": "scratch",
-            "display": scratch_path.clone(),
-            "abs": scratch_abs.display().to_string()
+            "kind": "report",
+            "display": report_path,
+            "abs": materialize_route_path(&target_workspace, report_path).display().to_string()
         }));
-        if let Some(report_path) = req
-            .report_path
-            .as_ref()
-            .filter(|value| !value.trim().is_empty())
-        {
-            writable_paths.push(report_path.clone());
+    }
+    for path in &write_paths_input {
+        if !path.trim().is_empty() && !writable_paths.iter().any(|item| item == path) {
+            writable_paths.push(path.clone());
             writable_roots.push(json!({
-                "kind": "report",
-                "display": report_path,
-                "abs": materialize_route_path(&target_workspace, report_path).display().to_string()
+                "kind": "write_path",
+                "display": path,
+                "abs": materialize_route_path(&target_workspace, path).display().to_string()
             }));
         }
-        for path in &write_paths_input {
-            if !path.trim().is_empty() && !writable_paths.iter().any(|item| item == path) {
-                writable_paths.push(path.clone());
-                writable_roots.push(json!({
-                    "kind": "write_path",
-                    "display": path,
-                    "abs": materialize_route_path(&target_workspace, path).display().to_string()
-                }));
-            }
-        }
-        let _ = std::fs::create_dir_all(&scratch_abs);
-        let _ = std::fs::write(
-            scratch_abs.join("README.md"),
-            format!(
-                "# AgentCall Session Scratch\n\nSession: `{session_name}`\n\nThis directory is writable for bounded helper artifacts, temporary scripts, and report material. Do not write outside route containment.\n"
-            ),
-        );
     }
+    let _ = std::fs::create_dir_all(&scratch_abs);
+    let _ = std::fs::write(
+        scratch_abs.join("README.md"),
+        format!(
+            "# AgentCall Session Scratch\n\nSession: `{session_name}`\n\nThis directory is writable for bounded helper artifacts, temporary scripts, and report material. Do not write outside route containment.\n"
+        ),
+    );
     json!({
-        "mode": if read_only { "read_only" } else { "enforced_readonly_bash" },
-        "read_only": read_only,
+        "mode": route_worker_kind(state, req),
         "write_paths_input": write_paths_input,
         "reference_paths": reference_paths,
         "writable_paths": writable_paths,
-        "scratch_path": if read_only { Value::Null } else { json!(scratch_path) },
+        "scratch_path": scratch_path,
         "roots": {
             "process_cwd": process_cwd.display().to_string(),
             "claude_workspace": process_cwd.display().to_string(),
             "target_workspace": target_workspace.display().to_string(),
-            "scratch_root": if read_only { Value::Null } else { json!(scratch_abs.display().to_string()) }
+            "scratch_root": scratch_abs.display().to_string()
         },
         "writable_roots": writable_roots,
-        "scratch_root": if read_only { Value::Null } else { json!(scratch_abs.display().to_string()) },
+        "scratch_root": scratch_abs.display().to_string(),
         "bash_write_policy": "readonly_only"
     })
 }
@@ -955,7 +1041,6 @@ fn route_has_context_fields(req: &RouteRequest) -> bool {
         || req.acceptance_criteria.is_some()
         || req.persist_context.is_some()
         || req.report_path.is_some()
-        || req.read_only.is_some()
 }
 
 fn merge_result_field(result: &mut Value, key: &str, value: Value) {
@@ -1254,6 +1339,14 @@ fn pty_prompt_control_envelope(req: &RouteRequest, containment: &Value) -> Strin
     lines.push(
         "Confirm task id, ownership, allowed paths, and report target before editing.".to_string(),
     );
+    if let Some(worker_kind) = containment.get("mode").and_then(Value::as_str) {
+        lines.push(format!("worker_kind: {worker_kind}"));
+        if worker_kind == "report" {
+            lines.push("report worker: inspect, analyze, and write only the requested report/scratch artifacts; do not modify implementation files.".to_string());
+        } else {
+            lines.push("coding worker: modify only the listed write boundaries, then write the requested report.".to_string());
+        }
+    }
     if let Some(task_id) = req.task_id.as_ref() {
         lines.push(format!("task_id: {task_id}"));
     }
@@ -1313,10 +1406,7 @@ fn toolchain_context_value(state: &AppState, req: &RouteRequest) -> Value {
     let target_workspace = route_target_workspace(state, req);
     let candidates = [
         target_workspace.join(".agentcall").join("toolchain.json"),
-        state
-            .workspace
-            .join("config")
-            .join("toolchain.local.json"),
+        state.workspace.join("config").join("toolchain.local.json"),
     ];
     for path in candidates {
         let Ok(text) = std::fs::read_to_string(&path) else {
@@ -1348,7 +1438,13 @@ fn toolchain_context_value(state: &AppState, req: &RouteRequest) -> Value {
 
 fn toolchain_hints_from_value(value: &Value) -> Value {
     if let Some(hints) = value.get("hints").and_then(Value::as_array) {
-        return Value::Array(hints.iter().filter(|item| item.is_string()).cloned().collect());
+        return Value::Array(
+            hints
+                .iter()
+                .filter(|item| item.is_string())
+                .cloned()
+                .collect(),
+        );
     }
     let mut hints = vec![];
     for key in ["go", "node", "npm", "python", "cache", "tmp"] {
@@ -1386,7 +1482,10 @@ fn pty_prompt_containment(containment: &Value) -> String {
             }
         }
     }
-    if let Some(paths) = containment.get("write_paths_input").and_then(Value::as_array) {
+    if let Some(paths) = containment
+        .get("write_paths_input")
+        .and_then(Value::as_array)
+    {
         for path in paths.iter().filter_map(Value::as_str) {
             lines.push(format!("write boundary: {path}"));
         }
@@ -1476,7 +1575,6 @@ mod tests {
                 acceptance_criteria: None,
                 persist_context: None,
                 report_path: None,
-                read_only: None,
                 pty_workflow: None,
                 initial_permission_mode: None,
             },
@@ -1513,7 +1611,6 @@ mod tests {
                 acceptance_criteria: None,
                 persist_context: None,
                 report_path: None,
-                read_only: None,
                 pty_workflow: None,
                 initial_permission_mode: None,
             },
@@ -1557,7 +1654,6 @@ mod tests {
                 acceptance_criteria: None,
                 persist_context: None,
                 report_path: None,
-                read_only: None,
                 pty_workflow: None,
                 initial_permission_mode: None,
             },
@@ -1604,7 +1700,6 @@ mod tests {
                 acceptance_criteria: Some(vec!["report risks".to_string()]),
                 persist_context: Some(true),
                 report_path: Some("src/report.md".to_string()),
-                read_only: None,
                 pty_workflow: None,
                 initial_permission_mode: None,
             },
@@ -1647,7 +1742,6 @@ mod tests {
             acceptance_criteria: None,
             persist_context: None,
             report_path: None,
-            read_only: None,
             pty_workflow: None,
             initial_permission_mode: None,
         };
@@ -1657,11 +1751,81 @@ mod tests {
         assert_eq!(report["status"], "report_not_requested");
         assert_eq!(report["ready"], false);
         assert_eq!(report["source"], "daemon_minted");
-        assert_eq!(
-            report["path"],
-            ".agents/agentcall/route-123-worker-one.md"
+        assert_eq!(report["path"], ".agents/agentcall/route-123-worker-one.md");
+        assert!(
+            report["abs_path"]
+                .as_str()
+                .unwrap()
+                .contains("worker-one.md")
         );
-        assert!(report["abs_path"].as_str().unwrap().contains("worker-one.md"));
+    }
+
+    #[test]
+    fn report_worker_uses_shared_workspace_lease() {
+        let workspace = test_workspace("route-report-shared-lease");
+        let state = Arc::new(AppState::test(workspace.clone()));
+        let first = report_route(
+            "review-a",
+            Some(vec![".agents/agentcall/review-a.md".to_string()]),
+            ".agents/agentcall/review-a.md",
+        );
+        let second = report_route(
+            "review-b",
+            Some(vec![".agents/agentcall".to_string()]),
+            ".agents/agentcall/review-b.md",
+        );
+
+        assert!(route_uses_shared_workspace_lease(&state, &first));
+        assert!(route_uses_shared_workspace_lease(&state, &second));
+        let first_reservation = reserve_route_leases(
+            &state,
+            "review-a",
+            "codex",
+            &workspace,
+            route_uses_shared_workspace_lease(&state, &first),
+        )
+        .unwrap();
+        install_reserved_route_leases(&state, &first_reservation).unwrap();
+        let second_reservation = reserve_route_leases(
+            &state,
+            "review-b",
+            "codex",
+            &workspace,
+            route_uses_shared_workspace_lease(&state, &second),
+        )
+        .unwrap();
+
+        assert_eq!(
+            first_reservation.workspace_lease.mode,
+            crate::ownership::WorkspaceLeaseMode::SharedReport
+        );
+        assert_eq!(
+            second_reservation.workspace_lease.mode,
+            crate::ownership::WorkspaceLeaseMode::SharedReport
+        );
+    }
+
+    #[test]
+    fn route_request_rejects_removed_read_only_field() {
+        let err = serde_json::from_value::<RouteRequest>(json!({
+            "objective": "inspect and report",
+            "read_only": true
+        }))
+        .unwrap_err();
+        assert!(err.to_string().contains("read_only"));
+    }
+
+    #[test]
+    fn implementation_write_route_keeps_exclusive_workspace_lease() {
+        let workspace = test_workspace("route-report-exclusive");
+        let state = Arc::new(AppState::test(workspace));
+        let req = report_route(
+            "impl-a",
+            Some(vec!["src".to_string()]),
+            ".agents/agentcall/impl-a.md",
+        );
+
+        assert!(!route_uses_shared_workspace_lease(&state, &req));
     }
 
     #[test]
@@ -1706,16 +1870,12 @@ mod tests {
             acceptance_criteria: None,
             persist_context: None,
             report_path: Some("reports/shared.md".to_string()),
-            read_only: None,
             pty_workflow: None,
             initial_permission_mode: None,
         };
         let warning = route_report_path_warning(&state, &req, "caller").unwrap();
 
-        assert_eq!(
-            warning["kind"],
-            "duplicate_explicit_report_path"
-        );
+        assert_eq!(warning["kind"], "duplicate_explicit_report_path");
         assert_eq!(warning["route_id"], "route-a");
     }
 
@@ -1801,11 +1961,10 @@ mod tests {
             phase: None,
             role: None,
             reference_paths: None,
-            write_paths: None,
+            write_paths: Some(vec!["src".to_string()]),
             acceptance_criteria: None,
             persist_context: None,
             report_path: None,
-            read_only: None,
             pty_workflow: None,
             initial_permission_mode: Some("auto".to_string()),
         };
@@ -1890,12 +2049,11 @@ mod tests {
             acceptance_criteria: None,
             persist_context: None,
             report_path: Some("docs/report.md".to_string()),
-            read_only: None,
             pty_workflow: None,
             initial_permission_mode: None,
         };
         let containment = pty_containment(&state, &req, "containment-a");
-        assert_eq!(containment["mode"], "enforced_readonly_bash");
+        assert_eq!(containment["mode"], "coding");
         assert_eq!(containment["bash_write_policy"], "readonly_only");
         assert_eq!(
             containment["scratch_path"],
@@ -1970,7 +2128,6 @@ mod tests {
             acceptance_criteria: None,
             persist_context: None,
             report_path: Some(".agentcall/reports/report.md".to_string()),
-            read_only: None,
             pty_workflow: None,
             initial_permission_mode: None,
         };
@@ -1993,11 +2150,11 @@ mod tests {
     }
 
     #[test]
-    fn pty_containment_read_only_has_no_writable_scratch() {
-        let workspace = test_workspace("containment-readonly");
-        let state = AppState::test(workspace);
+    fn pty_containment_report_worker_has_writable_report_and_scratch() {
+        let workspace = test_workspace("containment-report");
+        let state = AppState::test(workspace.clone());
         let req = RouteRequest {
-            objective: "read only audit".to_string(),
+            objective: "write audit report".to_string(),
             workspace: None,
             mode: Some("start".to_string()),
             runtime: Some("pty".to_string()),
@@ -2013,20 +2170,30 @@ mod tests {
             phase: None,
             role: None,
             reference_paths: None,
-            write_paths: Some(vec!["src".to_string()]),
+            write_paths: None,
             acceptance_criteria: None,
             persist_context: None,
             report_path: Some("docs/report.md".to_string()),
-            read_only: Some(true),
             pty_workflow: None,
             initial_permission_mode: None,
         };
-        let containment = pty_containment(&state, &req, "containment-ro");
-        assert_eq!(containment["mode"], "read_only");
-        assert!(containment["writable_paths"].as_array().unwrap().is_empty());
-        assert!(containment["writable_roots"].as_array().unwrap().is_empty());
-        assert!(containment["scratch_path"].is_null());
-        assert!(containment["roots"]["scratch_root"].is_null());
+        let containment = pty_containment(&state, &req, "containment-report");
+        assert_eq!(containment["mode"], "report");
+        let writable = containment["writable_paths"].as_array().unwrap();
+        assert!(writable.iter().any(|value| value == "docs/report.md"));
+        assert!(!writable.iter().any(|value| value == "src"));
+        assert!(
+            writable
+                .iter()
+                .any(|value| value == ".agentcall/workspaces/containment-report")
+        );
+        assert_eq!(
+            containment["roots"]["scratch_root"],
+            workspace
+                .join(".agentcall/workspaces/containment-report")
+                .display()
+                .to_string()
+        );
     }
 
     #[test]
@@ -2109,5 +2276,36 @@ mod tests {
             .unwrap()
             .as_nanos();
         std::env::temp_dir().join(format!("agentcall-routes-{name}-{nonce}"))
+    }
+
+    fn report_route(
+        session_name: &str,
+        write_paths: Option<Vec<String>>,
+        report_path: &str,
+    ) -> RouteRequest {
+        RouteRequest {
+            objective: "write a report".to_string(),
+            workspace: None,
+            mode: Some("start".to_string()),
+            runtime: Some("pty".to_string()),
+            estimated_minutes: None,
+            estimated_files: None,
+            estimated_loc: None,
+            needs_continuity: None,
+            risk: None,
+            session_name: Some(session_name.to_string()),
+            command: None,
+            task_id: None,
+            call_id: None,
+            phase: None,
+            role: None,
+            reference_paths: None,
+            write_paths,
+            acceptance_criteria: None,
+            persist_context: None,
+            report_path: Some(report_path.to_string()),
+            pty_workflow: None,
+            initial_permission_mode: None,
+        }
     }
 }

@@ -59,7 +59,7 @@ Codex 派工时必须明确：
 - objective：任务目标。
 - workspace：任务目标目录，不是 Claude 进程 cwd。
 - session_name：稳定、可追踪。
-- allowed_paths / report_path / read_only：写入边界。
+- write_paths / report_path / worker_kind：写入边界。
 - acceptance_criteria：验收标准。
 - role / phase：worker 身份和阶段。
 
@@ -191,13 +191,14 @@ worker 只能写：
 - daemon 为 session 创建的 scratch root。
 - 明确的 `report_path`。
 
-read-only route：
+report route：
 
-- 不允许写 project files。
-- 不允许 TaskCreate 漂移。
+- 不允许写 implementation files。
+- 只允许写 route report path 和 session scratch。
+- 不允许 TaskCreate 漂移成子实现 worker。
 - Bash 默认只允许只读探针。
 
-write route：
+coding route：
 
 - Write/Edit/MultiEdit 必须命中允许路径。
 - Bash 写入仍受策略限制。
@@ -245,12 +246,12 @@ workspace lease 防止多个 worker 同时写同一工作区。
 模式：
 
 - `Exclusive`
-- `SharedReadonly`
+- `SharedReport`
 
 规则：
 
-- 写入型任务需要 exclusive。
-- read-only/report 型任务可以 shared-readonly。
+- coding 任务需要 exclusive。
+- report 任务可以 shared report lease。
 - workspace key 必须 canonicalize，避免路径拼写绕过。
 
 ### 容量控制
@@ -523,4 +524,3 @@ MCP bridge 应：
 - orphaned owner/workspace lease 对账已补方向，但运行态需要重启后验证。
 - permission menu 仍需要进一步结构化成明确 options/recommended_action。
 - MCP transport 重启/重连体验仍需继续硬化。
-

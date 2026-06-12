@@ -1,5 +1,23 @@
 # CHANGELOG
 
+## v6.5.0 - Coding/Report Worker Split
+
+- 移除 `agentcall_route` 的 `read_only` 参数和纯只读 worker 工作线。
+- AgentCall 正常 worker 只剩两类：`coding` worker 使用独占 workspace lease 写实现路径；`report` worker 使用共享 report lease，只写 report/scratch。
+- `report` worker 仍可产出报告，不再因为“只读”语义拒绝写 `report_path`。
+- MCP 推荐 schema 不再暴露 `read_only`；daemon `RouteRequest` 拒绝未知字段，旧调用会明确失败。
+- workspace lease 内部共享模式改名为 `SharedReport`，board/health 摘要字段改为 `shared_report`。
+- report worker 默认拒绝 `TaskCreate`，防止报告任务漂移为子实现任务。
+
+## v6.3.0 - Structured Safety Errors And Version Alignment
+
+- 统一产品版本口径：Rust crates、Python package、MCP `SERVER_VERSION`、Codex plugin manifest、README/CHANGELOG 全部对齐到 `6.3.0`。
+- daemon error response 改为结构化错误对象，包含 `error.code`、`category`、`details`、`hint` 和 `retryable`。
+- 常见安全锁使用更准确的 HTTP 状态：workspace/owner lease 冲突为 `409`，容量满为 `429`，缺控制前置为 `428`。
+- MCP bridge 不再在非 200 响应头处丢弃 daemon body，会把结构化 daemon 错误透传给 Codex。
+- report-only route 使用共享 workspace lease；真正写实现路径的 route 仍保持独占 workspace lease。
+- AGENTS 增加版本纪律：发布前必须确认源码版本、plugin 版本、MCP server version 和 live daemon build version 一致。
+
 ## v6.2.0 - Worker Closure And Project-Aware Supervisor Loop
 
 - `agentcall_route` 在调用方未传 `report_path` 时自动生成唯一报告路径：`<target_workspace>/.agents/agentcall/<route_id>-<session_name>.md`。

@@ -96,7 +96,7 @@ pub(crate) fn prepare_session_send_command(
     if safety.requires_precondition && !has_control_token {
         validate_required_destructive_precondition(state, session, action, args)?;
     }
-    let idempotency_key = idempotency_key.unwrap_or("read-only");
+    let idempotency_key = idempotency_key.unwrap_or("implicit-action");
     let enriched_args = attach_or_validate_owner_lease(state, session, args)?;
     let command = build_session_send_command(session, action, idempotency_key, &enriched_args);
     validate_projection_precondition(state, &command)?;

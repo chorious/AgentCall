@@ -283,7 +283,6 @@ def start_route(
         "session_name": session_name,
         "command": command,
         "write_paths": [".agentcall/reports"],
-        "read_only": False,
     }
     if report_path:
         payload["report_path"] = report_path

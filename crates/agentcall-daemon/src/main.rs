@@ -5,6 +5,7 @@ mod commands;
 mod confidence;
 mod config;
 mod control;
+mod errors;
 mod events;
 mod hooks;
 mod http;

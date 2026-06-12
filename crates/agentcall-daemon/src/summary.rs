@@ -246,7 +246,11 @@ fn worker_matches_workspace_filter(worker: &Value, workspace_filter: Option<&str
     target.is_some_and(|target| normalized_path_string(target) == normalized_path_string(filter))
 }
 
-fn filter_routes_by_workspace(routes: Value, workspace_filter: Option<&str>, daemon_root: &Path) -> Value {
+fn filter_routes_by_workspace(
+    routes: Value,
+    workspace_filter: Option<&str>,
+    daemon_root: &Path,
+) -> Value {
     let Some(filter) = workspace_filter.filter(|value| !value.trim().is_empty()) else {
         return routes;
     };

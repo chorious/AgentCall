@@ -65,8 +65,7 @@ fn route_tool() -> Value {
                 "write_paths": {"type": "array", "items": {"type": "string"}, "description": "Paths the worker may modify, plus daemon-minted scratch/report paths."},
                 "reference_paths": {"type": "array", "items": {"type": "string"}, "description": "Recommended read/context paths for the worker. This is not a read permission boundary."},
                 "acceptance_criteria": {"type": "array", "items": {"type": "string"}},
-                "report_path": {"type": "string"},
-                "read_only": {"type": "boolean", "default": false}
+                "report_path": {"type": "string"}
             },
             "required": ["objective"],
             "additionalProperties": false
@@ -205,6 +204,7 @@ mod tests {
             "call_id",
             "phase",
             "role",
+            "read_only",
         ] {
             assert!(
                 properties.get(hidden).is_none(),

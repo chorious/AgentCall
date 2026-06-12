@@ -250,7 +250,11 @@ pub(crate) fn ingest_hook(
                 wrapper,
                 &format!("hook.{}", req.event),
             )?;
-            if decision.get("report_ready").and_then(serde_json::Value::as_bool) != Some(true) {
+            if decision
+                .get("report_ready")
+                .and_then(serde_json::Value::as_bool)
+                != Some(true)
+            {
                 mark_route_report_progress_observed_locked(
                     state,
                     &agent_dir,
@@ -1428,14 +1432,7 @@ fn pty_path_policy_for_wrapper(state: &AppState, wrapper_session: &str) -> Optio
     }
     let writable_roots = writable_roots_from_containment(containment);
     let roots = containment.get("roots");
-    if containment
-        .get("mode")
-        .and_then(serde_json::Value::as_str)
-        != Some("read_only")
-        && write_paths_input.is_empty()
-        && writable_paths.is_empty()
-        && writable_roots.is_empty()
-    {
+    if write_paths_input.is_empty() && writable_paths.is_empty() && writable_roots.is_empty() {
         return None;
     }
     Some(PtyPathPolicy {
@@ -1509,9 +1506,9 @@ fn pty_path_policy_denial(
     payload: &serde_json::Value,
     policy: &PtyPathPolicy,
 ) -> Option<String> {
-    if tool_name == "TaskCreate" && policy.mode == "read_only" {
+    if tool_name == "TaskCreate" && policy.mode == "report" {
         return Some(
-            "PTY path policy denies TaskCreate during read-only route; report missing context instead"
+            "PTY path policy denies TaskCreate during report route; request a coding worker for child implementation work"
                 .to_string(),
         );
     }
@@ -2298,28 +2295,14 @@ mod tests {
         .unwrap();
     }
 
-    fn install_pty_report_route(
-        state: &AppState,
-        wrapper_session: &str,
-        report_path: &str,
-        read_only: bool,
-    ) {
+    fn install_pty_report_route(state: &AppState, wrapper_session: &str, report_path: &str) {
         let path = state
             .workspace
             .join(".agentcall")
             .join("state")
             .join("routes.json");
-        let mode = if read_only {
-            "read_only"
-        } else {
-            "enforced_readonly_bash"
-        };
         let scratch = format!(".agentcall/workspaces/{wrapper_session}");
-        let writable_paths = if read_only {
-            serde_json::json!([])
-        } else {
-            serde_json::json!([report_path, scratch])
-        };
+        let writable_paths = serde_json::json!([report_path, scratch]);
         write_json_file(
             &path,
             &serde_json::json!({
@@ -2338,10 +2321,10 @@ mod tests {
                             "write_paths": ["docs/reports"]
                         },
                         "containment": {
-                            "mode": mode,
+                            "mode": "report",
                             "write_paths_input": ["docs/reports"],
                             "writable_paths": writable_paths,
-                            "scratch_path": if read_only { serde_json::Value::Null } else { serde_json::json!(scratch) },
+                            "scratch_path": scratch,
                             "bash_write_policy": "readonly_only"
                         }
                     }
@@ -3116,9 +3099,9 @@ mod tests {
     }
 
     #[test]
-    fn pty_read_only_route_denies_task_create_drift() {
-        let state = test_state("pty-readonly-taskcreate-deny");
-        install_pty_report_route(&state, "pty-a", "docs/reports/review.md", true);
+    fn pty_report_route_denies_task_create_drift() {
+        let state = test_state("pty-report-taskcreate-deny");
+        install_pty_report_route(&state, "pty-a", "docs/reports/review.md");
         let result = ingest_hook(
             &state,
             HookIngestRequest {
@@ -3138,14 +3121,14 @@ mod tests {
             result["decision"]["reason"]
                 .as_str()
                 .unwrap()
-                .contains("read-only route")
+                .contains("report route")
         );
     }
 
     #[test]
     fn post_tool_report_write_marks_route_and_projection_ready() {
         let state = test_state("pty-report-ready");
-        install_pty_report_route(&state, "pty-a", "docs/reports/review.md", false);
+        install_pty_report_route(&state, "pty-a", "docs/reports/review.md");
         let mut payload = write_payload("claude-a", "docs/reports/review.md");
         payload["wrapper_session"] = serde_json::json!("pty-a");
         let result = ingest_hook(

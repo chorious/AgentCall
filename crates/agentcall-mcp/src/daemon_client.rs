@@ -94,18 +94,43 @@ fn read_http_json(stream: TcpStream) -> Result<Value, String> {
         }
         head.push_str(&line);
     }
-    if !head.starts_with("HTTP/1.1 200") {
-        return Err(format!(
-            "daemon returned non-200 response: {}",
-            head.lines().next().unwrap_or(&head)
-        ));
-    }
+    let status = http_status_from_head(&head).unwrap_or(0);
     let content_length = content_length_from_head(&head)?;
     let mut body = vec![0u8; content_length];
     reader
         .read_exact(&mut body)
         .map_err(|err| format_io_error("read daemon response body", err))?;
+    if status != 200 {
+        return Err(format_non_200_daemon_error(status, &head, &body));
+    }
     serde_json::from_slice(&body).map_err(|err| format!("invalid daemon JSON: {err}"))
+}
+
+fn http_status_from_head(head: &str) -> Option<u16> {
+    let status_line = head.lines().next()?;
+    let mut parts = status_line.split_whitespace();
+    let _http = parts.next()?;
+    parts.next()?.parse::<u16>().ok()
+}
+
+fn format_non_200_daemon_error(status: u16, head: &str, body: &[u8]) -> String {
+    if let Ok(value) = serde_json::from_slice::<Value>(body) {
+        return serde_json::to_string(&value).unwrap_or_else(|_| {
+            format!(
+                "daemon returned HTTP {status}: {}",
+                head.lines().next().unwrap_or(head)
+            )
+        });
+    }
+    let body_text = String::from_utf8_lossy(body);
+    if body_text.trim().is_empty() {
+        format!(
+            "daemon returned HTTP {status}: {}",
+            head.lines().next().unwrap_or(head)
+        )
+    } else {
+        format!("daemon returned HTTP {status}: {body_text}")
+    }
 }
 
 fn content_length_from_head(head: &str) -> Result<usize, String> {
@@ -144,5 +169,18 @@ mod tests {
         );
         assert!(message.contains("daemon_query_timeout"));
         assert!(message.contains("read daemon response body"));
+    }
+
+    #[test]
+    fn non_200_daemon_response_preserves_structured_error_body() {
+        let body = br#"{"error":{"code":"workspace_busy","category":"safety_lock","message":"busy","details":{"existing_session":"worker-a"}}}"#;
+        let message = format_non_200_daemon_error(
+            409,
+            "HTTP/1.1 409 Conflict\r\nContent-Length: 120\r\n",
+            body,
+        );
+        let value: Value = serde_json::from_str(&message).unwrap();
+        assert_eq!(value["error"]["code"], "workspace_busy");
+        assert_eq!(value["error"]["details"]["existing_session"], "worker-a");
     }
 }
