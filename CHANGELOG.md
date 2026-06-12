@@ -1,5 +1,14 @@
 # CHANGELOG
 
+## v6.6.0 - Error Enum, SQLite Writer Fanout, Prompt Gate Cleanup
+
+- daemon safety-lock error codes now flow through a Rust `ErrorCode` enum before being serialized as stable snake_case JSON codes.
+- SQLite RuntimeStore can fan out write requests across up to six store writer threads, matching the default worker concurrency cap; JSON remains safety-capped to one writer.
+- Runtime health now reports `store_writer_threads`, `configured_store_writer_threads`, and whether the active store supports parallel writes.
+- Prompt gate now auto-submits stale `prompt_pending_ack` after a short daemon grace period; `submit_pending_prompt` remains a debug/recovery signal rather than a normal Codex action.
+- Split key `projection` and `worker_state` decision paths into smaller reducer/decision helpers, reducing the largest control-flow hotspots without changing public MCP shape.
+- Added `docs/reports/report_v6.6_code_optimization_closure_2026-06-13.md` to track which code-audit findings were closed, partially closed, or deferred.
+
 ## v6.5.0 - Coding/Report Worker Split
 
 - 移除 `agentcall_route` 的 `read_only` 参数和纯只读 worker 工作线。

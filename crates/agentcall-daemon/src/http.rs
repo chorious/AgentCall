@@ -900,7 +900,7 @@ mod tests {
         let response = error_response(
             400,
             &crate::errors::structured_error(
-                "workspace_busy",
+                crate::errors::ErrorCode::WorkspaceBusy,
                 "Workspace has an incompatible active lease.",
                 serde_json::json!({"existing_session": "worker-a"}),
             ),
@@ -910,7 +910,7 @@ mod tests {
         let body = fixed_json(error_response(
             400,
             &crate::errors::structured_error(
-                "workspace_busy",
+                crate::errors::ErrorCode::WorkspaceBusy,
                 "Workspace has an incompatible active lease.",
                 serde_json::json!({"existing_session": "worker-a"}),
             ),

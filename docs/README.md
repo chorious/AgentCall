@@ -1,6 +1,6 @@
 # AgentCall Docs
 
-这是 AgentCall 的文档索引。当前主线是 `coding/report worker split`：Codex 通过 AgentCall MCP/daemon 指挥 Claude Code PTY utility workers，daemon 负责状态权威、hook-aware projection、bounded write policy、compact board 和结构化安全锁错误。正常 worker 只剩 `coding` 与 `report` 两类；`read_only` route 线已移除。
+这是 AgentCall 的文档索引。当前主线是 `v6.6.0 - Error enum, SQLite writer fanout, prompt gate cleanup`：Codex 通过 AgentCall MCP/daemon 指挥 Claude Code PTY utility workers，daemon 负责状态权威、hook-aware projection、bounded write policy、compact board、枚举化安全锁错误、SQLite writer fanout 和 prompt gate 自动自愈。正常 worker 只剩 `coding` 与 `report` 两类；`read_only` route 线已移除。
 
 ## 当前入口
 
@@ -14,6 +14,7 @@
 - [v6.0 Code Plan](v6.0-code-plan.md)
 - [v5.3 Code Plan](v5.3-code-plan.md)
 - [v5.3 Closure Status](reports/v5.3-closure-status.md)
+- [v6.6 Code Optimization Closure](reports/report_v6.6_code_optimization_closure_2026-06-13.md)
 - [v5 Implementation Deep Audit](reports/v5-implementation-deep-audit.md)
 - [MCP transport recovery](mcp-transport-recovery.md)
 

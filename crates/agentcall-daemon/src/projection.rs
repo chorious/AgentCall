@@ -228,64 +228,16 @@ pub(crate) fn apply_event_to_projection(
 
     match event.event_type.as_str() {
         "session.started" | "process.started" | "mcp.tool_called" | "pty.session_started" => {
-            projection.terminal = false;
-            projection.terminal_event_id = None;
-            projection.terminal_global_seq = None;
-            projection.terminal_reason = None;
-            projection.stop_intent = None;
-            projection.liveness_status = "starting".to_string();
-            projection.turn_status = "starting".to_string();
-            projection.attention_status = "none".to_string();
-            projection.needs_attention = false;
-            projection.last_progress_brief = Some(event.message.clone());
-            if let Some(target_workspace) = event
-                .payload
-                .get("requested_cwd")
-                .or_else(|| event.payload.get("target_workspace"))
-                .and_then(Value::as_str)
-            {
-                projection.workspace = target_workspace.to_string();
-            }
-            if let Some(cwd) = event.payload.get("cwd").and_then(Value::as_str) {
-                projection.claude_cwd = cwd.to_string();
-            }
+            reduce_session_start_event(&mut projection, event);
         }
         "command.accepted" | "command.completed" | "pty.input_sent" => {
-            update_last_command_status(&mut projection, event);
-            if !matches!(
-                projection.liveness_status.as_str(),
-                "working" | "waiting_input"
-            ) {
-                projection.liveness_status = "prompt_pending".to_string();
-                projection.turn_status = "prompt_pending".to_string();
-                projection.next_recommended_action = "wait_or_submit_pending_prompt".to_string();
-            }
-            projection.attention_status = "none".to_string();
-            projection.needs_attention = false;
-            projection.last_progress_brief = Some(event.message.clone());
+            reduce_command_progress_event(&mut projection, event);
         }
         "command.awaiting_observation" => {
-            update_last_command_status(&mut projection, event);
-            if !matches!(
-                projection.liveness_status.as_str(),
-                "working" | "waiting_input"
-            ) {
-                projection.liveness_status = "prompt_pending".to_string();
-                projection.next_recommended_action = "wait_or_submit_pending_prompt".to_string();
-            }
-            projection.turn_status = "awaiting_observation".to_string();
-            projection.attention_status = "none".to_string();
-            projection.needs_attention = false;
-            projection.last_progress_brief = Some(event.message.clone());
+            reduce_command_awaiting_event(&mut projection, event);
         }
         "session.cleanup" => {
-            if !projection.terminal {
-                projection.liveness_status = "cleanup_observed".to_string();
-                projection.attention_status = "needs_runtime_reconcile".to_string();
-                projection.needs_attention = true;
-                projection.next_recommended_action = "inspect_runtime_health".to_string();
-            }
-            projection.last_progress_brief = Some(event.message.clone());
+            reduce_cleanup_event(&mut projection, event);
         }
         "process.exited" | "pty.session_ended" => {
             apply_terminal_event(&mut projection, event);
@@ -311,33 +263,14 @@ pub(crate) fn apply_event_to_projection(
         | "session.writer_closed"
         | "session.reader_failed"
         | "session.orphaned" => {
-            projection.terminal = true;
-            projection.terminal_event_id = Some(event.event_id.clone());
-            projection.terminal_global_seq = Some(event.global_seq);
-            projection.terminal_reason = Some(event.event_type.clone());
-            projection.liveness_status = "failed_or_orphaned".to_string();
-            projection.turn_status = "terminal".to_string();
-            projection.attention_status = "failed".to_string();
-            projection.needs_attention = true;
-            projection.last_error_brief = Some(
-                event
-                    .payload
-                    .get("error")
-                    .and_then(Value::as_str)
-                    .unwrap_or(event.message.as_str())
-                    .to_string(),
-            );
-            projection.last_progress_brief = Some(event.message.clone());
-            projection.next_recommended_action = "stop_or_restart_worker".to_string();
+            reduce_runtime_failure_event(&mut projection, event);
         }
         event_type if event_type.starts_with("hook.") => {
             reduce_hook_event(&mut projection, event);
             reason = "hook_event_reduced".to_string();
         }
         event_type if event_type.contains("policy") || event_type.contains("denial") => {
-            projection.attention_status = "blocked_by_policy".to_string();
-            projection.needs_attention = true;
-            projection.last_error_brief = Some(event.message.clone());
+            reduce_policy_event(&mut projection, event);
         }
         _ => {
             projection.last_progress_brief = Some(event.message.clone());
@@ -451,6 +384,97 @@ fn projection_items(items: Option<&Vec<Value>>) -> Vec<Value> {
         .collect()
 }
 
+fn reduce_session_start_event(projection: &mut SessionProjectionV1, event: &EventEnvelopeV1) {
+    projection.terminal = false;
+    projection.terminal_event_id = None;
+    projection.terminal_global_seq = None;
+    projection.terminal_reason = None;
+    projection.stop_intent = None;
+    projection.liveness_status = "starting".to_string();
+    projection.turn_status = "starting".to_string();
+    projection.attention_status = "none".to_string();
+    projection.needs_attention = false;
+    projection.last_progress_brief = Some(event.message.clone());
+    if let Some(target_workspace) = event
+        .payload
+        .get("requested_cwd")
+        .or_else(|| event.payload.get("target_workspace"))
+        .and_then(Value::as_str)
+    {
+        projection.workspace = target_workspace.to_string();
+    }
+    if let Some(cwd) = event.payload.get("cwd").and_then(Value::as_str) {
+        projection.claude_cwd = cwd.to_string();
+    }
+}
+
+fn reduce_command_progress_event(projection: &mut SessionProjectionV1, event: &EventEnvelopeV1) {
+    update_last_command_status(projection, event);
+    if !matches!(
+        projection.liveness_status.as_str(),
+        "working" | "waiting_input"
+    ) {
+        projection.liveness_status = "prompt_pending".to_string();
+        projection.turn_status = "prompt_pending".to_string();
+        projection.next_recommended_action = "wait_for_daemon_prompt_commit".to_string();
+    }
+    projection.attention_status = "none".to_string();
+    projection.needs_attention = false;
+    projection.last_progress_brief = Some(event.message.clone());
+}
+
+fn reduce_command_awaiting_event(projection: &mut SessionProjectionV1, event: &EventEnvelopeV1) {
+    update_last_command_status(projection, event);
+    if !matches!(
+        projection.liveness_status.as_str(),
+        "working" | "waiting_input"
+    ) {
+        projection.liveness_status = "prompt_pending".to_string();
+        projection.next_recommended_action = "wait_for_daemon_prompt_commit".to_string();
+    }
+    projection.turn_status = "awaiting_observation".to_string();
+    projection.attention_status = "none".to_string();
+    projection.needs_attention = false;
+    projection.last_progress_brief = Some(event.message.clone());
+}
+
+fn reduce_cleanup_event(projection: &mut SessionProjectionV1, event: &EventEnvelopeV1) {
+    if !projection.terminal {
+        projection.liveness_status = "cleanup_observed".to_string();
+        projection.attention_status = "needs_runtime_reconcile".to_string();
+        projection.needs_attention = true;
+        projection.next_recommended_action = "inspect_runtime_health".to_string();
+    }
+    projection.last_progress_brief = Some(event.message.clone());
+}
+
+fn reduce_runtime_failure_event(projection: &mut SessionProjectionV1, event: &EventEnvelopeV1) {
+    projection.terminal = true;
+    projection.terminal_event_id = Some(event.event_id.clone());
+    projection.terminal_global_seq = Some(event.global_seq);
+    projection.terminal_reason = Some(event.event_type.clone());
+    projection.liveness_status = "failed_or_orphaned".to_string();
+    projection.turn_status = "terminal".to_string();
+    projection.attention_status = "failed".to_string();
+    projection.needs_attention = true;
+    projection.last_error_brief = Some(
+        event
+            .payload
+            .get("error")
+            .and_then(Value::as_str)
+            .unwrap_or(event.message.as_str())
+            .to_string(),
+    );
+    projection.last_progress_brief = Some(event.message.clone());
+    projection.next_recommended_action = "stop_or_restart_worker".to_string();
+}
+
+fn reduce_policy_event(projection: &mut SessionProjectionV1, event: &EventEnvelopeV1) {
+    projection.attention_status = "blocked_by_policy".to_string();
+    projection.needs_attention = true;
+    projection.last_error_brief = Some(event.message.clone());
+}
+
 fn reduce_hook_event(projection: &mut SessionProjectionV1, event: &EventEnvelopeV1) {
     if event
         .payload
@@ -480,7 +504,7 @@ fn reduce_hook_event(projection: &mut SessionProjectionV1, event: &EventEnvelope
         projection.turn_status = "claude_ready".to_string();
         projection.attention_status = "none".to_string();
         projection.needs_attention = false;
-        projection.next_recommended_action = "wait_or_submit_pending_prompt".to_string();
+        projection.next_recommended_action = "wait_for_daemon_prompt_commit".to_string();
         projection.last_progress_brief = Some(event.message.clone());
         if let Some(cwd) = event.payload.get("workspace").and_then(Value::as_str) {
             projection.claude_cwd = cwd.to_string();
@@ -803,7 +827,7 @@ mod tests {
         assert_eq!(accepted.projection.liveness_status, "prompt_pending");
         assert_eq!(
             accepted.projection.next_recommended_action,
-            "wait_or_submit_pending_prompt"
+            "wait_for_daemon_prompt_commit"
         );
         assert_eq!(accepted.projection.attention_status, "none");
 

@@ -5,6 +5,8 @@ use crate::events::EventEnvelopeV1;
 use crate::ownership::{OwnerLease, WorkspaceLease};
 use crate::projection::{ProjectionUpdate, SessionProjectionV1};
 use serde_json::Value;
+use std::collections::hash_map::DefaultHasher;
+use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 use std::sync::mpsc;
 use std::thread;
@@ -88,6 +90,12 @@ pub(crate) enum RouteDecisionV1 {
 
 pub(crate) trait RuntimeStore: Send + Sync {
     fn backend_name(&self) -> &'static str;
+    fn supports_parallel_writes(&self) -> bool {
+        false
+    }
+    fn writer_threads(&self) -> usize {
+        1
+    }
 
     fn get_events(&self, query: EventQuery) -> Result<Vec<EventEnvelopeV1>, String>;
     fn get_session_projection(
@@ -169,24 +177,55 @@ enum StoreWriteRequest {
 
 pub(crate) struct StoreWriterRuntimeStore {
     inner: Arc<dyn RuntimeStore>,
-    tx: mpsc::Sender<StoreWriteRequest>,
+    txs: Vec<mpsc::Sender<StoreWriteRequest>>,
+    writer_threads: usize,
 }
 
 impl StoreWriterRuntimeStore {
-    pub(crate) fn new(inner: Arc<dyn RuntimeStore>) -> Self {
-        let (tx, rx) = mpsc::channel::<StoreWriteRequest>();
-        let writer_inner = Arc::clone(&inner);
-        thread::Builder::new()
-            .name("agentcall-store-writer".to_string())
-            .spawn(move || store_writer_loop(writer_inner, rx))
-            .expect("failed to spawn AgentCall store writer");
-        Self { inner, tx }
+    pub(crate) fn new(inner: Arc<dyn RuntimeStore>, requested_threads: usize) -> Self {
+        let writer_threads = if inner.supports_parallel_writes() {
+            requested_threads.clamp(1, 6)
+        } else {
+            1
+        };
+        let mut txs = Vec::with_capacity(writer_threads);
+        for index in 0..writer_threads {
+            let (tx, rx) = mpsc::channel::<StoreWriteRequest>();
+            let writer_inner = Arc::clone(&inner);
+            thread::Builder::new()
+                .name(format!("agentcall-store-writer-{index}"))
+                .spawn(move || store_writer_loop(writer_inner, rx))
+                .expect("failed to spawn AgentCall store writer");
+            txs.push(tx);
+        }
+        Self {
+            inner,
+            txs,
+            writer_threads,
+        }
+    }
+
+    fn send(&self, request: StoreWriteRequest) -> Result<(), String> {
+        let index = request.shard_index(self.txs.len());
+        self.txs
+            .get(index)
+            .ok_or_else(|| format!("store_writer_missing: index={index}"))?
+            .send(request)
+            .map_err(|err| format!("store_writer_closed: {err}"))
     }
 }
 
 impl RuntimeStore for StoreWriterRuntimeStore {
     fn backend_name(&self) -> &'static str {
         self.inner.backend_name()
+    }
+
+    fn supports_parallel_writes(&self) -> bool {
+        self.inner.supports_parallel_writes()
+    }
+
+    fn writer_threads(&self) -> usize {
+        self.writer_threads
     }
 
     fn get_events(&self, query: EventQuery) -> Result<Vec<EventEnvelopeV1>, String> {
@@ -210,97 +249,79 @@ impl RuntimeStore for StoreWriterRuntimeStore {
 
     fn save_report_index(&self, report: &ReportIndexRecord) -> Result<(), String> {
         let (tx, rx) = mpsc::channel();
-        self.tx
-            .send(StoreWriteRequest::SaveReportIndex(report.clone(), tx))
-            .map_err(|err| format!("store_writer_closed: {err}"))?;
+        self.send(StoreWriteRequest::SaveReportIndex(report.clone(), tx))?;
         rx.recv()
             .map_err(|err| format!("store_writer_response_closed: {err}"))?
     }
 
     fn save_artifact_index(&self, artifact: &ArtifactIndexRecord) -> Result<(), String> {
         let (tx, rx) = mpsc::channel();
-        self.tx
-            .send(StoreWriteRequest::SaveArtifactIndex(artifact.clone(), tx))
-            .map_err(|err| format!("store_writer_closed: {err}"))?;
+        self.send(StoreWriteRequest::SaveArtifactIndex(artifact.clone(), tx))?;
         rx.recv()
             .map_err(|err| format!("store_writer_response_closed: {err}"))?
     }
 
     fn upsert_owner_lease(&self, lease: &OwnerLease) -> Result<(), String> {
         let (tx, rx) = mpsc::channel();
-        self.tx
-            .send(StoreWriteRequest::UpsertOwnerLease(lease.clone(), tx))
-            .map_err(|err| format!("store_writer_closed: {err}"))?;
+        self.send(StoreWriteRequest::UpsertOwnerLease(lease.clone(), tx))?;
         rx.recv()
             .map_err(|err| format!("store_writer_response_closed: {err}"))?
     }
 
     fn release_owner_lease(&self, session_id: &str, reason: &str) -> Result<(), String> {
         let (tx, rx) = mpsc::channel();
-        self.tx
-            .send(StoreWriteRequest::ReleaseOwnerLease(
-                session_id.to_string(),
-                reason.to_string(),
-                tx,
-            ))
-            .map_err(|err| format!("store_writer_closed: {err}"))?;
+        self.send(StoreWriteRequest::ReleaseOwnerLease(
+            session_id.to_string(),
+            reason.to_string(),
+            tx,
+        ))?;
         rx.recv()
             .map_err(|err| format!("store_writer_response_closed: {err}"))?
     }
 
     fn upsert_workspace_lease(&self, lease: &WorkspaceLease) -> Result<(), String> {
         let (tx, rx) = mpsc::channel();
-        self.tx
-            .send(StoreWriteRequest::UpsertWorkspaceLease(lease.clone(), tx))
-            .map_err(|err| format!("store_writer_closed: {err}"))?;
+        self.send(StoreWriteRequest::UpsertWorkspaceLease(lease.clone(), tx))?;
         rx.recv()
             .map_err(|err| format!("store_writer_response_closed: {err}"))?
     }
 
     fn release_workspace_lease(&self, session_id: &str, reason: &str) -> Result<(), String> {
         let (tx, rx) = mpsc::channel();
-        self.tx
-            .send(StoreWriteRequest::ReleaseWorkspaceLease(
-                session_id.to_string(),
-                reason.to_string(),
-                tx,
-            ))
-            .map_err(|err| format!("store_writer_closed: {err}"))?;
+        self.send(StoreWriteRequest::ReleaseWorkspaceLease(
+            session_id.to_string(),
+            reason.to_string(),
+            tx,
+        ))?;
         rx.recv()
             .map_err(|err| format!("store_writer_response_closed: {err}"))?
     }
 
     fn renew_owner_lease(&self, lease_id: &str) -> Result<(), String> {
         let (tx, rx) = mpsc::channel();
-        self.tx
-            .send(StoreWriteRequest::RenewOwnerLease(lease_id.to_string(), tx))
-            .map_err(|err| format!("store_writer_closed: {err}"))?;
+        self.send(StoreWriteRequest::RenewOwnerLease(lease_id.to_string(), tx))?;
         rx.recv()
             .map_err(|err| format!("store_writer_response_closed: {err}"))?
     }
 
     fn record_file_read(&self, session_id: &str, path: &str) -> Result<(), String> {
         let (tx, rx) = mpsc::channel();
-        self.tx
-            .send(StoreWriteRequest::RecordFileRead(
-                session_id.to_string(),
-                path.to_string(),
-                tx,
-            ))
-            .map_err(|err| format!("store_writer_closed: {err}"))?;
+        self.send(StoreWriteRequest::RecordFileRead(
+            session_id.to_string(),
+            path.to_string(),
+            tx,
+        ))?;
         rx.recv()
             .map_err(|err| format!("store_writer_response_closed: {err}"))?
     }
 
     fn record_file_write(&self, session_id: &str, path: &str) -> Result<(), String> {
         let (tx, rx) = mpsc::channel();
-        self.tx
-            .send(StoreWriteRequest::RecordFileWrite(
-                session_id.to_string(),
-                path.to_string(),
-                tx,
-            ))
-            .map_err(|err| format!("store_writer_closed: {err}"))?;
+        self.send(StoreWriteRequest::RecordFileWrite(
+            session_id.to_string(),
+            path.to_string(),
+            tx,
+        ))?;
         rx.recv()
             .map_err(|err| format!("store_writer_response_closed: {err}"))?
     }
@@ -311,13 +332,11 @@ impl RuntimeStore for StoreWriterRuntimeStore {
         projection_update: ProjectionUpdate,
     ) -> Result<AppendResult, String> {
         let (tx, rx) = mpsc::channel();
-        self.tx
-            .send(StoreWriteRequest::AppendEventAndUpdateProjection(
-                event.clone(),
-                projection_update,
-                tx,
-            ))
-            .map_err(|err| format!("store_writer_closed: {err}"))?;
+        self.send(StoreWriteRequest::AppendEventAndUpdateProjection(
+            event.clone(),
+            projection_update,
+            tx,
+        ))?;
         rx.recv()
             .map_err(|err| format!("store_writer_response_closed: {err}"))?
     }
@@ -327,12 +346,10 @@ impl RuntimeStore for StoreWriterRuntimeStore {
         command: &CommandEnvelopeV1,
     ) -> Result<IdempotencyDecisionV1, String> {
         let (tx, rx) = mpsc::channel();
-        self.tx
-            .send(StoreWriteRequest::RegisterCommandIdempotently(
-                command.clone(),
-                tx,
-            ))
-            .map_err(|err| format!("store_writer_closed: {err}"))?;
+        self.send(StoreWriteRequest::RegisterCommandIdempotently(
+            command.clone(),
+            tx,
+        ))?;
         rx.recv()
             .map_err(|err| format!("store_writer_response_closed: {err}"))?
     }
@@ -345,15 +362,13 @@ impl RuntimeStore for StoreWriterRuntimeStore {
         projection_update: ProjectionUpdate,
     ) -> Result<(), String> {
         let (tx, rx) = mpsc::channel();
-        self.tx
-            .send(StoreWriteRequest::CompleteCommandWithEvent(
-                command_id.to_string(),
-                status,
-                event.clone(),
-                projection_update,
-                tx,
-            ))
-            .map_err(|err| format!("store_writer_closed: {err}"))?;
+        self.send(StoreWriteRequest::CompleteCommandWithEvent(
+            command_id.to_string(),
+            status,
+            event.clone(),
+            projection_update,
+            tx,
+        ))?;
         rx.recv()
             .map_err(|err| format!("store_writer_response_closed: {err}"))?
     }
@@ -365,16 +380,56 @@ impl RuntimeStore for StoreWriterRuntimeStore {
         workspace_lease: Option<&WorkspaceLease>,
     ) -> Result<RouteDecisionV1, String> {
         let (tx, rx) = mpsc::channel();
-        self.tx
-            .send(StoreWriteRequest::AcquireRouteLeasesAndCreateSession(
-                session.clone(),
-                owner_lease.clone(),
-                workspace_lease.cloned(),
-                tx,
-            ))
-            .map_err(|err| format!("store_writer_closed: {err}"))?;
+        self.send(StoreWriteRequest::AcquireRouteLeasesAndCreateSession(
+            session.clone(),
+            owner_lease.clone(),
+            workspace_lease.cloned(),
+            tx,
+        ))?;
         rx.recv()
             .map_err(|err| format!("store_writer_response_closed: {err}"))?
+    }
+}
+
+impl StoreWriteRequest {
+    fn shard_index(&self, shards: usize) -> usize {
+        if shards <= 1 {
+            return 0;
+        }
+        let mut hasher = DefaultHasher::new();
+        self.shard_key().hash(&mut hasher);
+        (hasher.finish() as usize) % shards
+    }
+
+    fn shard_key(&self) -> String {
+        match self {
+            Self::SaveReportIndex(report, _) => format!("report:{}", report.report_id),
+            Self::SaveArtifactIndex(artifact, _) => format!("artifact:{}", artifact.artifact_id),
+            Self::UpsertOwnerLease(lease, _) => format!("session:{}", lease.session_id),
+            Self::ReleaseOwnerLease(session_id, _, _) => format!("session:{session_id}"),
+            Self::UpsertWorkspaceLease(lease, _) => format!("workspace:{}", lease.workspace_key),
+            Self::ReleaseWorkspaceLease(session_id, _, _) => format!("session:{session_id}"),
+            Self::RenewOwnerLease(lease_id, _) => format!("lease:{lease_id}"),
+            Self::RecordFileRead(session_id, _, _) | Self::RecordFileWrite(session_id, _, _) => {
+                format!("session:{session_id}")
+            }
+            Self::AppendEventAndUpdateProjection(event, _, _) => event
+                .session_id
+                .as_deref()
+                .map(|session_id| format!("session:{session_id}"))
+                .unwrap_or_else(|| format!("event:{}", event.global_seq)),
+            Self::RegisterCommandIdempotently(command, _) => {
+                format!("session:{}", command.session_id)
+            }
+            Self::CompleteCommandWithEvent(command_id, _, event, _, _) => event
+                .session_id
+                .as_deref()
+                .map(|session_id| format!("session:{session_id}"))
+                .unwrap_or_else(|| format!("command:{command_id}")),
+            Self::AcquireRouteLeasesAndCreateSession(session, _, _, _) => {
+                format!("session:{}", session.session_id)
+            }
+        }
     }
 }
 
@@ -457,11 +512,13 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]
-    fn store_writer_serializes_concurrent_command_writes() {
+    fn json_store_writer_stays_single_thread_even_when_parallel_requested() {
         let root = test_workspace("writer-commands");
-        let store: Arc<dyn RuntimeStore> = Arc::new(StoreWriterRuntimeStore::new(Arc::new(
-            JsonRuntimeStore::new(root.clone()),
-        )));
+        let store: Arc<dyn RuntimeStore> = Arc::new(StoreWriterRuntimeStore::new(
+            Arc::new(JsonRuntimeStore::new(root.clone())),
+            6,
+        ));
+        assert_eq!(store.writer_threads(), 1);
         let mut workers = Vec::new();
         for idx in 0..8 {
             let store = Arc::clone(&store);
@@ -479,6 +536,36 @@ mod tests {
         let commands_log = fs::read_to_string(root.join(".agentcall/state/commands.ndjson"))
             .expect("commands log should exist");
         assert_eq!(commands_log.lines().count(), 8);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn sqlite_store_writer_uses_parallel_threads_when_requested() {
+        let root = test_workspace("writer-sqlite-commands");
+        let store: Arc<dyn RuntimeStore> = Arc::new(StoreWriterRuntimeStore::new(
+            Arc::new(crate::store_sqlite::SqliteRuntimeStore::new(root.clone()).unwrap()),
+            6,
+        ));
+        assert_eq!(store.writer_threads(), 6);
+        let mut workers = Vec::new();
+        for idx in 0..24 {
+            let store = Arc::clone(&store);
+            workers.push(std::thread::spawn(move || {
+                let command = command_for(idx);
+                store.register_command_idempotently(&command).unwrap()
+            }));
+        }
+        for worker in workers {
+            assert!(matches!(
+                worker.join().unwrap(),
+                IdempotencyDecisionV1::Recorded(_)
+            ));
+        }
+        let events = store
+            .get_idempotency("codex", "idem-23")
+            .unwrap()
+            .expect("last command idempotency should be recorded");
+        assert_eq!(events.idempotency_key, "idem-23");
         let _ = fs::remove_dir_all(root);
     }
 

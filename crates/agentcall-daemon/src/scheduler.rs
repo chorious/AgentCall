@@ -1,4 +1,4 @@
-use crate::errors::structured_error;
+use crate::errors::{ErrorCode, structured_error};
 use crate::ownership::{
     owner_lease_is_active, prune_expired_leases, release_orphaned_runtime_leases,
 };
@@ -28,7 +28,7 @@ pub(crate) fn enforce_start_capacity(
         return Ok(decision);
     }
     Err(structured_error(
-        "capacity_exceeded",
+        ErrorCode::CapacityExceeded,
         decision.reason.clone(),
         json!({
             "active_sessions": decision.active_sessions,

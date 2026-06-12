@@ -1,19 +1,156 @@
 use serde_json::{Value, json};
 
-pub(crate) fn structured_error(code: &str, message: impl Into<String>, details: Value) -> String {
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ErrorCode {
+    WorkspaceBusy,
+    OwnerLeaseExists,
+    OwnerConflict,
+    OwnerMismatch,
+    StaleLease,
+    StaleLeaseGeneration,
+    ExpiredLease,
+    CapacityExceeded,
+    MissingControlToken,
+    InvalidControlToken,
+    MissingPrecondition,
+    AuthenticationRequired,
+    Forbidden,
+    BadRequest,
+    InternalError,
+}
+
+impl ErrorCode {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::WorkspaceBusy => "workspace_busy",
+            Self::OwnerLeaseExists => "owner_lease_exists",
+            Self::OwnerConflict => "owner_conflict",
+            Self::OwnerMismatch => "owner_mismatch",
+            Self::StaleLease => "stale_lease",
+            Self::StaleLeaseGeneration => "stale_lease_generation",
+            Self::ExpiredLease => "expired_lease",
+            Self::CapacityExceeded => "capacity_exceeded",
+            Self::MissingControlToken => "missing_control_token",
+            Self::InvalidControlToken => "invalid_control_token",
+            Self::MissingPrecondition => "missing_precondition",
+            Self::AuthenticationRequired => "authentication_required",
+            Self::Forbidden => "forbidden",
+            Self::BadRequest => "bad_request",
+            Self::InternalError => "internal_error",
+        }
+    }
+
+    pub(crate) fn from_str(value: &str) -> Option<Self> {
+        Some(match value {
+            "workspace_busy" => Self::WorkspaceBusy,
+            "owner_lease_exists" => Self::OwnerLeaseExists,
+            "owner_conflict" => Self::OwnerConflict,
+            "owner_mismatch" => Self::OwnerMismatch,
+            "stale_lease" => Self::StaleLease,
+            "stale_lease_generation" => Self::StaleLeaseGeneration,
+            "expired_lease" => Self::ExpiredLease,
+            "capacity_exceeded" => Self::CapacityExceeded,
+            "missing_control_token" => Self::MissingControlToken,
+            "invalid_control_token" => Self::InvalidControlToken,
+            "missing_precondition" => Self::MissingPrecondition,
+            "authentication_required" => Self::AuthenticationRequired,
+            "forbidden" => Self::Forbidden,
+            "bad_request" => Self::BadRequest,
+            "internal_error" => Self::InternalError,
+            _ => return None,
+        })
+    }
+
+    fn http_status(self, fallback: u16) -> u16 {
+        match self {
+            Self::WorkspaceBusy
+            | Self::OwnerLeaseExists
+            | Self::OwnerConflict
+            | Self::OwnerMismatch
+            | Self::StaleLease
+            | Self::StaleLeaseGeneration
+            | Self::ExpiredLease => 409,
+            Self::CapacityExceeded => 429,
+            Self::MissingControlToken | Self::InvalidControlToken | Self::MissingPrecondition => {
+                428
+            }
+            Self::AuthenticationRequired => 401,
+            Self::Forbidden => 403,
+            Self::InternalError => 500,
+            Self::BadRequest => fallback,
+        }
+    }
+
+    fn metadata(self) -> (&'static str, bool, &'static str) {
+        match self {
+            Self::WorkspaceBusy => (
+                "safety_lock",
+                false,
+                "Another active worker owns an incompatible workspace lease.",
+            ),
+            Self::OwnerLeaseExists => (
+                "safety_lock",
+                false,
+                "The session already has an active owner lease; use the existing control token or stop/release the session.",
+            ),
+            Self::OwnerConflict | Self::OwnerMismatch => (
+                "safety_lock",
+                false,
+                "The session belongs to another owner.",
+            ),
+            Self::StaleLease | Self::StaleLeaseGeneration | Self::ExpiredLease => (
+                "safety_lock",
+                false,
+                "Refresh board/session summary and retry with the daemon-minted control token.",
+            ),
+            Self::CapacityExceeded => (
+                "safety_lock",
+                true,
+                "Active worker capacity is full; wait for a worker to finish or stop an obsolete session.",
+            ),
+            Self::MissingControlToken | Self::InvalidControlToken | Self::MissingPrecondition => (
+                "safety_lock",
+                false,
+                "Use the control token and precondition returned by agentcall_session summary.",
+            ),
+            Self::AuthenticationRequired => (
+                "auth",
+                false,
+                "Configure daemon_token for both daemon and MCP bridge, or explicitly enable dev_open_loopback locally.",
+            ),
+            Self::Forbidden => (
+                "auth",
+                false,
+                "Only loopback Host/Origin requests are accepted by the daemon API.",
+            ),
+            Self::InternalError => (
+                "internal",
+                false,
+                "Inspect daemon logs; this should not be retried blindly.",
+            ),
+            Self::BadRequest => ("validation", false, "Fix the request payload and retry."),
+        }
+    }
+}
+
+pub(crate) fn structured_error(
+    code: ErrorCode,
+    message: impl Into<String>,
+    details: Value,
+) -> String {
     serde_json::to_string(&structured_error_value(code, message, details))
         .unwrap_or_else(|_| "{\"error\":{\"code\":\"internal_error\"}}".to_string())
 }
 
 pub(crate) fn structured_error_value(
-    code: &str,
+    code: ErrorCode,
     message: impl Into<String>,
     details: Value,
 ) -> Value {
-    let (category, retryable, hint) = metadata_for_code(code);
+    let (category, retryable, hint) = code.metadata();
     json!({
         "error": {
-            "code": code,
+            "code": code.as_str(),
             "category": category,
             "message": message.into(),
             "details": details,
@@ -38,62 +175,52 @@ pub(crate) fn error_value(message: &str) -> Value {
 }
 
 pub(crate) fn status_for_error(value: &Value, fallback: u16) -> u16 {
-    match value.pointer("/error/code").and_then(Value::as_str) {
-        Some("workspace_busy")
-        | Some("owner_lease_exists")
-        | Some("owner_conflict")
-        | Some("owner_mismatch")
-        | Some("stale_lease")
-        | Some("stale_lease_generation")
-        | Some("expired_lease") => 409,
-        Some("capacity_exceeded") => 429,
-        Some("missing_control_token")
-        | Some("invalid_control_token")
-        | Some("missing_precondition") => 428,
-        Some("authentication_required") => 401,
-        Some("forbidden") => 403,
-        _ => fallback,
-    }
+    value
+        .pointer("/error/code")
+        .and_then(Value::as_str)
+        .and_then(ErrorCode::from_str)
+        .map(|code| code.http_status(fallback))
+        .unwrap_or(fallback)
 }
 
-fn classify_message(message: &str) -> &'static str {
+fn classify_message(message: &str) -> ErrorCode {
     let lower = message.to_ascii_lowercase();
     if lower.starts_with("workspace_busy:") {
-        "workspace_busy"
+        ErrorCode::WorkspaceBusy
     } else if lower.starts_with("rejected_existing_owner_lease:") {
-        "owner_lease_exists"
+        ErrorCode::OwnerLeaseExists
     } else if lower.starts_with("rejected_owner_conflict:") {
-        "owner_conflict"
+        ErrorCode::OwnerConflict
     } else if lower.starts_with("rejected_owner_mismatch:") {
-        "owner_mismatch"
+        ErrorCode::OwnerMismatch
     } else if lower.starts_with("rejected_stale_lease_generation:") {
-        "stale_lease_generation"
+        ErrorCode::StaleLeaseGeneration
     } else if lower.starts_with("rejected_stale_lease:") {
-        "stale_lease"
+        ErrorCode::StaleLease
     } else if lower.starts_with("rejected_expired_lease:") {
-        "expired_lease"
+        ErrorCode::ExpiredLease
     } else if lower.starts_with("capacity_exceeded:") {
-        "capacity_exceeded"
+        ErrorCode::CapacityExceeded
     } else if lower.contains("missing control token") || lower.contains("control_token_required") {
-        "missing_control_token"
+        ErrorCode::MissingControlToken
     } else if lower.contains("invalid control token") {
-        "invalid_control_token"
+        ErrorCode::InvalidControlToken
     } else if lower.contains("daemon token is required")
         || lower.contains("invalid or missing daemon token")
     {
-        "authentication_required"
+        ErrorCode::AuthenticationRequired
     } else if lower.contains("host not allowed") || lower.contains("origin not allowed") {
-        "forbidden"
+        ErrorCode::Forbidden
     } else {
-        "bad_request"
+        ErrorCode::BadRequest
     }
 }
 
-fn details_from_message(code: &str, message: &str) -> Value {
+fn details_from_message(code: ErrorCode, message: &str) -> Value {
     match code {
-        "workspace_busy" => parse_workspace_busy(message),
-        "owner_lease_exists" => parse_key_values(message),
-        "capacity_exceeded" => parse_key_values(message),
+        ErrorCode::WorkspaceBusy => parse_workspace_busy(message),
+        ErrorCode::OwnerLeaseExists => parse_key_values(message),
+        ErrorCode::CapacityExceeded => parse_key_values(message),
         _ => json!({}),
     }
 }
@@ -122,50 +249,4 @@ fn parse_key_values(message: &str) -> Value {
         );
     }
     Value::Object(object)
-}
-
-fn metadata_for_code(code: &str) -> (&'static str, bool, &'static str) {
-    match code {
-        "workspace_busy" => (
-            "safety_lock",
-            false,
-            "Another active worker owns an incompatible workspace lease.",
-        ),
-        "owner_lease_exists" => (
-            "safety_lock",
-            false,
-            "The session already has an active owner lease; use the existing control token or stop/release the session.",
-        ),
-        "owner_conflict" | "owner_mismatch" => (
-            "safety_lock",
-            false,
-            "The session belongs to another owner.",
-        ),
-        "stale_lease" | "stale_lease_generation" | "expired_lease" => (
-            "safety_lock",
-            false,
-            "Refresh board/session summary and retry with the daemon-minted control token.",
-        ),
-        "capacity_exceeded" => (
-            "safety_lock",
-            true,
-            "Active worker capacity is full; wait for a worker to finish or stop an obsolete session.",
-        ),
-        "missing_control_token" | "invalid_control_token" | "missing_precondition" => (
-            "safety_lock",
-            false,
-            "Use the control token and precondition returned by agentcall_session summary.",
-        ),
-        "authentication_required" => (
-            "auth",
-            false,
-            "Configure daemon_token for both daemon and MCP bridge, or explicitly enable dev_open_loopback locally.",
-        ),
-        "forbidden" => (
-            "auth",
-            false,
-            "Only loopback Host/Origin requests are accepted by the daemon API.",
-        ),
-        _ => ("validation", false, "Fix the request payload and retry."),
-    }
 }

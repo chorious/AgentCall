@@ -27,7 +27,7 @@ AgentCall lets Codex supervise Claude Code PTY utility workers through a local R
 
 ## Version Discipline
 
-- Current product version: `6.5.0`.
+- Current product version: `6.6.0`.
 - Product version is the single public version source. Keep these in lockstep: README/CHANGELOG, Rust crate versions, `pyproject.toml`, MCP `SERVER_VERSION`, Codex plugin manifest, `Cargo.lock`, and the live daemon build version.
 - Do not claim a version bump is complete after only editing source files. Rebuild and restart daemon/MCP where applicable, then verify `agentcall_daemon(action=status)` reports the same build version.
 - If source version and live daemon version differ, report version drift explicitly and rebuild/restart before continuing live validation.
@@ -141,16 +141,19 @@ git diff --check
 - Put old reviews under `docs/arch/review/`.
 - Root directory should stay focused on source entrypoints, README, CHANGELOG, config template, and build manifests.
 
-## Current v6.5 Status
+## Current v6.6 Status
 
 See `docs/v6.2-code-plan.md` for the frozen implementation baseline. Do not edit that plan during implementation.
 
 - v6.2 keeps the default Codex loop slim: compact board, route start, normalized worker summary, explicit next actions, report request, and structured report acceptance.
 - v6.3 adds structured safety-lock errors and version alignment over that baseline.
 - v6.5 removes the `read_only` route line and leaves only `coding` and `report` worker kinds.
+- v6.6 makes daemon safety-lock errors enum-backed, enables SQLite store writer fanout up to the configured six-worker concurrency limit, and lets daemon auto-commit stale prompt-pending PTY handoffs before Codex has to use debug recovery.
 - `workspace_busy`, `owner_lease_exists`, `capacity_exceeded`, and control-precondition failures must surface structured error codes and details instead of a bare `400`.
+- New safety-lock codes must be added as `ErrorCode` enum variants first; do not introduce ad hoc string-only error codes in daemon live paths.
+- SQLite is the recommended RuntimeStore backend for live multi-worker use. It may use `store_writer_threads=6`; JSON remains a single-writer safety fallback even if a larger writer count is configured.
 - report workers may share a target workspace lease and write only report/scratch artifacts; coding workers that write implementation paths still require exclusive workspace ownership.
-- `submit_pending_prompt` is a finite prompt commit signal, not a completion state; it must converge to `prompt_submitted` or `prompt_commit_unacknowledged`.
+- `submit_pending_prompt` is a finite debug/recovery prompt commit signal, not a normal completion state; daemon should auto-commit stale `prompt_pending_ack` routes and converge to `prompt_submitted` or `prompt_commit_unacknowledged`.
 - `agentcall_route` mints a unique per-route report path under the target workspace when `report_path` is omitted.
 - `agentcall_session_send(action=request_report)` is a finite report state transition; observe `report_requested`, `report_drafting`, `report_ready`, or `report_overdue`.
 - Report acceptance confidence is split into `overall`, `artifact`, `daemon_write`, and `route_match`; `overall=high` requires daemon-observed evidence.

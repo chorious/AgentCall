@@ -167,130 +167,19 @@ pub(crate) fn worker_state_for_session(state: &AppState, session_name: &str) -> 
     };
     let live = session_updated_at.is_some();
 
-    let (state_kind, why, can_wait) = if terminal
-        || matches!(liveness, "completed" | "stopped" | "killed")
-        || !live
-    {
-        (
-            WorkerStateKind::Done,
-            "The daemon no longer has a live PTY worker for this session.".to_string(),
-            false,
-        )
-    } else if matches!(liveness, "failed" | "failed_or_orphaned") || attention == "failed" {
-        (
-            WorkerStateKind::Failed,
-            "The worker hit a terminal failure or orphaned session state.".to_string(),
-            false,
-        )
-    } else if report_status == "report_accepted" {
-        (
-            WorkerStateKind::ReportAccepted,
-            "The worker report was accepted by the supervisor.".to_string(),
-            false,
-        )
-    } else if report_ready || attention == "report_ready" {
-        (
-            WorkerStateKind::ReportReady,
-            "The worker wrote the expected report or produced report-ready evidence.".to_string(),
-            false,
-        )
-    } else if report_is_overdue(&report) {
-        (
-            WorkerStateKind::ReportOverdue,
-            "A report was requested but no report-ready evidence arrived before the deadline."
-                .to_string(),
-            false,
-        )
-    } else if report_status == "report_drafting" {
-        (
-            WorkerStateKind::ReportDrafting,
-            "A report was requested and the worker has produced tool/hook progress since then."
-                .to_string(),
-            true,
-        )
-    } else if report_status == "report_requested" {
-        (
-            WorkerStateKind::ReportRequested,
-            "A report has been requested; waiting for report write evidence.".to_string(),
-            true,
-        )
-    } else if prompt_gate.state == PromptGateState::PromptCommitUnacknowledged {
-        (
-            WorkerStateKind::PromptCommitUnacknowledged,
-            "A prompt commit signal was sent, but UserPromptSubmit or worker progress was not observed before the deadline.".to_string(),
-            false,
-        )
-    } else if prompt_gate.state == PromptGateState::PromptMissing {
-        (
-            WorkerStateKind::PromptMissing,
-            "Route prompt was written to the PTY but UserPromptSubmit was not observed before the ack deadline.".to_string(),
-            false,
-        )
-    } else if matches!(prompt_gate.state, PromptGateState::CommitSignalSent) {
-        (
-            WorkerStateKind::PromptPending,
-            "A prompt commit signal was sent; waiting for UserPromptSubmit or worker progress."
-                .to_string(),
-            true,
-        )
-    } else if prompt_gate.is_prompt_gate_active() {
-        (
-            WorkerStateKind::PromptPending,
-            "PTY worker was spawned; waiting for Claude Code to emit UserPromptSubmit.".to_string(),
-            true,
-        )
-    } else if prompt_gate.state == PromptGateState::PromptSubmitted && liveness == "unknown" {
-        (
-            WorkerStateKind::PromptSubmitted,
-            "The route prompt was submitted; waiting for hook or tool progress.".to_string(),
-            true,
-        )
-    } else if attention == "needs_permission" {
-        (
-            WorkerStateKind::NeedsPermission,
-            "Claude Code is showing a permission or menu prompt.".to_string(),
-            false,
-        )
-    } else if attention == "blocked_by_policy" {
-        (
-            WorkerStateKind::BlockedByPolicy,
-            "The worker repeated or hit a denied policy action.".to_string(),
-            false,
-        )
-    } else if attention == "checkpoint_due" {
-        (
-            WorkerStateKind::CheckpointDue,
-            "Claude Code reached a checkpoint or subagent stop; inspect report/progress before continuing.".to_string(),
-            false,
-        )
-    } else if attention == "waiting_input" || liveness == "waiting_input" {
-        (
-            WorkerStateKind::IdleAfterTurn,
-            "Claude Code is idle after a turn; inspect report/progress before sending more text."
-                .to_string(),
-            false,
-        )
-    } else if matches!(liveness, "stopping" | "killing") {
-        (
-            WorkerStateKind::Stopping,
-            "A stop or kill command has been dispatched; waiting for observed process exit."
-                .to_string(),
-            true,
-        )
-    } else if liveness == "working" {
-        (
-            WorkerStateKind::Working,
-            "UserPromptSubmit was observed or the worker is running tool work.".to_string(),
-            true,
-        )
-    } else {
-        (
-            WorkerStateKind::Starting,
-            "The worker is starting and has not produced enough structured progress yet."
-                .to_string(),
-            true,
-        )
-    };
+    let decision = decide_worker_state(WorkerDecisionInput {
+        terminal,
+        live,
+        liveness,
+        attention,
+        report_status: &report_status,
+        report_ready,
+        report: &report,
+        prompt_gate: &prompt_gate,
+    });
+    let state_kind = decision.state;
+    let why = decision.why;
+    let can_wait = decision.can_wait;
 
     let last_progress_age_seconds = session_updated_at
         .map(|updated_at| now_ms().saturating_sub(updated_at) / 1000)
@@ -421,6 +310,168 @@ fn report_is_overdue(report: &Value) -> bool {
         .get("deadline_at_ms")
         .and_then(Value::as_u64)
         .is_some_and(|deadline| deadline <= now_ms())
+}
+
+struct WorkerDecisionInput<'a> {
+    terminal: bool,
+    live: bool,
+    liveness: &'a str,
+    attention: &'a str,
+    report_status: &'a str,
+    report_ready: bool,
+    report: &'a Value,
+    prompt_gate: &'a PromptGateView,
+}
+
+struct WorkerDecision {
+    state: WorkerStateKind,
+    why: String,
+    can_wait: bool,
+}
+
+fn decide_worker_state(input: WorkerDecisionInput<'_>) -> WorkerDecision {
+    if input.terminal || matches!(input.liveness, "completed" | "stopped" | "killed") || !input.live
+    {
+        return worker_decision(
+            WorkerStateKind::Done,
+            "The daemon no longer has a live PTY worker for this session.",
+            false,
+        );
+    }
+    if matches!(input.liveness, "failed" | "failed_or_orphaned") || input.attention == "failed" {
+        return worker_decision(
+            WorkerStateKind::Failed,
+            "The worker hit a terminal failure or orphaned session state.",
+            false,
+        );
+    }
+    if input.report_status == "report_accepted" {
+        return worker_decision(
+            WorkerStateKind::ReportAccepted,
+            "The worker report was accepted by the supervisor.",
+            false,
+        );
+    }
+    if input.report_ready || input.attention == "report_ready" {
+        return worker_decision(
+            WorkerStateKind::ReportReady,
+            "The worker wrote the expected report or produced report-ready evidence.",
+            false,
+        );
+    }
+    if report_is_overdue(input.report) {
+        return worker_decision(
+            WorkerStateKind::ReportOverdue,
+            "A report was requested but no report-ready evidence arrived before the deadline.",
+            false,
+        );
+    }
+    if input.report_status == "report_drafting" {
+        return worker_decision(
+            WorkerStateKind::ReportDrafting,
+            "A report was requested and the worker has produced tool/hook progress since then.",
+            true,
+        );
+    }
+    if input.report_status == "report_requested" {
+        return worker_decision(
+            WorkerStateKind::ReportRequested,
+            "A report has been requested; waiting for report write evidence.",
+            true,
+        );
+    }
+    if let Some(decision) = decide_prompt_gate_state(input.prompt_gate, input.liveness) {
+        return decision;
+    }
+    if input.attention == "needs_permission" {
+        return worker_decision(
+            WorkerStateKind::NeedsPermission,
+            "Claude Code is showing a permission or menu prompt.",
+            false,
+        );
+    }
+    if input.attention == "blocked_by_policy" {
+        return worker_decision(
+            WorkerStateKind::BlockedByPolicy,
+            "The worker repeated or hit a denied policy action.",
+            false,
+        );
+    }
+    if input.attention == "checkpoint_due" {
+        return worker_decision(
+            WorkerStateKind::CheckpointDue,
+            "Claude Code reached a checkpoint or subagent stop; inspect report/progress before continuing.",
+            false,
+        );
+    }
+    if input.attention == "waiting_input" || input.liveness == "waiting_input" {
+        return worker_decision(
+            WorkerStateKind::IdleAfterTurn,
+            "Claude Code is idle after a turn; inspect report/progress before sending more text.",
+            false,
+        );
+    }
+    if matches!(input.liveness, "stopping" | "killing") {
+        return worker_decision(
+            WorkerStateKind::Stopping,
+            "A stop or kill command has been dispatched; waiting for observed process exit.",
+            true,
+        );
+    }
+    if input.liveness == "working" {
+        return worker_decision(
+            WorkerStateKind::Working,
+            "UserPromptSubmit was observed or the worker is running tool work.",
+            true,
+        );
+    }
+    worker_decision(
+        WorkerStateKind::Starting,
+        "The worker is starting and has not produced enough structured progress yet.",
+        true,
+    )
+}
+
+fn decide_prompt_gate_state(
+    prompt_gate: &PromptGateView,
+    liveness: &str,
+) -> Option<WorkerDecision> {
+    match prompt_gate.state {
+        PromptGateState::PromptCommitUnacknowledged => Some(worker_decision(
+            WorkerStateKind::PromptCommitUnacknowledged,
+            "A prompt commit signal was sent, but UserPromptSubmit or worker progress was not observed before the deadline.",
+            false,
+        )),
+        PromptGateState::PromptMissing => Some(worker_decision(
+            WorkerStateKind::PromptMissing,
+            "Route prompt was written to the PTY but UserPromptSubmit was not observed before the ack deadline; daemon auto-commit has already been attempted.",
+            false,
+        )),
+        PromptGateState::CommitSignalSent => Some(worker_decision(
+            WorkerStateKind::PromptPending,
+            "A prompt commit signal was sent; waiting for UserPromptSubmit or worker progress.",
+            true,
+        )),
+        _ if prompt_gate.is_prompt_gate_active() => Some(worker_decision(
+            WorkerStateKind::PromptPending,
+            "PTY worker was spawned; daemon is waiting for or auto-committing the route prompt.",
+            true,
+        )),
+        PromptGateState::PromptSubmitted if liveness == "unknown" => Some(worker_decision(
+            WorkerStateKind::PromptSubmitted,
+            "The route prompt was submitted; waiting for hook or tool progress.",
+            true,
+        )),
+        _ => None,
+    }
+}
+
+fn worker_decision(state: WorkerStateKind, why: &str, can_wait: bool) -> WorkerDecision {
+    WorkerDecision {
+        state,
+        why: why.to_string(),
+        can_wait,
+    }
 }
 
 fn patience_for_state(state: &WorkerStateKind, last_progress_age_seconds: u64) -> Value {

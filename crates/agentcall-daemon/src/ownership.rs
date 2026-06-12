@@ -1,4 +1,4 @@
-use crate::errors::structured_error;
+use crate::errors::{ErrorCode, structured_error};
 use crate::state::{AppState, read_json_file, write_json_file};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -213,7 +213,7 @@ pub(crate) fn ensure_owner_lease(
     if let Some(existing) = leases.get(session_id) {
         if existing.owner_id != owner_id {
             return Err(structured_error(
-                "owner_conflict",
+                ErrorCode::OwnerConflict,
                 "Session is already owned by another owner.",
                 json!({
                     "session_id": session_id,
@@ -369,7 +369,7 @@ pub(crate) fn reserve_route_leases(
         if let Some(existing) = owner_leases.get(session_id) {
             if owner_lease_is_active(existing, now) {
                 return Err(structured_error(
-                    "owner_lease_exists",
+                    ErrorCode::OwnerLeaseExists,
                     "Session already has an active owner lease.",
                     json!({
                         "session_id": session_id,
@@ -398,7 +398,7 @@ pub(crate) fn reserve_route_leases(
                 || workspace_lease.mode == WorkspaceLeaseMode::Exclusive
             {
                 return Err(structured_error(
-                    "workspace_busy",
+                    ErrorCode::WorkspaceBusy,
                     "Workspace has an incompatible active lease.",
                     json!({
                         "workspace": workspace.display().to_string(),
@@ -492,7 +492,7 @@ pub(crate) fn acquire_workspace_lease(
         }
         if existing.mode == WorkspaceLeaseMode::Exclusive || mode == WorkspaceLeaseMode::Exclusive {
             return Err(structured_error(
-                "workspace_busy",
+                ErrorCode::WorkspaceBusy,
                 "Workspace has an incompatible active lease.",
                 json!({
                     "workspace": workspace.display().to_string(),

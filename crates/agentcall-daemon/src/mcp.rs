@@ -2271,6 +2271,54 @@ mod tests {
     }
 
     #[test]
+    fn prompt_gate_refresh_auto_submits_pending_prompt_after_short_grace() {
+        let root = std::env::temp_dir().join(format!(
+            "agentcall-mcp-auto-submit-pending-ack-v66-{}",
+            std::process::id()
+        ));
+        let state = AppState::test(root.clone());
+        install_prompt_gate_route(
+            &state,
+            "route-pty",
+            "worker-a",
+            json!({
+                "schema_version": 2,
+                "state": "prompt_pending_ack",
+                "task_started": false,
+                "prompt_id": "route_prompt:route-pty:worker-a",
+                "prompt_written_at_ms": now_ms().saturating_sub(crate::prompt_gate::DEFAULT_AUTO_COMMIT_GRACE_MS + 100),
+                "awaiting_hook": "UserPromptSubmit",
+                "ack_deadline_ms": 15_000,
+                "commit_ack_deadline_ms": DEFAULT_COMMIT_ACK_DEADLINE_MS,
+                "commit_attempts": []
+            }),
+        );
+        install_ok_actor(&state, "worker-a");
+
+        let gate = crate::prompt_gate::refresh_prompt_gate_timeouts_for_session(&state, "worker-a");
+
+        assert_eq!(
+            gate.state,
+            crate::prompt_gate::PromptGateState::CommitSignalSent
+        );
+        let routes = crate::state::read_json_file(
+            &state
+                .workspace
+                .join(".agentcall")
+                .join("state")
+                .join("routes.json"),
+            json!({}),
+        );
+        let route = routes.get("route-pty").unwrap();
+        assert_eq!(route["status"], "prompt_commit_signal_sent");
+        assert_eq!(
+            route["result"]["prompt_gate"]["commit_attempts"][0]["kind"],
+            "daemon_auto"
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn prompt_commit_signal_sent_expires_to_unacknowledged() {
         let root = std::env::temp_dir().join(format!(
             "agentcall-mcp-commit-unack-v61-{}",

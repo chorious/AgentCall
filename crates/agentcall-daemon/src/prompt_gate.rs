@@ -7,6 +7,7 @@ use serde_json::{Value, json};
 
 pub(crate) const DEFAULT_ACK_DEADLINE_MS: u64 = 15_000;
 pub(crate) const DEFAULT_COMMIT_ACK_DEADLINE_MS: u64 = 8_000;
+pub(crate) const DEFAULT_AUTO_COMMIT_GRACE_MS: u64 = 2_000;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum PromptGateState {
@@ -45,6 +46,7 @@ pub(crate) struct PromptGateView {
     pub(crate) commit_deadline_exceeded: bool,
     pub(crate) commit_attempts: u64,
     pub(crate) active_commit_attempt_id: Option<String>,
+    pub(crate) prompt_age_ms: u64,
     pub(crate) ack_deadline_ms: u64,
     pub(crate) commit_ack_deadline_ms: u64,
     pub(crate) awaiting_hook: Option<String>,
@@ -62,6 +64,7 @@ impl PromptGateView {
             commit_deadline_exceeded: false,
             commit_attempts: 0,
             active_commit_attempt_id: None,
+            prompt_age_ms: 0,
             ack_deadline_ms: DEFAULT_ACK_DEADLINE_MS,
             commit_ack_deadline_ms: DEFAULT_COMMIT_ACK_DEADLINE_MS,
             awaiting_hook: None,
@@ -75,6 +78,14 @@ impl PromptGateView {
             PromptGateState::PromptMissing | PromptGateState::PromptCommitUnacknowledged
         ) && !self.task_started
             && self.commit_attempts < 2
+    }
+
+    pub(crate) fn can_daemon_auto_submit_pending_prompt(&self) -> bool {
+        !self.task_started
+            && self.commit_attempts < 2
+            && (self.can_submit_pending_prompt()
+                || (self.state == PromptGateState::PromptPendingAck
+                    && self.prompt_age_ms >= DEFAULT_AUTO_COMMIT_GRACE_MS))
     }
 
     pub(crate) fn is_prompt_gate_active(&self) -> bool {
@@ -100,7 +111,10 @@ impl PromptGateView {
             "commit_deadline_exceeded": self.commit_deadline_exceeded,
             "commit_attempts": self.commit_attempts,
             "active_commit_attempt_id": self.active_commit_attempt_id,
+            "prompt_age_ms": self.prompt_age_ms,
+            "daemon_auto_commit_after_ms": DEFAULT_AUTO_COMMIT_GRACE_MS,
             "can_submit_pending_prompt": self.can_submit_pending_prompt(),
+            "daemon_auto_submit_enabled": self.can_daemon_auto_submit_pending_prompt(),
             "handoff_path": self.handoff_path,
         })
     }
@@ -130,7 +144,7 @@ pub(crate) fn refresh_prompt_gate_timeouts_for_session(
     wrapper_session: &str,
 ) -> PromptGateView {
     let view = prompt_gate_for_session(state, wrapper_session);
-    if view.can_submit_pending_prompt() {
+    if view.can_daemon_auto_submit_pending_prompt() {
         if daemon_auto_submit_pending_prompt(state, wrapper_session, &view).is_ok() {
             return prompt_gate_for_session(state, wrapper_session);
         }
@@ -298,6 +312,11 @@ pub(crate) fn prompt_gate_from_route(route_id: &str, route: &Value) -> PromptGat
     let ack_deadline_exceeded = !task_started
         && prompt_written_at > 0
         && now_ms().saturating_sub(prompt_written_at) >= ack_deadline_ms;
+    let prompt_age_ms = if prompt_written_at > 0 {
+        now_ms().saturating_sub(prompt_written_at)
+    } else {
+        0
+    };
     let active_commit_attempt_id = gate
         .get("active_commit_attempt_id")
         .and_then(Value::as_str)
@@ -360,6 +379,7 @@ pub(crate) fn prompt_gate_from_route(route_id: &str, route: &Value) -> PromptGat
         commit_deadline_exceeded,
         commit_attempts,
         active_commit_attempt_id,
+        prompt_age_ms,
         ack_deadline_ms,
         commit_ack_deadline_ms,
         awaiting_hook: gate

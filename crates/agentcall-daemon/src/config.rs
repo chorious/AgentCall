@@ -5,6 +5,7 @@ use std::path::{Path, PathBuf};
 pub(crate) struct LocalConfig {
     pub(crate) claude_workspace: Option<PathBuf>,
     pub(crate) store_backend: Option<String>,
+    pub(crate) store_writer_threads: Option<usize>,
     pub(crate) max_sessions: Option<usize>,
     pub(crate) per_owner_max_sessions: Option<usize>,
     pub(crate) experimental_sdk_runtime: Option<bool>,

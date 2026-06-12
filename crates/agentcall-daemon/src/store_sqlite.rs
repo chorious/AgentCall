@@ -57,6 +57,10 @@ impl RuntimeStore for SqliteRuntimeStore {
         "sqlite"
     }
 
+    fn supports_parallel_writes(&self) -> bool {
+        true
+    }
+
     fn get_events(&self, query: EventQuery) -> Result<Vec<EventEnvelopeV1>, String> {
         let conn = self.connect()?;
         let requested_limit = if query.limit == 0 {

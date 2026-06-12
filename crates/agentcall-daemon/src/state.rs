@@ -96,14 +96,30 @@ impl AppState {
 }
 
 fn configured_runtime_store(workspace: &Path, config: &LocalConfig) -> Arc<dyn RuntimeStore> {
+    let requested_writer_threads = config
+        .store_writer_threads
+        .or(config.max_sessions)
+        .unwrap_or(6)
+        .clamp(1, 6);
     match config.store_backend.as_deref() {
-        Some("sqlite") => Arc::new(StoreWriterRuntimeStore::new(Arc::new(
-            SqliteRuntimeStore::new(workspace.to_path_buf())
-                .expect("failed to initialize sqlite runtime store"),
-        ))),
-        _ => Arc::new(StoreWriterRuntimeStore::new(Arc::new(
-            JsonRuntimeStore::new(workspace.to_path_buf()),
-        ))),
+        Some("sqlite") => {
+            let inner: Arc<dyn RuntimeStore> = Arc::new(
+                SqliteRuntimeStore::new(workspace.to_path_buf())
+                    .expect("failed to initialize sqlite runtime store"),
+            );
+            Arc::new(StoreWriterRuntimeStore::new(
+                inner,
+                requested_writer_threads,
+            ))
+        }
+        _ => {
+            let inner: Arc<dyn RuntimeStore> =
+                Arc::new(JsonRuntimeStore::new(workspace.to_path_buf()));
+            Arc::new(StoreWriterRuntimeStore::new(
+                inner,
+                requested_writer_threads,
+            ))
+        }
     }
 }
 
