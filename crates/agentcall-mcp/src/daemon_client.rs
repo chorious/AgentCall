@@ -9,11 +9,36 @@ const READ_TIMEOUT: Duration = Duration::from_secs(10);
 const WRITE_TIMEOUT: Duration = Duration::from_secs(3);
 
 pub(crate) fn daemon_get(config: &Config, path: &str) -> Result<Value, String> {
-    daemon_request(config, "GET", path, None)
+    daemon_request(
+        config,
+        "GET",
+        path,
+        None,
+        CONNECT_TIMEOUT,
+        READ_TIMEOUT,
+        WRITE_TIMEOUT,
+    )
+}
+
+pub(crate) fn daemon_get_with_timeout(
+    config: &Config,
+    path: &str,
+    timeout: Duration,
+) -> Result<Value, String> {
+    let timeout = timeout.max(Duration::from_millis(1));
+    daemon_request(config, "GET", path, None, timeout, timeout, timeout)
 }
 
 pub(crate) fn daemon_post_json(config: &Config, path: &str, body: Value) -> Result<Value, String> {
-    daemon_request(config, "POST", path, Some(body))
+    daemon_request(
+        config,
+        "POST",
+        path,
+        Some(body),
+        CONNECT_TIMEOUT,
+        READ_TIMEOUT,
+        WRITE_TIMEOUT,
+    )
 }
 
 pub(crate) fn parse_daemon_url(url: &str) -> Result<(String, u16), String> {
@@ -35,6 +60,9 @@ fn daemon_request(
     method: &str,
     path: &str,
     body: Option<Value>,
+    connect_timeout: Duration,
+    read_timeout: Duration,
+    write_timeout: Duration,
 ) -> Result<Value, String> {
     let (host, port) = parse_daemon_url(&config.daemon_url)?;
     let address = (host.as_str(), port)
@@ -42,13 +70,13 @@ fn daemon_request(
         .map_err(|err| format!("failed to resolve daemon {}: {err}", config.daemon_url))?
         .next()
         .ok_or_else(|| format!("failed to resolve daemon {}", config.daemon_url))?;
-    let mut stream = TcpStream::connect_timeout(&address, CONNECT_TIMEOUT)
+    let mut stream = TcpStream::connect_timeout(&address, connect_timeout)
         .map_err(|err| format!("failed to connect daemon {}: {err}", config.daemon_url))?;
     stream
-        .set_read_timeout(Some(READ_TIMEOUT))
+        .set_read_timeout(Some(read_timeout))
         .map_err(|err| format!("failed to set daemon read timeout: {err}"))?;
     stream
-        .set_write_timeout(Some(WRITE_TIMEOUT))
+        .set_write_timeout(Some(write_timeout))
         .map_err(|err| format!("failed to set daemon write timeout: {err}"))?;
     let body_text = body
         .map(|value| serde_json::to_string(&value).unwrap_or_else(|_| "{}".to_string()))

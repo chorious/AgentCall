@@ -1,11 +1,11 @@
 use crate::config::Config;
-use crate::daemon_client::{daemon_get, parse_daemon_url};
+use crate::daemon_client::{daemon_get, daemon_get_with_timeout, parse_daemon_url};
 use serde_json::{Value, json};
 use std::env;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 #[cfg(windows)]
 use std::os::windows::process::CommandExt;
@@ -54,11 +54,15 @@ fn start_daemon(config: &Config, args: Value) -> Result<Value, String> {
         .and_then(Value::as_u64)
         .unwrap_or(10)
         .min(30);
-    let attempts = wait_seconds.saturating_mul(5).max(1);
-    let mut last_error = String::new();
-    for _ in 0..attempts {
-        thread::sleep(Duration::from_millis(200));
-        match daemon_get(config, "/api/runtime/health") {
+    let deadline = Instant::now() + Duration::from_secs(wait_seconds);
+    let last_error = loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        let probe_timeout = if wait_seconds == 0 {
+            Duration::from_millis(1)
+        } else {
+            remaining.min(Duration::from_millis(300))
+        };
+        match daemon_get_with_timeout(config, "/api/runtime/health", probe_timeout) {
             Ok(health) => {
                 return Ok(json!({
                     "status": "started",
@@ -68,9 +72,15 @@ fn start_daemon(config: &Config, args: Value) -> Result<Value, String> {
                     "daemon": health
                 }));
             }
-            Err(err) => last_error = err,
+            Err(err) => {
+                if wait_seconds == 0 || Instant::now() >= deadline {
+                    break err;
+                }
+            }
         }
-    }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        thread::sleep(remaining.min(Duration::from_millis(200)));
+    };
     Ok(json!({
         "status": "starting",
         "pid": child.id(),

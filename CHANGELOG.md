@@ -1,5 +1,11 @@
 # CHANGELOG
 
+## v6.7.1 - Runtime Start And Store-backed Board Patch
+
+- `agentcall_daemon(action=start)` now bounds health probes by the requested `wait_seconds`, avoiding long TCP/read timeout multiplication when the daemon is slow or unhealthy.
+- SQLite RuntimeStore now recovers `event_seq` and per-session event sequence from the SQLite `events` table instead of stale NDJSON logs.
+- Full board event reads now go through `state.store.get_events(...)`, matching the compact projection path and avoiding direct `events.ndjson` reads on the board hot path.
+
 ## v6.7.0 - P0/P1 Control Hardening
 
 - `SessionProjectionV1` now uses an internal `ProjectionStatus` enum while preserving the existing snake_case JSON status strings.

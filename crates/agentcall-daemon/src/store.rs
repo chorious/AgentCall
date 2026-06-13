@@ -5,7 +5,7 @@ use crate::events::EventEnvelopeV1;
 use crate::ownership::{OwnerLease, WorkspaceLease};
 use crate::projection::{ProjectionUpdate, SessionProjectionV1};
 use serde_json::Value;
-use std::collections::hash_map::DefaultHasher;
+use std::collections::{HashMap, hash_map::DefaultHasher};
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 use std::sync::mpsc;
@@ -95,6 +95,15 @@ pub(crate) trait RuntimeStore: Send + Sync {
     }
     fn writer_threads(&self) -> usize {
         1
+    }
+    fn next_event_global_seq(&self, fallback: u64) -> Result<u64, String> {
+        Ok(fallback)
+    }
+    fn next_session_event_numbers(
+        &self,
+        fallback: HashMap<String, u64>,
+    ) -> Result<HashMap<String, u64>, String> {
+        Ok(fallback)
     }
 
     fn get_events(&self, query: EventQuery) -> Result<Vec<EventEnvelopeV1>, String>;
@@ -226,6 +235,17 @@ impl RuntimeStore for StoreWriterRuntimeStore {
 
     fn writer_threads(&self) -> usize {
         self.writer_threads
+    }
+
+    fn next_event_global_seq(&self, fallback: u64) -> Result<u64, String> {
+        self.inner.next_event_global_seq(fallback)
+    }
+
+    fn next_session_event_numbers(
+        &self,
+        fallback: HashMap<String, u64>,
+    ) -> Result<HashMap<String, u64>, String> {
+        self.inner.next_session_event_numbers(fallback)
     }
 
     fn get_events(&self, query: EventQuery) -> Result<Vec<EventEnvelopeV1>, String> {

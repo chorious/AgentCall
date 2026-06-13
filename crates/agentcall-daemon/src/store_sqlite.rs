@@ -84,6 +84,49 @@ impl RuntimeStore for SqliteRuntimeStore {
         true
     }
 
+    fn next_event_global_seq(&self, fallback: u64) -> Result<u64, String> {
+        self.with_connection(|conn| {
+            let max_seq: Option<i64> = conn
+                .query_row("SELECT MAX(global_seq) FROM events", [], |row| row.get(0))
+                .optional()
+                .map_err(|err| err.to_string())?
+                .flatten();
+            Ok(max_seq
+                .map(|seq| (seq as u64).saturating_add(1))
+                .unwrap_or(1)
+                .max(fallback))
+        })
+    }
+
+    fn next_session_event_numbers(
+        &self,
+        mut fallback: HashMap<String, u64>,
+    ) -> Result<HashMap<String, u64>, String> {
+        self.with_connection(|conn| {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT session_id, MAX(session_seq) FROM events \
+                     WHERE session_id IS NOT NULL AND session_seq IS NOT NULL \
+                     GROUP BY session_id",
+                )
+                .map_err(|err| err.to_string())?;
+            let rows = stmt
+                .query_map([], |row| {
+                    let session_id: String = row.get(0)?;
+                    let max_seq: i64 = row.get(1)?;
+                    Ok((session_id, max_seq as u64))
+                })
+                .map_err(|err| err.to_string())?;
+            for row in rows {
+                let (session_id, max_seq) = row.map_err(|err| err.to_string())?;
+                let next = max_seq.saturating_add(1);
+                let entry = fallback.entry(session_id).or_insert(1);
+                *entry = (*entry).max(next);
+            }
+            Ok(fallback)
+        })
+    }
+
     fn get_events(&self, query: EventQuery) -> Result<Vec<EventEnvelopeV1>, String> {
         self.with_connection(|conn| {
             let requested_limit = if query.limit == 0 {
@@ -770,6 +813,29 @@ mod tests {
         );
         let projection = store.get_session_projection("worker-a").unwrap().unwrap();
         assert_eq!(projection.attention_status, "needs_permission");
+    }
+
+    #[test]
+    fn sqlite_event_sequence_recovery_uses_events_table() {
+        let store = test_store("event-seq-recovery");
+        let event = crate::events::build_event_envelope(
+            "evt-000025".to_string(),
+            25,
+            Some(7),
+            "hook.UserPromptSubmit",
+            "prompt submitted",
+            json!({"wrapper_session": "worker-a"}),
+        );
+        let update = apply_event_to_projection(None, &event);
+        store
+            .append_event_and_update_projection(&event, update)
+            .unwrap();
+
+        assert_eq!(store.next_event_global_seq(3).unwrap(), 26);
+        let sessions = store
+            .next_session_event_numbers(HashMap::from([("worker-a".to_string(), 2)]))
+            .unwrap();
+        assert_eq!(sessions.get("worker-a"), Some(&8));
     }
 
     #[test]

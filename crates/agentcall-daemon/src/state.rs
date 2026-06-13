@@ -44,10 +44,28 @@ impl AppState {
         config: LocalConfig,
         config_error: Option<String>,
     ) -> Self {
-        let next_event_seq = next_event_number_from_log(&workspace);
-        let event_session_seq = next_session_event_numbers_from_log(&workspace);
+        let log_next_event_seq = next_event_number_from_log(&workspace);
+        let log_event_session_seq = next_session_event_numbers_from_log(&workspace);
         let next_seq = next_runtime_seq_from_state(&workspace);
         let store = configured_runtime_store(&workspace, &config);
+        let next_event_seq = store
+            .next_event_global_seq(log_next_event_seq)
+            .unwrap_or_else(|err| {
+                eprintln!(
+                    "agentcall-daemon: failed to recover event seq from {} store: {err}",
+                    store.backend_name()
+                );
+                log_next_event_seq
+            });
+        let event_session_seq = store
+            .next_session_event_numbers(log_event_session_seq.clone())
+            .unwrap_or_else(|err| {
+                eprintln!(
+                    "agentcall-daemon: failed to recover session event seq from {} store: {err}",
+                    store.backend_name()
+                );
+                log_event_session_seq
+            });
         Self {
             workspace,
             config,

@@ -10,7 +10,8 @@ use crate::routes::routes_state;
 use crate::runtime_sdk::sdk_runtime_enabled;
 use crate::scheduler::scheduler_health;
 use crate::session::{Session, SessionInfo, list_sessions};
-use crate::state::{AppState, read_events, read_json_file, write_json_file};
+use crate::state::{AppState, read_json_file, write_json_file};
+use crate::store::EventQuery;
 use crate::terminal::{clean_terminal_text, tail_lines};
 use crate::terminal_screen::TerminalEmulator;
 use crate::util::now_ms;
@@ -66,7 +67,21 @@ pub(crate) fn board_state(
         });
     }
 
-    let events = read_events(&agent_dir.join("events.ndjson"));
+    let events = state
+        .store
+        .get_events(EventQuery {
+            session_id: None,
+            after_global_seq: None,
+            event_types: vec![],
+            limit: 80,
+        })
+        .map(|events| {
+            events
+                .into_iter()
+                .map(|event| event.to_compat_json())
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
     let project_state = read_json_file(
         &agent_dir.join("state").join("project.json"),
         serde_json::json!({}),

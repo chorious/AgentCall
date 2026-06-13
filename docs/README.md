@@ -1,6 +1,6 @@
 # AgentCall Docs
 
-这是 AgentCall 的文档索引。当前主线是 `v6.7.0 - P0/P1 control hardening`：Codex 通过 AgentCall MCP/daemon 指挥 Claude Code PTY utility workers，daemon 负责状态权威、hook-aware projection、bounded write policy、compact board、枚举化安全锁错误、SQLite writer fanout 和 prompt gate 自动自愈。正常 worker 只剩 `coding` 与 `report` 两类；`read_only` route 线已移除。
+这是 AgentCall 的文档索引。当前主线是 `v6.7.1`：Codex 通过 AgentCall MCP/daemon 指挥 Claude Code PTY utility workers，daemon 负责状态权威、hook-aware projection、bounded write policy、compact board、枚举化安全锁错误、SQLite writer fanout 和 prompt gate 自动自愈。正常 worker 只剩 `coding` 与 `report` 两类；`read_only` route 线已移除。
 
 ## 当前入口
 
@@ -14,6 +14,10 @@
 - [v6.0 Code Plan](v6.0-code-plan.md)
 - [v5.3 Code Plan](v5.3-code-plan.md)
 - [v5.3 Closure Status](reports/v5.3-closure-status.md)
+- [v6.7 P0/P1 Closure](reports/report_v6.7_p0_p1_closure_2026-06-13.md)
+- [v6.7 Demo Known Issues And v7 Questions](reports/report_v6.7_demo_known_issues_and_v7_questions_2026-06-13.md)
+- [v7 Shared Context Research](reports/report_v7_shared_context_research_2026-06-13.md)
+- [v7 Worker Brief Research](reports/report_v7_worker_brief_research_2026-06-13.md)
 - [v6.6 Code Optimization Closure](reports/report_v6.6_code_optimization_closure_2026-06-13.md)
 - [v5 Implementation Deep Audit](reports/v5-implementation-deep-audit.md)
 - [MCP transport recovery](mcp-transport-recovery.md)
@@ -43,6 +47,14 @@
 
 最新实现审计和真实 worker 报告放在 [reports](reports)：
 
+- [report_v7_worker_brief_research_2026-06-13.md](reports/report_v7_worker_brief_research_2026-06-13.md)
+- [report_v7_shared_context_research_2026-06-13.md](reports/report_v7_shared_context_research_2026-06-13.md)
+- [report_v6.7_demo_known_issues_and_v7_questions_2026-06-13.md](reports/report_v6.7_demo_known_issues_and_v7_questions_2026-06-13.md)
+- [report_v6.7_p0_p1_closure_2026-06-13.md](reports/report_v6.7_p0_p1_closure_2026-06-13.md)
+- [report_v6.6_open_issues_priority_2026-06-13.md](reports/report_v6.6_open_issues_priority_2026-06-13.md)
+- [report_v6.6_code_optimization_closure_2026-06-13.md](reports/report_v6.6_code_optimization_closure_2026-06-13.md)
+- [report_code_reasonability_2026-06-13.md](reports/report_code_reasonability_2026-06-13.md)
+- [report_project_expansion_github_2026-06-13.md](reports/report_project_expansion_github_2026-06-13.md)
 - [v5.3-closure-status.md](reports/v5.3-closure-status.md)
 - [v5-implementation-deep-audit.md](reports/v5-implementation-deep-audit.md)
 - [review_v52_functional_implementation.md](reports/review_v52_functional_implementation.md)

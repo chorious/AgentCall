@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "agentcall"
-version = "6.7.0"
+version = "6.7.1"
 description = "Local control plane for Codex-led Claude Code agent clusters"
 readme = "README.md"
 requires-python = ">=3.11"
