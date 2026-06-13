@@ -7,7 +7,7 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 const PROTOCOL_VERSION: &str = "2024-11-05";
 const SERVER_NAME: &str = "agentcall-mcp";
-const SERVER_VERSION: &str = "6.7.1";
+const SERVER_VERSION: &str = "6.7.2";
 pub(crate) const MAX_MCP_INPUT_LINE_BYTES: usize = 1024 * 1024;
 const TOOL_TEXT_CAP_BYTES: usize = 128 * 1024;
 const TOOL_TEXT_PREVIEW_BYTES: usize = 16 * 1024;

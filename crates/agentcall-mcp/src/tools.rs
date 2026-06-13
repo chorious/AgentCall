@@ -14,7 +14,13 @@ pub(crate) fn call_tool(config: &Config, name: &str, args: Value) -> Result<Valu
     daemon_post_json(
         config,
         "/api/mcp/call",
-        json!({"name": name, "arguments": args}),
+        json!({
+            "name": name,
+            "arguments": args,
+            "client": {
+                "owner_id": config.owner_id,
+            }
+        }),
     )
 }
 

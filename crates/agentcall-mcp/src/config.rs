@@ -6,6 +6,7 @@ pub(crate) struct Config {
     pub(crate) workspace: PathBuf,
     pub(crate) daemon_url: String,
     pub(crate) daemon_token: Option<String>,
+    pub(crate) owner_id: String,
 }
 
 impl Config {
@@ -57,12 +58,44 @@ impl Config {
         if daemon_token.is_none() {
             daemon_token = read_local_daemon_token(&workspace);
         }
+        let owner_id = derive_owner_id();
         Ok(Self {
             workspace,
             daemon_url,
             daemon_token,
+            owner_id,
         })
     }
+}
+
+fn derive_owner_id() -> String {
+    env::var("AGENTCALL_OWNER_ID")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .or_else(|| {
+            env::var("CODEX_THREAD_ID")
+                .ok()
+                .filter(|value| !value.trim().is_empty())
+                .map(|value| format!("codex-thread-{value}"))
+        })
+        .map(|value| normalize_owner_id(&value))
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| "codex".to_string())
+}
+
+fn normalize_owner_id(value: &str) -> String {
+    let mut normalized = String::new();
+    for ch in value.trim().chars() {
+        if ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.' | ':') {
+            normalized.push(ch);
+        } else {
+            normalized.push('-');
+        }
+        if normalized.len() >= 96 {
+            break;
+        }
+    }
+    normalized.trim_matches('-').to_string()
 }
 
 fn read_local_daemon_token(workspace: &std::path::Path) -> Option<String> {

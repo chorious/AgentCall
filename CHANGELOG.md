@@ -1,5 +1,11 @@
 # CHANGELOG
 
+## v6.7.2 - Owner-scoped Worker Capacity Patch
+
+- MCP bridge now forwards a stable owner id derived from `AGENTCALL_OWNER_ID` or `CODEX_THREAD_ID` to the daemon, so each Codex session/thread gets its own worker quota.
+- Scheduler no longer treats global active session count as a hard start gate; `max_sessions` is now advisory health data, while `per_owner_max_sessions` remains the enforced concurrency cap.
+- `capacity_exceeded` now represents the current owner/session quota being full, not unrelated workers from other Codex sessions occupying the global daemon.
+
 ## v6.7.1 - Runtime Start And Store-backed Board Patch
 
 - `agentcall_daemon(action=start)` now bounds health probes by the requested `wait_seconds`, avoiding long TCP/read timeout multiplication when the daemon is slow or unhealthy.

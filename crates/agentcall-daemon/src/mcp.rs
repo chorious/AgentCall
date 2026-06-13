@@ -14,7 +14,8 @@ use crate::prompt_gate::{
     prompt_gate_from_route,
 };
 use crate::routes::{
-    RouteRequest, checkpoint_session, handle_route, patch_route_record, route_for_wrapper_session,
+    RouteRequest, checkpoint_session, handle_route_for_owner, patch_route_record,
+    route_for_wrapper_session,
 };
 use crate::session::get_session;
 use crate::state::{AppState, append_agent_event};
@@ -41,6 +42,12 @@ const REPORT_REQUEST_DEADLINE_MS: u64 = 5 * 60 * 1000;
 pub(crate) struct McpCallRequest {
     name: String,
     arguments: Option<Value>,
+    client: Option<McpClientContext>,
+}
+
+#[derive(Deserialize)]
+struct McpClientContext {
+    owner_id: Option<String>,
 }
 
 pub(crate) fn mcp_tools() -> Vec<Value> {
@@ -137,7 +144,7 @@ pub(crate) fn mcp_call(state: &Arc<AppState>, req: McpCallRequest) -> Result<Val
     let args = req.arguments.unwrap_or_else(|| json!({}));
     let result = match req.name.as_str() {
         "agentcall_board" => mcp_board(state, &args),
-        "agentcall_route" => mcp_route(state, args.clone()),
+        "agentcall_route" => mcp_route(state, args.clone(), req.client.as_ref()),
         "agentcall_session" => mcp_session(state, &args),
         "agentcall_session_send" => mcp_session_send(state, &args),
         "agentcall_report" => mcp_report(state, &args),
@@ -184,11 +191,39 @@ fn mcp_board(state: &AppState, args: &Value) -> Result<Value, String> {
     ))
 }
 
-fn mcp_route(state: &Arc<AppState>, args: Value) -> Result<Value, String> {
+fn mcp_route(
+    state: &Arc<AppState>,
+    args: Value,
+    client: Option<&McpClientContext>,
+) -> Result<Value, String> {
     let req: RouteRequest =
         serde_json::from_value(args).map_err(|err| format!("invalid route arguments: {err}"))?;
-    let route = handle_route(state, req)?;
+    let owner_id = client_owner_id(client);
+    let route = handle_route_for_owner(state, req, &owner_id)?;
     Ok(route_mcp_response(state, &route))
+}
+
+fn client_owner_id(client: Option<&McpClientContext>) -> String {
+    client
+        .and_then(|client| client.owner_id.as_deref())
+        .map(normalize_owner_id)
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| "codex".to_string())
+}
+
+fn normalize_owner_id(value: &str) -> String {
+    let mut normalized = String::new();
+    for ch in value.trim().chars() {
+        if ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.' | ':') {
+            normalized.push(ch);
+        } else {
+            normalized.push('-');
+        }
+        if normalized.len() >= 96 {
+            break;
+        }
+    }
+    normalized.trim_matches('-').to_string()
 }
 
 fn route_mcp_response(state: &AppState, route: &Value) -> Value {
@@ -1897,6 +1932,15 @@ mod tests {
     use crate::actor::{ActorControlCommand, ActorHandle};
     use std::sync::mpsc;
     use std::thread;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn test_workspace(name: &str) -> PathBuf {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir().join(format!("agentcall-mcp-{name}-{nonce}"))
+    }
 
     fn install_prompt_gate_route(
         state: &AppState,
@@ -1990,6 +2034,37 @@ mod tests {
                 .get("event_types")
                 .is_some()
         );
+    }
+
+    #[test]
+    fn mcp_route_records_client_owner_id() {
+        let state = Arc::new(AppState::test(test_workspace("mcp-route-owner")));
+
+        let result = mcp_call(
+            &state,
+            McpCallRequest {
+                name: "agentcall_route".to_string(),
+                arguments: Some(json!({
+                    "objective": "recommend a worker",
+                    "mode": "recommend"
+                })),
+                client: Some(McpClientContext {
+                    owner_id: Some("codex-thread-owner-a".to_string()),
+                }),
+            },
+        )
+        .unwrap();
+
+        let route_id = result["route_id"].as_str().unwrap();
+        let routes = crate::state::read_json_file(
+            &state
+                .workspace
+                .join(".agentcall")
+                .join("state")
+                .join("routes.json"),
+            json!({}),
+        );
+        assert_eq!(routes[route_id]["owner_id"], "codex-thread-owner-a");
     }
 
     #[test]

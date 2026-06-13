@@ -72,16 +72,6 @@ pub(crate) fn scheduler_decision(state: &AppState, owner_id: &str) -> SchedulerD
         .values()
         .filter(|lease| owner_lease_is_active(lease, now) && lease.owner_id == owner_id)
         .count();
-    if active_sessions >= max_sessions {
-        return SchedulerDecision {
-            status: "capacity_exceeded".to_string(),
-            reason: "global active session cap reached; no hidden queue is created".to_string(),
-            active_sessions,
-            active_owner_sessions,
-            max_sessions,
-            per_owner_max_sessions,
-        };
-    }
     if active_owner_sessions >= per_owner_max_sessions {
         return SchedulerDecision {
             status: "capacity_exceeded".to_string(),
@@ -109,9 +99,10 @@ pub(crate) fn scheduler_health(state: &AppState) -> Value {
     json!({
         "active_sessions": decision.active_sessions,
         "max_sessions": decision.max_sessions,
+        "global_capacity_policy": "advisory_only",
         "codex_active_sessions": decision.active_owner_sessions,
         "per_owner_max_sessions": decision.per_owner_max_sessions,
-        "queue_policy": "reject_when_full",
+        "queue_policy": "reject_when_owner_full",
         "allow_hidden_queue": false,
     })
 }
@@ -125,7 +116,8 @@ impl SchedulerDecision {
             "active_owner_sessions": self.active_owner_sessions,
             "max_sessions": self.max_sessions,
             "per_owner_max_sessions": self.per_owner_max_sessions,
-            "queue_policy": "reject_when_full",
+            "global_capacity_policy": "advisory_only",
+            "queue_policy": "reject_when_owner_full",
             "allow_hidden_queue": false,
         })
     }
@@ -140,14 +132,14 @@ mod tests {
     use std::path::PathBuf;
 
     #[test]
-    fn scheduler_rejects_global_capacity_without_queue() {
+    fn scheduler_treats_global_capacity_as_advisory() {
         let state = test_state(Some(2), Some(10));
-        insert_lease(&state, "worker-a", "codex");
+        insert_lease(&state, "worker-a", "other-a");
         insert_lease(&state, "worker-b", "other");
-        let err = enforce_start_capacity(&state, "codex").unwrap_err();
-        let value: Value = serde_json::from_str(&err).unwrap();
-        assert_eq!(value["error"]["code"], "capacity_exceeded");
-        assert_eq!(value["error"]["details"]["allow_queue"], false);
+        let decision = enforce_start_capacity(&state, "codex").unwrap();
+        assert_eq!(decision.status, "start_now");
+        assert_eq!(decision.active_sessions, 2);
+        assert_eq!(decision.active_owner_sessions, 0);
     }
 
     #[test]

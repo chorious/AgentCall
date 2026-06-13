@@ -49,6 +49,7 @@ pub(crate) struct RouteRequest {
 struct RouteRecord {
     route_id: String,
     invocation_id: Option<String>,
+    owner_id: String,
     objective: String,
     workspace: Option<String>,
     mode: String,
@@ -93,6 +94,14 @@ impl PtyWorkflow {
 }
 
 pub(crate) fn handle_route(state: &Arc<AppState>, req: RouteRequest) -> Result<Value, String> {
+    handle_route_for_owner(state, req, "codex")
+}
+
+pub(crate) fn handle_route_for_owner(
+    state: &Arc<AppState>,
+    req: RouteRequest,
+    owner_id: &str,
+) -> Result<Value, String> {
     let mut req = req;
     if req.objective.trim().is_empty() {
         return Err("missing objective".to_string());
@@ -118,6 +127,7 @@ pub(crate) fn handle_route(state: &Arc<AppState>, req: RouteRequest) -> Result<V
     let mut record = RouteRecord {
         route_id: route_id.clone(),
         invocation_id: None,
+        owner_id: owner_id.to_string(),
         objective: req.objective.clone(),
         workspace: req.workspace.clone(),
         mode: mode.clone(),
@@ -142,7 +152,7 @@ pub(crate) fn handle_route(state: &Arc<AppState>, req: RouteRequest) -> Result<V
 
     if mode == "start" {
         match decision.runtime.as_str() {
-            "pty" => start_pty_route(state, &req, &mut record)?,
+            "pty" => start_pty_route(state, &req, &mut record, owner_id)?,
             "sdk" => start_sdk_route(state, &req, &mut record)?,
             other => return Err(format!("unsupported route runtime: {other}")),
         }
@@ -624,6 +634,7 @@ fn start_pty_route(
     state: &Arc<AppState>,
     req: &RouteRequest,
     record: &mut RouteRecord,
+    owner_id: &str,
 ) -> Result<(), String> {
     let session_name = req
         .session_name
@@ -641,12 +652,12 @@ fn start_pty_route(
     let command = pty_command(req, &workflow, claude_session_id.as_deref())?;
     let containment = pty_containment(state, req, &session_name);
     let target_workspace = route_target_workspace(state, req);
-    let schedule = enforce_start_capacity(state, "codex")?;
+    let schedule = enforce_start_capacity(state, owner_id)?;
     let shared_workspace_lease = route_uses_shared_workspace_lease(state, req);
     let leases = reserve_route_leases(
         state,
         &session_name,
-        "codex",
+        owner_id,
         &target_workspace,
         shared_workspace_lease,
     )?;
