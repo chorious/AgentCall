@@ -175,7 +175,7 @@ mod tests {
             "runtime": "agentcall-daemon",
             "active_pty_sessions": 6,
             "live_daemon_sessions": 6,
-            "build": {"version": "6.8.1"},
+            "build": {"version": "6.8.2"},
             "scheduler": {"per_owner_max_sessions": 6, "active_sessions": 6, "queue_policy": "reject_when_owner_full"}
         });
         let value = daemon_health_for_owner(&test_config(), health, false);

@@ -301,10 +301,21 @@ def stop_existing_processes(root: Path) -> None:
     root_text = str(root.resolve())
     script = rf"""
 $root = {json.dumps(root_text)}
-$rootLower = $root.ToLowerInvariant()
+$rootLower = $root.ToLowerInvariant().TrimEnd('\')
 $names = @('agentcall-mcp.exe', 'agentcall-daemon.exe')
+function Normalize-AgentCallPath($value) {{
+  if (-not $value) {{ return '' }}
+  $text = [string]$value
+  if ($text.StartsWith('\??\')) {{ $text = $text.Substring(4) }}
+  return $text.ToLowerInvariant()
+}}
 $matches = Get-CimInstance Win32_Process -ErrorAction SilentlyContinue |
-  Where-Object {{ ($names -contains $_.Name) -and $_.ExecutablePath -and $_.ExecutablePath.ToLowerInvariant().StartsWith($rootLower) }}
+  Where-Object {{
+    if (-not ($names -contains $_.Name)) {{ return $false }}
+    $path = Normalize-AgentCallPath $_.ExecutablePath
+    $cmd = Normalize-AgentCallPath $_.CommandLine
+    ($path.StartsWith($rootLower)) -or ($cmd.Contains($rootLower))
+  }}
 if (-not $matches) {{
   Write-Output 'No stale AgentCall processes found under repo root.'
   exit 0

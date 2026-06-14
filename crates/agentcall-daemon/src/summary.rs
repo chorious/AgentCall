@@ -215,6 +215,7 @@ fn v6_compact_board_state(
                         | "needs_permission"
                         | "blocked_by_policy"
                         | "report_ready"
+                        | "accepted_live"
                         | "failed"
                 )
         })

@@ -1,3 +1,6 @@
+use crate::accepted_live::{
+    accepted_live_auto_close_grace_seconds, schedule_accepted_live_auto_close,
+};
 use crate::actor::submit_session_command;
 use crate::commands::{CommandType, PreparedCommand, prepare_session_send_command};
 use crate::confidence::attach_confidence_to_reports;
@@ -1885,7 +1888,7 @@ fn mcp_report(
     }
 }
 
-fn accept_report_for_session(state: &AppState, session_id: &str) -> Value {
+fn accept_report_for_session(state: &Arc<AppState>, session_id: &str) -> Value {
     let route =
         route_for_wrapper_session(state, session_id).map(|(route_id, route)| (route_id, route));
     let target_workspace = route
@@ -1933,21 +1936,30 @@ fn accept_report_for_session(state: &AppState, session_id: &str) -> Value {
     };
     if accepted {
         if let Some((route_id, _)) = route.as_ref() {
+            let accepted_at_ms = now_ms();
             let _ = patch_route_record(
                 state,
                 route_id,
                 json!({
                     "status": "report_accepted",
-                    "updated_at": now_ms(),
+                    "updated_at": accepted_at_ms,
+                    "required_next_step": "stop_live_worker_or_wait_for_auto_close",
                     "result": {
                         "report": {
                             "status": "report_accepted",
                             "accepted": true,
-                            "accepted_at_ms": now_ms()
+                            "accepted_at_ms": accepted_at_ms,
+                            "auto_close": {
+                                "enabled": true,
+                                "status": "pending",
+                                "grace_seconds": accepted_live_auto_close_grace_seconds(),
+                                "deadline_at_ms": accepted_at_ms + accepted_live_auto_close_grace_seconds() * 1000
+                            }
                         }
                     }
                 }),
             );
+            schedule_accepted_live_auto_close(state, session_id.to_string(), accepted_at_ms);
         }
     }
     json!({
@@ -1979,6 +1991,17 @@ fn accept_report_for_session(state: &AppState, session_id: &str) -> Value {
         },
         "primary_action": {
             "kind": if accepted { "stop_worker" } else { "inspect_session_or_request_report" }
+        },
+        "accepted_live": if accepted { get_session(state, session_id).is_some() } else { false },
+        "auto_close": if accepted {
+            json!({
+                "enabled": true,
+                "grace_seconds": accepted_live_auto_close_grace_seconds(),
+                "status": if get_session(state, session_id).is_some() { "pending" } else { "not_live" },
+                "hint": "The report is accepted, but a live PTY worker still occupies capacity until stopped or auto-closed."
+            })
+        } else {
+            Value::Null
         }
     })
 }
@@ -2148,7 +2171,7 @@ mod tests {
     #[test]
     fn mcp_board_compact_ignores_scope_all_without_debug_view() {
         let root = test_workspace("board-owner-safe-compact");
-        let state = AppState::test(root.clone());
+        let state = Arc::new(AppState::test(root.clone()));
         let result = mcp_board(
             &state,
             &json!({"view": "compact", "filter": "attention", "scope": "all"}),
@@ -2167,7 +2190,7 @@ mod tests {
     #[test]
     fn mcp_board_full_scope_all_is_explicit_debug_global() {
         let root = test_workspace("board-owner-debug-global");
-        let state = AppState::test(root.clone());
+        let state = Arc::new(AppState::test(root.clone()));
         let result = mcp_board(
             &state,
             &json!({"view": "full", "scope": "all", "section": "sessions"}),
@@ -2224,7 +2247,7 @@ mod tests {
             "agentcall-mcp-session-events-{}",
             std::process::id()
         ));
-        let state = AppState::test(root.clone());
+        let state = Arc::new(AppState::test(root.clone()));
         append_agent_event(
             &state,
             "hook.Notification",
@@ -2256,7 +2279,7 @@ mod tests {
             "agentcall-mcp-session-projection-{}",
             std::process::id()
         ));
-        let state = AppState::test(root.clone());
+        let state = Arc::new(AppState::test(root.clone()));
         append_agent_event(
             &state,
             "hook.Notification",
@@ -2868,7 +2891,7 @@ mod tests {
             "agentcall-mcp-report-route-workspace-{}",
             std::process::id()
         ));
-        let state = AppState::test(root.clone());
+        let state = Arc::new(AppState::test(root.clone()));
         let target_workspace = root.join("target-workspace");
         let report_rel = ".agentcall/reports/worker-report.md";
         let report_abs = target_workspace.join(report_rel);
@@ -2986,7 +3009,7 @@ mod tests {
             "agentcall-mcp-report-route-write-confidence-{}",
             std::process::id()
         ));
-        let state = AppState::test(root.clone());
+        let state = Arc::new(AppState::test(root.clone()));
         let report_rel = ".agentcall/reports/worker-report.md";
         let report_abs = root.join(report_rel);
         std::fs::create_dir_all(report_abs.parent().unwrap()).unwrap();

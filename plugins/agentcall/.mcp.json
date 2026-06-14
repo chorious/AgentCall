@@ -2,7 +2,7 @@
   "mcpServers": {
     "agentcall": {
       "enabled": true,
-      "command": "E:\\Project\\AgentCall\\target\\runtime\\6.8.1\\agentcall-mcp.exe",
+      "command": "E:\\Project\\AgentCall\\target\\runtime\\6.8.2\\agentcall-mcp.exe",
       "args": [
         "--workspace",
         "E:\\Project\\AgentCall"

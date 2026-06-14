@@ -10,7 +10,7 @@ use std::collections::HashSet;
 #[cfg(unix)]
 use std::io::Read;
 
-const CONTROL_TOKEN_TTL_SECONDS: i64 = 60;
+const CONTROL_TOKEN_TTL_SECONDS: i64 = 5 * 60;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub(crate) struct ControlTokenClaims {

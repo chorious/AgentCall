@@ -1,3 +1,6 @@
+use crate::accepted_live::{
+    accepted_live_auto_close_projection, maybe_auto_close_accepted_live_session,
+};
 use crate::projection::session_projection_summary;
 use crate::prompt_gate::{
     PromptGateState, PromptGateView, prompt_gate_for_session,
@@ -29,7 +32,7 @@ pub(crate) enum WorkerStateKind {
     ReportDrafting,
     ReportOverdue,
     ReportReady,
-    ReportAccepted,
+    AcceptedLive,
     Stopping,
     Done,
     Failed,
@@ -52,7 +55,7 @@ impl WorkerStateKind {
             Self::ReportDrafting => "report_drafting",
             Self::ReportOverdue => "report_overdue",
             Self::ReportReady => "report_ready",
-            Self::ReportAccepted => "report_accepted",
+            Self::AcceptedLive => "accepted_live",
             Self::Stopping => "stopping",
             Self::Done => "done",
             Self::Failed => "failed",
@@ -60,10 +63,7 @@ impl WorkerStateKind {
     }
 
     pub(crate) fn is_terminal(&self) -> bool {
-        matches!(
-            self,
-            Self::ReportAccepted | Self::Done | Self::Failed | Self::ReportReady
-        )
+        matches!(self, Self::Done | Self::Failed | Self::ReportReady)
     }
 }
 
@@ -118,6 +118,7 @@ pub(crate) fn worker_transition_allowed(from: &WorkerStateKind, to: &WorkerState
                 | WorkerStateKind::ReportDrafting
                 | WorkerStateKind::ReportReady
                 | WorkerStateKind::ReportOverdue
+                | WorkerStateKind::AcceptedLive
                 | WorkerStateKind::Stopping
                 | WorkerStateKind::Failed
                 | WorkerStateKind::Done
@@ -126,6 +127,7 @@ pub(crate) fn worker_transition_allowed(from: &WorkerStateKind, to: &WorkerState
             to,
             WorkerStateKind::ReportDrafting
                 | WorkerStateKind::ReportReady
+                | WorkerStateKind::AcceptedLive
                 | WorkerStateKind::ReportOverdue
                 | WorkerStateKind::Stopping
                 | WorkerStateKind::Failed
@@ -140,9 +142,9 @@ pub(crate) fn worker_transition_allowed(from: &WorkerStateKind, to: &WorkerState
         ),
         WorkerStateKind::ReportReady => matches!(
             to,
-            WorkerStateKind::ReportAccepted | WorkerStateKind::Stopping | WorkerStateKind::Done
+            WorkerStateKind::AcceptedLive | WorkerStateKind::Stopping | WorkerStateKind::Done
         ),
-        WorkerStateKind::ReportAccepted => {
+        WorkerStateKind::AcceptedLive => {
             matches!(to, WorkerStateKind::Stopping | WorkerStateKind::Done)
         }
         WorkerStateKind::Stopping => matches!(
@@ -231,10 +233,17 @@ fn worker_state_for_session_with_gate(
     session_name: &str,
     prompt_gate: PromptGateView,
 ) -> WorkerStateView {
+    let _ = maybe_auto_close_accepted_live_session(state, session_name);
     let projection = session_projection_summary(state, session_name);
     let route = route_for_wrapper_session(state, session_name).map(|(_, route)| route);
     let workspace = workspace_projection(state, route.as_ref());
     let mut report = report_projection_from_route(route.as_ref());
+    if let Some(route) = route.as_ref() {
+        let auto_close = accepted_live_auto_close_projection(route, now_ms());
+        if !auto_close.is_null() {
+            report["auto_close"] = auto_close;
+        }
+    }
     let report_ready = projection
         .get("report_ready")
         .and_then(Value::as_bool)
@@ -460,8 +469,8 @@ fn decide_worker_state(input: WorkerDecisionInput<'_>) -> WorkerDecision {
     }
     if input.report_status == "report_accepted" {
         return worker_decision(
-            WorkerStateKind::ReportAccepted,
-            "The worker report was accepted by the supervisor.",
+            WorkerStateKind::AcceptedLive,
+            "The worker report was accepted, but the PTY worker is still live and occupying capacity. Stop it now, or daemon will auto-close it after the accepted-live grace period.",
             false,
         );
     }
@@ -767,7 +776,7 @@ fn actions_for_state(
                 true,
             )],
         ),
-        WorkerStateKind::ReportAccepted => (
+        WorkerStateKind::AcceptedLive => (
             action(
                 session_name,
                 WorkerActionKind::Stop,
@@ -816,6 +825,7 @@ fn pending_interaction_for_state(state: &WorkerStateKind, why: &str) -> Value {
         WorkerStateKind::IdleAfterTurn => "idle_after_turn",
         WorkerStateKind::NeedsPermission => "permission_menu",
         WorkerStateKind::ReportReady => "report_written_waiting_accept",
+        WorkerStateKind::AcceptedLive => "accepted_live_waiting_close",
         WorkerStateKind::ReportRequested => "report_requested",
         WorkerStateKind::ReportDrafting => "report_drafting",
         WorkerStateKind::ReportOverdue => "report_overdue",
@@ -887,7 +897,11 @@ mod tests {
         ));
         assert!(worker_transition_allowed(
             &WorkerStateKind::ReportReady,
-            &WorkerStateKind::ReportAccepted
+            &WorkerStateKind::AcceptedLive
+        ));
+        assert!(worker_transition_allowed(
+            &WorkerStateKind::AcceptedLive,
+            &WorkerStateKind::Stopping
         ));
     }
 

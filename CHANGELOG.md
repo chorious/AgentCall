@@ -1,5 +1,13 @@
 # CHANGELOG
 
+## v6.8.2 - Accepted-live Closure Patch
+
+- Control tokens for destructive session actions now live for 5 minutes instead of 60 seconds, reducing false `stale_control_token` failures during normal report cleanup.
+- Accepting a report no longer lets a live PTY worker look completed: summaries/boards now project `accepted_live`, keep it in attention, and tell Codex to stop it or wait for daemon auto-close.
+- Accepted live workers get a daemon-owned 5 minute auto-close grace period; if still live after the grace window, daemon requests PTY stop and records `report.accepted_live_auto_close`.
+- `agentcall_report(action=accept)` now returns `accepted_live` and `auto_close` details so callers can see that capacity is still occupied until the worker exits.
+- Runtime helper scripts now understand versioned runtime daemon paths and match Windows AgentCall processes more robustly during release cleanup.
+
 ## v6.8.1 - Owner-safe Visibility Patch
 
 - MCP owner fallback no longer collapses unrelated Codex sessions into the global `codex` owner; when no explicit owner/thread id exists it uses the current MCP process owner id.

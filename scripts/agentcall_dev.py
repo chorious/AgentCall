@@ -189,9 +189,6 @@ def cmd_daemon_health(root: Path, args: argparse.Namespace) -> int:
 
 
 def cmd_verify_runtime_build(root: Path, args: argparse.Namespace) -> int:
-    expected_bin = Path(args.daemon_bin).resolve() if args.daemon_bin else default_daemon_binary(root)
-    if not expected_bin.exists():
-        raise ToolError(f"expected daemon binary missing: {expected_bin}")
     url = args.daemon_url.rstrip("/") + "/api/runtime/health"
     try:
         payload = http_json(url, timeout=args.timeout, headers=daemon_auth_headers(root))
@@ -201,6 +198,9 @@ def cmd_verify_runtime_build(root: Path, args: argparse.Namespace) -> int:
     if not isinstance(build, dict):
         raise ToolError("daemon health did not expose build identity")
     binary_path = Path(str(build.get("binary_path") or "")).resolve()
+    expected_bin = expected_daemon_binary(root, args.daemon_bin, build)
+    if not expected_bin.exists():
+        raise ToolError(f"expected daemon binary missing: {expected_bin}")
     if not paths_same(binary_path, expected_bin):
         raise ToolError(f"daemon binary mismatch: running={binary_path}; expected={expected_bin}")
     process_started_at_ms = build.get("process_started_at_ms")
@@ -223,6 +223,17 @@ def cmd_verify_runtime_build(root: Path, args: argparse.Namespace) -> int:
     }
     print(json.dumps(result, ensure_ascii=False, indent=2))
     return 0
+
+
+def expected_daemon_binary(root: Path, daemon_bin: str | None, build: dict) -> Path:
+    if daemon_bin:
+        return Path(daemon_bin).resolve()
+    version = str(build.get("version") or "").strip()
+    if version:
+        runtime = root / "target" / "runtime" / version / executable_name("agentcall-daemon")
+        if runtime.exists():
+            return runtime.resolve()
+    return default_daemon_binary(root)
 
 
 def cmd_install_hooks(root: Path, args: argparse.Namespace) -> int:
@@ -747,8 +758,11 @@ def find_cargo() -> Path | None:
 
 
 def default_daemon_binary(root: Path) -> Path:
-    name = "agentcall-daemon.exe" if os.name == "nt" else "agentcall-daemon"
-    return (root / "target" / "debug" / name).resolve()
+    return (root / "target" / "debug" / executable_name("agentcall-daemon")).resolve()
+
+
+def executable_name(name: str) -> str:
+    return f"{name}.exe" if os.name == "nt" else name
 
 
 def paths_same(left: Path, right: Path) -> bool:

@@ -1,5 +1,6 @@
 #![recursion_limit = "256"]
 
+mod accepted_live;
 mod actor;
 mod commands;
 mod confidence;
