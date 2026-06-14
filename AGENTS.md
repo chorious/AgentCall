@@ -27,7 +27,7 @@ AgentCall lets Codex supervise Claude Code PTY utility workers through a local R
 
 ## Version Discipline
 
-- Current product version: `6.7.2`.
+- Current product version: `6.8.0`.
 - Product version is the single public version source. Keep these in lockstep: README/CHANGELOG, Rust crate versions, `pyproject.toml`, MCP `SERVER_VERSION`, Codex plugin manifest, `Cargo.lock`, and the live daemon build version.
 - Do not claim a version bump is complete after only editing source files. Rebuild and restart daemon/MCP where applicable, then verify `agentcall_daemon(action=status)` reports the same build version.
 - If source version and live daemon version differ, report version drift explicitly and rebuild/restart before continuing live validation.
@@ -141,7 +141,7 @@ git diff --check
 - Put old reviews under `docs/arch/review/`.
 - Root directory should stay focused on source entrypoints, README, CHANGELOG, config template, and build manifests.
 
-## Current v6.7 Status
+## Current v6.8 Status
 
 See `docs/v6.2-code-plan.md` for the frozen implementation baseline. Do not edit that plan during implementation.
 
@@ -150,6 +150,7 @@ See `docs/v6.2-code-plan.md` for the frozen implementation baseline. Do not edit
 - v6.5 removes the `read_only` route line and leaves only `coding` and `report` worker kinds.
 - v6.6 makes daemon safety-lock errors enum-backed, enables SQLite store writer fanout up to the configured six-worker concurrency limit, and lets daemon auto-commit stale prompt-pending PTY handoffs before Codex has to use debug recovery.
 - v6.7 hardens the control plane internals; v6.7.1 fixes bounded daemon start waiting, SQLite sequence recovery, and full board store-backed event reads; v6.7.2 scopes worker capacity to the current Codex session/thread owner instead of enforcing a daemon-global six-worker cap.
+- v6.8 keeps the owner-scoped model and reduces MCP observation cost: compact board is owner-filtered by default, session summary uses a projection-first snapshot path, and control tokens are minted only for explicit `include=["control"]` reads.
 - `workspace_busy`, `owner_lease_exists`, `capacity_exceeded`, and control-precondition failures must surface structured error codes and details instead of a bare `400`.
 - New safety-lock codes must be added as `ErrorCode` enum variants first; do not introduce ad hoc string-only error codes in daemon live paths.
 - SQLite is the recommended RuntimeStore backend for live multi-worker use. It may use `store_writer_threads=6`; JSON remains a single-writer safety fallback even if a larger writer count is configured.

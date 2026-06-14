@@ -1,5 +1,13 @@
 # CHANGELOG
 
+## v6.8.0 - Owner-scoped Batch Snapshot And Fast Summary Release
+
+- Compact board defaults to the current Codex session/thread owner, so unrelated sessions no longer pollute the default MCP view.
+- `agentcall_session(view=summary)` now keeps the projection-first fast path and omits daemon-minted control tokens unless callers explicitly request `include=["control"]`.
+- Session summary/control paths now preserve owner identity through MCP calls, preventing accidental cross-owner control assumptions.
+- Added v6.8 planning and latency reports for batch-state retrieval, owner-scoped snapshots, and MCP session-call performance.
+- Runtime release now builds into a sidecar target directory before syncing live binaries, reducing Windows file-lock failures from active MCP transports.
+
 ## v6.7.2 - Owner-scoped Worker Capacity Patch
 
 - MCP bridge now forwards a stable owner id derived from `AGENTCALL_OWNER_ID` or `CODEX_THREAD_ID` to the daemon, so each Codex session/thread gets its own worker quota.

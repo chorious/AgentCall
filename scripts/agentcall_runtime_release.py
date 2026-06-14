@@ -119,8 +119,18 @@ def run_release(root: Path, version: str, label: str, args: argparse.Namespace) 
         )
         run_checked([sys.executable, "-m", "pytest", "-q"], root, "pytest", timeout=300)
 
-    print_step("build", "cargo build --workspace")
-    run_checked([cargo_bin(), "build", "--workspace"], root, "cargo build --workspace", timeout=300)
+    if not args.no_stop_existing:
+        print_step("pre-build stop", "stopping AgentCall daemon/MCP processes before overwriting binaries")
+        stop_existing_processes(root)
+
+    build_target_dir = ".agentcall_build\\target-runtime-release"
+    print_step("build", f"cargo build --workspace --target-dir {build_target_dir}")
+    run_checked(
+        [cargo_bin(), "build", "--workspace", "--target-dir", build_target_dir],
+        root,
+        "cargo build --workspace",
+        timeout=300,
+    )
 
     if not args.skip_release_check:
         print_step("release-check", "python agentcall.py release-check")
@@ -129,6 +139,8 @@ def run_release(root: Path, version: str, label: str, args: argparse.Namespace) 
     if not args.no_stop_existing:
         print_step("stop", "stopping stale AgentCall daemon/MCP processes")
         stop_existing_processes(root)
+        print_step("sync", "copying freshly built binaries into target/debug")
+        sync_runtime_binaries(root, Path(build_target_dir))
 
     if not args.no_restart:
         print_step("start", "starting daemon as Windows breakaway process")
@@ -269,9 +281,10 @@ def stop_existing_processes(root: Path) -> None:
     root_text = str(root.resolve())
     script = rf"""
 $root = {json.dumps(root_text)}
+$rootLower = $root.ToLowerInvariant()
 $names = @('agentcall-mcp', 'agentcall-daemon')
-$matches = Get-Process -Name $names -ErrorAction SilentlyContinue |
-  Where-Object {{ $_.Path -and $_.Path.StartsWith($root, [System.StringComparison]::OrdinalIgnoreCase) }}
+$matches = Get-Process -ErrorAction SilentlyContinue |
+  Where-Object {{ ($names -contains $_.ProcessName) -and $_.Path -and $_.Path.ToLowerInvariant().StartsWith($rootLower) }}
 if (-not $matches) {{
   Write-Output 'No stale AgentCall processes found under repo root.'
   exit 0
@@ -293,6 +306,35 @@ foreach ($proc in $matches) {{
         print(output)
     if result.returncode != 0:
         raise ReleaseError("stop_process_failed", f"repo-scoped process stop failed: {output}")
+
+
+def sync_runtime_binaries(root: Path, build_target_dir: Path) -> None:
+    src_dir = root / build_target_dir / "debug"
+    dst_dir = root / "target" / "debug"
+    dst_dir.mkdir(parents=True, exist_ok=True)
+    binaries = [executable_name(package) for package in AGENTCALL_PACKAGES]
+    missing = [name for name in binaries if not (src_dir / name).exists()]
+    if missing:
+        raise ReleaseError(
+            "built_binary_missing",
+            f"built binaries missing under {src_dir}: {', '.join(missing)}",
+        )
+    last_error = ""
+    for attempt in range(1, 6):
+        try:
+            if attempt > 1:
+                stop_existing_processes(root)
+                time.sleep(0.2)
+            for name in binaries:
+                shutil.copy2(src_dir / name, dst_dir / name)
+            return
+        except PermissionError as exc:
+            last_error = str(exc)
+            time.sleep(0.25 * attempt)
+    raise ReleaseError(
+        "binary_sync_locked",
+        f"failed to sync runtime binaries into {dst_dir}; locked by live process: {last_error}",
+    )
 
 
 def start_daemon_breakaway(root: Path) -> int:
