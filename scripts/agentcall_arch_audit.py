@@ -81,11 +81,14 @@ def check_mcp_default_session_fast_path(root: Path) -> list[str]:
     if 'unwrap_or_else(|| legacy_session_view(&include))' not in body:
         failures.append("mcp_session must translate legacy include without changing the summary default")
     summary_body = extract_rust_item_body(text, "fn session_summary_view")
-    if "session_projection_summary(state, name)" not in summary_body:
+    summary_impl_body = summary_body
+    if "session_summary_view_for_owner" in summary_body:
+        summary_impl_body = extract_rust_item_body(text, "fn session_summary_view_for_owner")
+    if "session_projection_summary(state, name)" not in summary_impl_body:
         failures.append("session_summary_view must read projection summary for the default fast path")
-    if '"view": "summary"' not in summary_body:
+    if '"view": "summary"' not in summary_impl_body:
         failures.append("session_summary_view must return the v5.4 summary view contract")
-    if '"clean_tail"' in summary_body:
+    if '"clean_tail"' in summary_impl_body:
         failures.append("session_summary_view must not include clean_tail")
     return failures
 

@@ -306,12 +306,10 @@ fn mcp_session(
         .and_then(Value::as_str)
         .unwrap_or_else(|| legacy_session_view(&include));
     match view {
-        "summary" => Ok(session_summary_view(
-            state,
-            name,
-            &include,
-            owner_id.as_deref(),
-        )),
+        "summary" if owner_id.is_some() || include.iter().any(|item| item == "control") => Ok(
+            session_summary_view_for_owner(state, name, &include, owner_id.as_deref()),
+        ),
+        "summary" => Ok(session_summary_view(state, name, &include)),
         "tui" => session_tui_view(state, name, args),
         "events" => session_events(state, name, args, false),
         "debug" => session_debug_view(state, name, args, &include),
@@ -333,7 +331,11 @@ fn legacy_session_view(include: &[String]) -> &'static str {
     }
 }
 
-fn session_summary_view(
+fn session_summary_view(state: &AppState, name: &str, include: &[String]) -> Value {
+    session_summary_view_for_owner(state, name, include, None)
+}
+
+fn session_summary_view_for_owner(
     state: &AppState,
     name: &str,
     include: &[String],
@@ -614,7 +616,7 @@ fn session_debug_view(
     let mut response = json!({
         "schema_version": 1,
         "view": "debug",
-        "summary": session_summary_view(state, name, &[], None),
+        "summary": session_summary_view(state, name, &[]),
     });
     let session = if wants_clean_tail || wants_screen || wants_plan {
         Some(get_session(state, name).ok_or_else(|| {
