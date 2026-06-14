@@ -4,10 +4,13 @@ use crate::routes::{patch_route_record, route_for_wrapper_session};
 use crate::state::AppState;
 use crate::util::now_ms;
 use serde_json::{Value, json};
+use std::sync::Arc;
+use std::thread;
+use std::time::Duration;
 
 pub(crate) const DEFAULT_ACK_DEADLINE_MS: u64 = 15_000;
 pub(crate) const DEFAULT_COMMIT_ACK_DEADLINE_MS: u64 = 8_000;
-pub(crate) const DEFAULT_AUTO_COMMIT_GRACE_MS: u64 = 2_000;
+pub(crate) const DEFAULT_AUTO_COMMIT_GRACE_MS: u64 = 1_000;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum PromptGateState {
@@ -174,6 +177,13 @@ pub(crate) fn refresh_prompt_gate_timeouts_for_session(
         }
     }
     view
+}
+
+pub(crate) fn schedule_prompt_gate_auto_commit(state: Arc<AppState>, wrapper_session: String) {
+    thread::spawn(move || {
+        thread::sleep(Duration::from_millis(DEFAULT_AUTO_COMMIT_GRACE_MS));
+        let _ = refresh_prompt_gate_timeouts_for_session(&state, &wrapper_session);
+    });
 }
 
 fn daemon_auto_submit_pending_prompt(

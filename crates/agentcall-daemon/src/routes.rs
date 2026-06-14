@@ -4,7 +4,9 @@ use crate::ownership::{
     install_reserved_route_leases, release_owner_lease, release_workspace_lease,
     reserve_route_leases,
 };
-use crate::prompt_gate::{DEFAULT_ACK_DEADLINE_MS, route_prompt_id};
+use crate::prompt_gate::{
+    DEFAULT_ACK_DEADLINE_MS, route_prompt_id, schedule_prompt_gate_auto_commit,
+};
 use crate::runtime::{AgentRuntime, StartSpec};
 use crate::runtime_pty::ClaudeCodePtyRuntime;
 use crate::runtime_sdk::{ClaudeCodeSdkRuntime, sdk_runtime_enabled};
@@ -193,6 +195,11 @@ pub(crate) fn handle_route_for_owner(
     }
 
     upsert_route_record(state, &record)?;
+    if record.recommended_runtime == "pty" && mode == "start" {
+        if let Some(session_name) = record.session_name.clone() {
+            schedule_prompt_gate_auto_commit(Arc::clone(state), session_name);
+        }
+    }
     Ok(json!(record))
 }
 
