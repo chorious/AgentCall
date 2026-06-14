@@ -69,18 +69,29 @@ impl Config {
 }
 
 fn derive_owner_id() -> String {
-    env::var("AGENTCALL_OWNER_ID")
-        .ok()
+    derive_owner_id_from(
+        env::var("AGENTCALL_OWNER_ID").ok(),
+        env::var("CODEX_THREAD_ID").ok(),
+        std::process::id(),
+    )
+}
+
+fn derive_owner_id_from(
+    explicit_owner: Option<String>,
+    codex_thread_id: Option<String>,
+    process_id: u32,
+) -> String {
+    explicit_owner
         .filter(|value| !value.trim().is_empty())
         .or_else(|| {
-            env::var("CODEX_THREAD_ID")
-                .ok()
+            codex_thread_id
                 .filter(|value| !value.trim().is_empty())
                 .map(|value| format!("codex-thread-{value}"))
         })
+        .or_else(|| Some(format!("codex-mcp-pid-{process_id}")))
         .map(|value| normalize_owner_id(&value))
         .filter(|value| !value.is_empty())
-        .unwrap_or_else(|| "codex".to_string())
+        .unwrap_or_else(|| format!("codex-mcp-pid-{process_id}"))
 }
 
 fn normalize_owner_id(value: &str) -> String {
@@ -107,4 +118,34 @@ fn read_local_daemon_token(workspace: &std::path::Path) -> Option<String> {
         .and_then(serde_json::Value::as_str)
         .map(str::to_string)
         .filter(|value| !value.trim().is_empty())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn owner_id_prefers_explicit_env() {
+        assert_eq!(
+            derive_owner_id_from(
+                Some("codex-main".to_string()),
+                Some("thread-a".to_string()),
+                42
+            ),
+            "codex-main"
+        );
+    }
+
+    #[test]
+    fn owner_id_uses_thread_when_available() {
+        assert_eq!(
+            derive_owner_id_from(None, Some("019e:abc".to_string()), 42),
+            "codex-thread-019e:abc"
+        );
+    }
+
+    #[test]
+    fn owner_id_falls_back_to_mcp_process_not_global_codex() {
+        assert_eq!(derive_owner_id_from(None, None, 42), "codex-mcp-pid-42");
+    }
 }

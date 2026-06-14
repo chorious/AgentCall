@@ -1,6 +1,6 @@
 # AgentCall Docs
 
-这是 AgentCall 的文档索引。当前主线是 `v6.8.0`：Codex 通过 AgentCall MCP/daemon 指挥 Claude Code PTY utility workers，daemon 负责状态权威、hook-aware projection、bounded write policy、compact board、枚举化安全锁错误、SQLite writer fanout、prompt gate 自动自愈，以及按 Codex session/thread owner 隔离的 worker 并发额度。正常 worker 只剩 `coding` 与 `report` 两类；`read_only` route 线已移除。
+这是 AgentCall 的文档索引。当前主线是 `v6.8.1`：Codex 通过 AgentCall MCP/daemon 指挥 Claude Code PTY utility workers，daemon 负责状态权威、hook-aware projection、bounded write policy、compact board、枚举化安全锁错误、SQLite writer fanout、prompt gate 自动自愈，以及按 Codex session/thread owner 隔离的 worker 并发额度。正常 worker 只剩 `coding` 与 `report` 两类；`read_only` route 线已移除。
 
 ## 当前入口
 

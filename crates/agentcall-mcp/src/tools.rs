@@ -32,7 +32,8 @@ fn daemon_tool() -> Value {
             "type": "object",
             "properties": {
                 "action": {"type": "string", "enum": ["status", "start"], "default": "status"},
-                "wait_seconds": {"type": "integer", "minimum": 0, "maximum": 30, "default": 10}
+                "wait_seconds": {"type": "integer", "minimum": 0, "maximum": 30, "default": 10},
+                "debug": {"type": "boolean", "default": false, "description": "Return full daemon health including global worker counts. Default status is owner/session-safe."}
             },
             "additionalProperties": false
         }
@@ -50,7 +51,7 @@ fn board_tool() -> Value {
                 "view": {"type": "string", "enum": ["full", "compact"], "default": "compact"},
                 "filter": {"type": "string", "enum": ["all", "attention"], "default": "attention"},
                 "section": {"type": "string", "enum": ["all", "sessions", "events", "reports", "claims", "transcripts", "routes"], "default": "all"},
-                "scope": {"type": "string", "enum": ["all", "mine"], "default": "all"},
+                "scope": {"type": "string", "enum": ["all", "mine"], "default": "mine"},
                 "owner_id": {"type": "string"}
             },
             "additionalProperties": false
@@ -90,7 +91,7 @@ fn session_tool() -> Value {
                 "name": {"type": "string"},
                 "view": {"type": "string", "enum": ["summary", "tui", "events", "debug", "raw"], "default": "summary"},
                 "detail": {"type": "string", "enum": ["compact", "debug", "raw"], "default": "compact"},
-                "include": {"type": "array", "items": {"type": "string", "enum": ["summary", "clean_tail", "screen", "plan", "events", "artifacts", "policy", "metrics", "debug"]}, "default": ["summary"]},
+                "include": {"type": "array", "items": {"type": "string", "enum": ["summary", "control", "clean_tail", "screen", "plan", "events", "artifacts", "policy", "metrics", "debug"]}, "default": ["summary"]},
                 "cursor": {"type": "integer", "minimum": 0},
                 "limit": {"type": "integer", "minimum": 1, "maximum": 200, "default": 50},
                 "event_types": {"type": "array", "items": {"type": "string"}}
@@ -184,6 +185,16 @@ mod tests {
             tool["inputSchema"]["properties"]["filter"]["default"],
             "attention"
         );
+        assert_eq!(
+            tool["inputSchema"]["properties"]["scope"]["default"],
+            "mine"
+        );
+    }
+
+    #[test]
+    fn daemon_tool_defaults_to_owner_safe_status() {
+        let tool = daemon_tool();
+        assert_eq!(tool["inputSchema"]["properties"]["debug"]["default"], false);
     }
 
     #[test]
@@ -226,6 +237,7 @@ mod tests {
             .as_array()
             .unwrap();
         assert!(include_enum.iter().any(|item| item == "clean_tail"));
+        assert!(include_enum.iter().any(|item| item == "control"));
         assert!(include_enum.iter().any(|item| item == "plan"));
         assert!(include_enum.iter().any(|item| item == "debug"));
         assert!(include_enum.iter().any(|item| item == "policy"));

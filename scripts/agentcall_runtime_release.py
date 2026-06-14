@@ -136,16 +136,21 @@ def run_release(root: Path, version: str, label: str, args: argparse.Namespace) 
         print_step("release-check", "python agentcall.py release-check")
         run_checked([sys.executable, "agentcall.py", "release-check"], root, "release-check", timeout=900)
 
+    runtime_dir = runtime_binary_dir(root, version)
     if not args.no_stop_existing:
         print_step("stop", "stopping stale AgentCall daemon/MCP processes")
         stop_existing_processes(root)
-        print_step("sync", "copying freshly built binaries into target/debug")
-        sync_runtime_binaries(root, Path(build_target_dir))
+        print_step("sync", f"copying freshly built binaries into target/runtime/{version}")
+        runtime_dir = sync_runtime_binaries(root, Path(build_target_dir), version)
 
     if not args.no_restart:
         print_step("start", "starting daemon as Windows breakaway process")
-        pid = start_daemon_breakaway(root)
-        print(f"[OK] daemon process started pid={pid}")
+        existing = daemon_health_if_running(root, args.daemon_url)
+        if existing.get("build", {}).get("version") == version:
+            print("[OK] daemon already running at expected version")
+        else:
+            pid = start_daemon_breakaway(root, runtime_dir)
+            print(f"[OK] daemon process started pid={pid}")
         print_step("verify", "checking live daemon version")
         health = wait_for_daemon(root, args.daemon_url, version)
         print(
@@ -162,7 +167,7 @@ def run_release(root: Path, version: str, label: str, args: argparse.Namespace) 
                 indent=2,
             )
         )
-        print("[NOTE] Codex MCP stdio transports may need a new Codex session/plugin reload to bind to the rebuilt agentcall-mcp.exe.")
+        print("[NOTE] Codex MCP stdio transports may need a new Codex session/plugin reload to bind to the versioned runtime agentcall-mcp.exe.")
     return 0
 
 
@@ -211,6 +216,9 @@ def align_versions(root: Path, version: str, label: str, dry_run: bool) -> list[
     plugin_path = root / "plugins" / "agentcall" / ".codex-plugin" / "plugin.json"
     if update_plugin_version(plugin_path, version, dry_run=dry_run):
         changed.append(str(plugin_path.relative_to(root)))
+    plugin_mcp_path = root / "plugins" / "agentcall" / ".mcp.json"
+    if update_plugin_mcp_command(plugin_mcp_path, root, version, dry_run=dry_run):
+        changed.append(str(plugin_mcp_path.relative_to(root)))
 
     lock_path = root / "Cargo.lock"
     if update_cargo_lock(lock_path, version, dry_run=dry_run):
@@ -252,6 +260,18 @@ def update_plugin_version(path: Path, version: str, dry_run: bool) -> bool:
     return True
 
 
+def update_plugin_mcp_command(path: Path, root: Path, version: str, dry_run: bool) -> bool:
+    data = json.loads(read_text(path))
+    expected = str(root / "target" / "runtime" / version / executable_name("agentcall-mcp"))
+    server = data.setdefault("mcpServers", {}).setdefault("agentcall", {})
+    if server.get("command") == expected:
+        return False
+    server["command"] = expected
+    if not dry_run:
+        path.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    return True
+
+
 def update_cargo_lock(path: Path, version: str, dry_run: bool) -> bool:
     text = read_text(path)
     lines = text.splitlines()
@@ -282,16 +302,16 @@ def stop_existing_processes(root: Path) -> None:
     script = rf"""
 $root = {json.dumps(root_text)}
 $rootLower = $root.ToLowerInvariant()
-$names = @('agentcall-mcp', 'agentcall-daemon')
-$matches = Get-Process -ErrorAction SilentlyContinue |
-  Where-Object {{ ($names -contains $_.ProcessName) -and $_.Path -and $_.Path.ToLowerInvariant().StartsWith($rootLower) }}
+$names = @('agentcall-mcp.exe', 'agentcall-daemon.exe')
+$matches = Get-CimInstance Win32_Process -ErrorAction SilentlyContinue |
+  Where-Object {{ ($names -contains $_.Name) -and $_.ExecutablePath -and $_.ExecutablePath.ToLowerInvariant().StartsWith($rootLower) }}
 if (-not $matches) {{
   Write-Output 'No stale AgentCall processes found under repo root.'
   exit 0
 }}
 foreach ($proc in $matches) {{
-  Write-Output ("Stopping {{0}} pid={{1}} path={{2}}" -f $proc.ProcessName, $proc.Id, $proc.Path)
-  Stop-Process -Id $proc.Id -Force -ErrorAction Stop
+  Write-Output ("Stopping {{0}} pid={{1}} path={{2}}" -f $proc.Name, $proc.ProcessId, $proc.ExecutablePath)
+  Stop-Process -Id $proc.ProcessId -Force -ErrorAction Stop
 }}
 """
     result = subprocess.run(
@@ -308,9 +328,13 @@ foreach ($proc in $matches) {{
         raise ReleaseError("stop_process_failed", f"repo-scoped process stop failed: {output}")
 
 
-def sync_runtime_binaries(root: Path, build_target_dir: Path) -> None:
+def runtime_binary_dir(root: Path, version: str) -> Path:
+    return root / "target" / "runtime" / version
+
+
+def sync_runtime_binaries(root: Path, build_target_dir: Path, version: str) -> Path:
     src_dir = root / build_target_dir / "debug"
-    dst_dir = root / "target" / "debug"
+    dst_dir = runtime_binary_dir(root, version)
     dst_dir.mkdir(parents=True, exist_ok=True)
     binaries = [executable_name(package) for package in AGENTCALL_PACKAGES]
     missing = [name for name in binaries if not (src_dir / name).exists()]
@@ -327,7 +351,7 @@ def sync_runtime_binaries(root: Path, build_target_dir: Path) -> None:
                 time.sleep(0.2)
             for name in binaries:
                 shutil.copy2(src_dir / name, dst_dir / name)
-            return
+            return dst_dir
         except PermissionError as exc:
             last_error = str(exc)
             time.sleep(0.25 * attempt)
@@ -336,9 +360,8 @@ def sync_runtime_binaries(root: Path, build_target_dir: Path) -> None:
         f"failed to sync runtime binaries into {dst_dir}; locked by live process: {last_error}",
     )
 
-
-def start_daemon_breakaway(root: Path) -> int:
-    daemon = root / "target" / "debug" / executable_name("agentcall-daemon")
+def start_daemon_breakaway(root: Path, runtime_dir: Path) -> int:
+    daemon = runtime_dir / executable_name("agentcall-daemon")
     if not daemon.exists():
         raise ReleaseError("daemon_binary_missing", f"daemon binary missing: {daemon}")
     logs = root / ".agentcall" / "logs"
@@ -366,6 +389,17 @@ def start_daemon_breakaway(root: Path) -> int:
     if proc.poll() is not None:
         raise ReleaseError("daemon_start_failed", f"daemon exited immediately with code {proc.returncode}")
     return proc.pid
+
+
+def daemon_health_if_running(root: Path, daemon_url: str) -> dict:
+    try:
+        return http_json(
+            daemon_url.rstrip("/") + "/api/runtime/health",
+            headers=daemon_auth_headers(root),
+            timeout=1.0,
+        )
+    except Exception:
+        return {}
 
 
 def wait_for_daemon(root: Path, daemon_url: str, expected_version: str) -> dict:

@@ -1,5 +1,12 @@
 # CHANGELOG
 
+## v6.8.1 - Owner-safe Visibility Patch
+
+- MCP owner fallback no longer collapses unrelated Codex sessions into the global `codex` owner; when no explicit owner/thread id exists it uses the current MCP process owner id.
+- `agentcall_board` ordinary compact calls remain owner-scoped even if a caller passes `scope=all`; global board visibility is reserved for explicit `view=full&scope=all` debug inspection.
+- `agentcall_daemon(status|start)` now returns owner-safe daemon health by default and redacts global worker counts unless `debug=true` is requested.
+- MCP tool schema now defaults `agentcall_board.scope` to `mine` and exposes `debug` on `agentcall_daemon`.
+
 ## v6.8.0 - Owner-scoped Batch Snapshot And Fast Summary Release
 
 - Compact board defaults to the current Codex session/thread owner, so unrelated sessions no longer pollute the default MCP view.

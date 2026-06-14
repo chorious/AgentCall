@@ -15,19 +15,26 @@ pub(crate) fn daemon_control(config: &Config, args: Value) -> Result<Value, Stri
         .get("action")
         .and_then(Value::as_str)
         .unwrap_or("status");
+    let debug = args.get("debug").and_then(Value::as_bool).unwrap_or(false);
     match action {
         "status" => Ok(match daemon_get(config, "/api/runtime/health") {
-            Ok(health) => json!({"status": "running", "daemon": health}),
+            Ok(health) => json!({
+                "status": "running",
+                "daemon": daemon_health_for_owner(config, health, debug)
+            }),
             Err(err) => json!({"status": "stopped", "daemon_url": config.daemon_url, "error": err}),
         }),
-        "start" => start_daemon(config, args),
+        "start" => start_daemon(config, args, debug),
         other => Err(format!("unknown daemon action: {other}")),
     }
 }
 
-fn start_daemon(config: &Config, args: Value) -> Result<Value, String> {
+fn start_daemon(config: &Config, args: Value, debug: bool) -> Result<Value, String> {
     if let Ok(health) = daemon_get(config, "/api/runtime/health") {
-        return Ok(json!({"status": "already_running", "daemon": health}));
+        return Ok(json!({
+            "status": "already_running",
+            "daemon": daemon_health_for_owner(config, health, debug)
+        }));
     }
     let (_, port) = parse_daemon_url(&config.daemon_url)?;
     let binary = daemon_binary_path()?;
@@ -69,7 +76,7 @@ fn start_daemon(config: &Config, args: Value) -> Result<Value, String> {
                     "pid": child.id(),
                     "daemon_url": config.daemon_url,
                     "binary": binary,
-                    "daemon": health
+                    "daemon": daemon_health_for_owner(config, health, debug)
                 }));
             }
             Err(err) => {
@@ -89,6 +96,36 @@ fn start_daemon(config: &Config, args: Value) -> Result<Value, String> {
         "warning": "daemon process was spawned but health did not become ready before wait_seconds",
         "last_error": last_error
     }))
+}
+
+fn daemon_health_for_owner(config: &Config, health: Value, debug: bool) -> Value {
+    if debug {
+        return health;
+    }
+    let build = health.get("build").cloned().unwrap_or_else(|| json!({}));
+    let scheduler = health
+        .get("scheduler")
+        .cloned()
+        .unwrap_or_else(|| json!({}));
+    json!({
+        "status": health.get("status").cloned().unwrap_or_else(|| json!("unknown")),
+        "runtime": health.get("runtime").cloned().unwrap_or_else(|| json!("agentcall-daemon")),
+        "build": build,
+        "workspace": health.get("workspace").cloned().unwrap_or(Value::Null),
+        "claude_workspace": health.get("claude_workspace").cloned().unwrap_or(Value::Null),
+        "store_backend": health.get("store_backend").cloned().unwrap_or(Value::Null),
+        "hook_aware_summary": health.get("hook_aware_summary").cloned().unwrap_or(Value::Null),
+        "owner": {
+            "owner_id": &config.owner_id,
+            "scope": "mine"
+        },
+        "scheduler": {
+            "per_owner_max_sessions": scheduler.get("per_owner_max_sessions").cloned().unwrap_or(Value::Null),
+            "queue_policy": scheduler.get("queue_policy").cloned().unwrap_or(Value::Null)
+        },
+        "global_debug_redacted": true,
+        "debug_hint": "Pass debug=true to agentcall_daemon only when inspecting global daemon workers."
+    })
 }
 
 fn daemon_binary_path() -> Result<PathBuf, String> {
@@ -116,4 +153,47 @@ fn daemon_binary_path() -> Result<PathBuf, String> {
         }
     }
     Ok(PathBuf::from(exe_name))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_config() -> Config {
+        Config {
+            workspace: PathBuf::from("E:\\Project\\AgentCall"),
+            daemon_url: "http://127.0.0.1:3293".to_string(),
+            daemon_token: None,
+            owner_id: "codex-owner-a".to_string(),
+        }
+    }
+
+    #[test]
+    fn daemon_status_default_redacts_global_worker_counts() {
+        let health = json!({
+            "status": "ok",
+            "runtime": "agentcall-daemon",
+            "active_pty_sessions": 6,
+            "live_daemon_sessions": 6,
+            "build": {"version": "6.8.1"},
+            "scheduler": {"per_owner_max_sessions": 6, "active_sessions": 6, "queue_policy": "reject_when_owner_full"}
+        });
+        let value = daemon_health_for_owner(&test_config(), health, false);
+        assert_eq!(value["global_debug_redacted"], true);
+        assert_eq!(value["owner"]["owner_id"], "codex-owner-a");
+        assert!(value.get("active_pty_sessions").is_none());
+        assert!(value["scheduler"].get("active_sessions").is_none());
+    }
+
+    #[test]
+    fn daemon_status_debug_returns_full_health() {
+        let health = json!({
+            "status": "ok",
+            "active_pty_sessions": 6,
+            "scheduler": {"active_sessions": 6}
+        });
+        let value = daemon_health_for_owner(&test_config(), health, true);
+        assert_eq!(value["active_pty_sessions"], 6);
+        assert_eq!(value["scheduler"]["active_sessions"], 6);
+    }
 }

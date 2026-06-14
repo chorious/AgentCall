@@ -1,12 +1,12 @@
 # AgentCall
 
-当前版本 / Current version: `v6.8.0`
+当前版本 / Current version: `v6.8.1`
 
 AgentCall is a local coordination plane that lets **Codex supervise Claude Code PTY utility workers** through a daemon-backed MCP interface. Codex stays the parent agent: it reads a compact board, starts bounded workers, sends safe commands, waits with patience hints, asks for reports, and accepts or revises deliverables. Claude Code workers do the visible PTY work under hook-aware policy and file ownership.
 
 AgentCall 是一个本地多 Agent 协作控制面：让 **Codex 指挥 Claude Code PTY worker 集群**。Codex 负责拆分、监督、验收和整合；Claude Code worker 负责执行边界明确的实现、审查、证据检查和报告任务。
 
-v6.8.0 延续 v6.2 worker closure 主线，并聚焦 MCP 响应速度和 owner 隔离：compact board 默认按当前 Codex session/thread owner 过滤，`agentcall_session` 默认走 projection-first summary 快路径且不默认铸造 control token，显式 `include=["control"]` 才返回短期控制令牌。v6.8 还补充了 batch-state/latency 分析报告，减少 Codex 为查看多个 worker 状态而串行读取多个 session 的上下文负担。冻结实现基线仍见 [v6.2 code plan](docs/v6.2-code-plan.md)。
+v6.8.1 延续 v6.8 owner/batch snapshot 主线，并修紧普通 Codex session 的全局可见性：MCP owner 在缺少 `CODEX_THREAD_ID` 时不再退回全局 `codex`，而是使用当前 MCP 进程级 owner；`agentcall_board` 的普通 compact 请求即使传入 `scope=all` 也只看当前 owner；`agentcall_daemon(status)` 默认返回 owner-safe health，只有 `debug=true` 才暴露全局 worker 数。冻结实现基线仍见 [v6.2 code plan](docs/v6.2-code-plan.md)。
 
 ## Product Shape / 产品特点
 
@@ -104,7 +104,7 @@ python agentcall.py paths
 python agentcall.py logs doctor
 python agentcall.py sessions cleanup --stale-after 5m
 python agentcall.py release-check
-python agentcall.py runtime-release --version 6.8.0
+python agentcall.py runtime-release --version 6.8.1
 ```
 
 The scripts are intentionally loud: missing Cargo, stale hooks, daemon health timeout, plugin validation failure, pytest failure, or whitespace diff errors should point to the failing subsystem.

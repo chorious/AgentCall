@@ -180,16 +180,21 @@ fn mcp_board(
     client: Option<&McpClientContext>,
 ) -> Result<Value, String> {
     let scope = args.get("scope").and_then(Value::as_str).unwrap_or("mine");
-    let client_owner = client_owner_id_optional(client);
-    let owner_id = board_owner_filter(
-        Some(scope),
-        args.get("owner_id")
-            .and_then(Value::as_str)
-            .or(client_owner.as_deref()),
-    );
+    let view = args
+        .get("view")
+        .and_then(Value::as_str)
+        .unwrap_or("compact");
+    let debug_global = view == "full" && scope == "all";
+    let owner_for_non_debug = client_owner_id(client);
+    let requested_owner = args.get("owner_id").and_then(Value::as_str);
+    let owner_id = if debug_global {
+        board_owner_filter(Some(scope), requested_owner)
+    } else {
+        board_owner_filter(Some("mine"), Some(&owner_for_non_debug))
+    };
     Ok(board_state(
         state,
-        args.get("view").and_then(Value::as_str),
+        Some(view),
         args.get("filter").and_then(Value::as_str),
         args.get("section").and_then(Value::as_str),
         owner_id.as_deref(),
@@ -2138,6 +2143,42 @@ mod tests {
             json!({}),
         );
         assert_eq!(routes[route_id]["owner_id"], "codex-thread-owner-a");
+    }
+
+    #[test]
+    fn mcp_board_compact_ignores_scope_all_without_debug_view() {
+        let root = test_workspace("board-owner-safe-compact");
+        let state = AppState::test(root.clone());
+        let result = mcp_board(
+            &state,
+            &json!({"view": "compact", "filter": "attention", "scope": "all"}),
+            Some(&McpClientContext {
+                owner_id: Some("codex-owner-a".to_string()),
+            }),
+        )
+        .unwrap();
+        assert_eq!(result["view"], "compact");
+        assert_eq!(result["owner"]["bound"], true);
+        assert_eq!(result["owner"]["owner_id"], "codex-owner-a");
+        assert_eq!(result["owner"]["scope"], "mine");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn mcp_board_full_scope_all_is_explicit_debug_global() {
+        let root = test_workspace("board-owner-debug-global");
+        let state = AppState::test(root.clone());
+        let result = mcp_board(
+            &state,
+            &json!({"view": "full", "scope": "all", "section": "sessions"}),
+            Some(&McpClientContext {
+                owner_id: Some("codex-owner-a".to_string()),
+            }),
+        )
+        .unwrap();
+        assert_eq!(result["workspace_filter_applied"], false);
+        assert!(result.get("runtime_sessions").is_some());
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]
