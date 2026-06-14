@@ -267,7 +267,7 @@ fn parse_workspace_busy(message: &str) -> Value {
         "workspace": fields.get("workspace").cloned().unwrap_or(Value::Null),
         "existing_session": fields.get("existing_session").cloned().unwrap_or(Value::Null),
         "existing_mode": fields.get("existing_mode").cloned().unwrap_or(Value::Null),
-        "suggested_action": "Inspect the existing session, accept its report or stop it if stale; report-only workers should use report_path/write_paths that do not claim implementation ownership."
+        "suggested_action": "For parallel Code work, create a separate temporary workspace or git worktree for the new worker and route with workspace pointing at that shard. Do not start two exclusive Code workers in the same worktree. Otherwise inspect the existing session, accept its report, or stop it if stale."
     })
 }
 

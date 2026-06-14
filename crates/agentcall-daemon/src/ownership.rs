@@ -410,7 +410,7 @@ pub(crate) fn reserve_route_leases(
                         "existing_owner": existing.owner_id.clone(),
                         "existing_mode": existing.mode.clone(),
                         "existing_expires_at": existing.expires_at.clone(),
-                        "suggested_action": "Use report-only shared routing, wait for the existing worker report, or stop/release the stale session explicitly."
+                        "suggested_action": "For parallel Code work, create a separate temporary workspace or git worktree for the new worker and route with workspace pointing at that shard. Do not start two exclusive Code workers in the same worktree. Otherwise wait for the existing worker, accept its report, or stop/release the stale session explicitly."
                     }),
                 ));
             }
@@ -511,7 +511,7 @@ pub(crate) fn acquire_workspace_lease(
                         "existing_owner": existing.owner_id.clone(),
                         "existing_mode": existing.mode.clone(),
                         "existing_expires_at": existing.expires_at.clone(),
-                        "suggested_action": "Use report-only shared routing, wait for the existing worker report, or stop/release the stale session explicitly."
+                        "suggested_action": "For parallel Code work, create a separate temporary workspace or git worktree for the new worker and route with workspace pointing at that shard. Do not start two exclusive Code workers in the same worktree. Otherwise wait for the existing worker, accept its report, or stop/release the stale session explicitly."
                     }),
                 ));
             }
@@ -812,6 +812,24 @@ mod tests {
 
         let err = acquire_workspace_lease(&state, "worker-b", &workspace, false).unwrap_err();
         assert!(err.contains("workspace_busy"));
+        assert!(err.contains("git worktree"));
+    }
+
+    #[test]
+    fn route_workspace_busy_suggests_temporary_worktree_shard() {
+        let state = test_state("route-workspace-busy-hint");
+        let workspace = state.workspace.clone();
+        let first = reserve_route_leases(&state, "worker-a", "codex", &workspace, false).unwrap();
+        install_reserved_route_leases(&state, &first).unwrap();
+
+        let err = match reserve_route_leases(&state, "worker-b", "codex", &workspace, false) {
+            Ok(_) => panic!("expected workspace_busy"),
+            Err(err) => err,
+        };
+
+        assert!(err.contains("workspace_busy"));
+        assert!(err.contains("git worktree"));
+        assert!(err.contains("route with workspace pointing at that shard"));
     }
 
     #[test]
