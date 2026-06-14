@@ -25,7 +25,7 @@ use crate::summary::{
     session_plan_artifact, session_summary, terminal_snapshot_value,
 };
 use crate::util::now_ms;
-use crate::worker_state::{WorkerStateKind, worker_state_for_session};
+use crate::worker_state::{WorkerStateKind, worker_snapshot_for_session, worker_state_for_session};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use std::path::PathBuf;
@@ -62,7 +62,7 @@ pub(crate) fn mcp_tools() -> Vec<Value> {
                     "view": {"type": "string", "enum": ["full", "compact"], "default": "compact"},
                     "filter": {"type": "string", "enum": ["all", "attention"], "default": "attention"},
                     "section": {"type": "string", "enum": ["all", "sessions", "events", "reports", "claims", "transcripts", "routes"], "default": "all"},
-                    "scope": {"type": "string", "enum": ["all", "mine"], "default": "all"},
+                    "scope": {"type": "string", "enum": ["all", "mine"], "default": "mine"},
                     "owner_id": {"type": "string"}
                 },
                 "additionalProperties": false
@@ -96,7 +96,7 @@ pub(crate) fn mcp_tools() -> Vec<Value> {
                     "name": {"type": "string"},
                     "view": {"type": "string", "enum": ["summary", "tui", "events", "debug", "raw"], "default": "summary"},
                     "detail": {"type": "string", "enum": ["compact", "debug", "raw"], "default": "compact"},
-                    "include": {"type": "array", "items": {"type": "string", "enum": ["summary", "clean_tail", "screen", "plan", "events", "artifacts", "policy", "metrics", "debug"]}, "default": ["summary"]},
+                    "include": {"type": "array", "items": {"type": "string", "enum": ["summary", "control", "clean_tail", "screen", "plan", "events", "artifacts", "policy", "metrics", "debug"]}, "default": ["summary"]},
                     "cursor": {"type": "integer", "minimum": 0},
                     "limit": {"type": "integer", "minimum": 1, "maximum": 200, "default": 50},
                     "event_types": {"type": "array", "items": {"type": "string"}}
@@ -143,11 +143,11 @@ pub(crate) fn mcp_tools() -> Vec<Value> {
 pub(crate) fn mcp_call(state: &Arc<AppState>, req: McpCallRequest) -> Result<Value, String> {
     let args = req.arguments.unwrap_or_else(|| json!({}));
     let result = match req.name.as_str() {
-        "agentcall_board" => mcp_board(state, &args),
+        "agentcall_board" => mcp_board(state, &args, req.client.as_ref()),
         "agentcall_route" => mcp_route(state, args.clone(), req.client.as_ref()),
-        "agentcall_session" => mcp_session(state, &args),
-        "agentcall_session_send" => mcp_session_send(state, &args),
-        "agentcall_report" => mcp_report(state, &args),
+        "agentcall_session" => mcp_session(state, &args, req.client.as_ref()),
+        "agentcall_session_send" => mcp_session_send(state, &args, req.client.as_ref()),
+        "agentcall_report" => mcp_report(state, &args, req.client.as_ref()),
         other => Err(format!("unknown daemon MCP tool: {other}")),
     };
     let status = if result.is_ok() { "ok" } else { "error" };
@@ -174,10 +174,18 @@ pub(crate) fn mcp_call(state: &Arc<AppState>, req: McpCallRequest) -> Result<Val
     result
 }
 
-fn mcp_board(state: &AppState, args: &Value) -> Result<Value, String> {
+fn mcp_board(
+    state: &AppState,
+    args: &Value,
+    client: Option<&McpClientContext>,
+) -> Result<Value, String> {
+    let scope = args.get("scope").and_then(Value::as_str).unwrap_or("mine");
+    let client_owner = client_owner_id_optional(client);
     let owner_id = board_owner_filter(
-        args.get("scope").and_then(Value::as_str),
-        args.get("owner_id").and_then(Value::as_str),
+        Some(scope),
+        args.get("owner_id")
+            .and_then(Value::as_str)
+            .or(client_owner.as_deref()),
     );
     Ok(board_state(
         state,
@@ -204,11 +212,14 @@ fn mcp_route(
 }
 
 fn client_owner_id(client: Option<&McpClientContext>) -> String {
+    client_owner_id_optional(client).unwrap_or_else(|| "codex".to_string())
+}
+
+fn client_owner_id_optional(client: Option<&McpClientContext>) -> Option<String> {
     client
         .and_then(|client| client.owner_id.as_deref())
         .map(normalize_owner_id)
         .filter(|value| !value.is_empty())
-        .unwrap_or_else(|| "codex".to_string())
 }
 
 fn normalize_owner_id(value: &str) -> String {
@@ -278,15 +289,29 @@ fn route_mcp_response(state: &AppState, route: &Value) -> Value {
     })
 }
 
-fn mcp_session(state: &AppState, args: &Value) -> Result<Value, String> {
+fn mcp_session(
+    state: &AppState,
+    args: &Value,
+    client: Option<&McpClientContext>,
+) -> Result<Value, String> {
     let name = required_str(args, "name")?;
     let include = string_array(args, "include");
+    let owner_id = args
+        .get("owner_id")
+        .and_then(Value::as_str)
+        .map(normalize_owner_id)
+        .or_else(|| client_owner_id_optional(client));
     let view = args
         .get("view")
         .and_then(Value::as_str)
         .unwrap_or_else(|| legacy_session_view(&include));
     match view {
-        "summary" => Ok(session_summary_view(state, name, &include)),
+        "summary" => Ok(session_summary_view(
+            state,
+            name,
+            &include,
+            owner_id.as_deref(),
+        )),
         "tui" => session_tui_view(state, name, args),
         "events" => session_events(state, name, args, false),
         "debug" => session_debug_view(state, name, args, &include),
@@ -308,12 +333,22 @@ fn legacy_session_view(include: &[String]) -> &'static str {
     }
 }
 
-fn session_summary_view(state: &AppState, name: &str, include: &[String]) -> Value {
+fn session_summary_view(
+    state: &AppState,
+    name: &str,
+    include: &[String],
+    owner_id: Option<&str>,
+) -> Value {
     let projection = session_projection_summary(state, name);
     let wants_screen = include.iter().any(|item| item == "screen");
+    let wants_control = include.iter().any(|item| item == "control");
     if !wants_screen {
-        let worker = worker_state_for_session(state, name);
-        let control = slim_control_summary(control_summary_for_session(state, name, None));
+        let worker = worker_snapshot_for_session(state, name);
+        let control = if wants_control {
+            slim_control_summary(control_summary_for_session(state, name, owner_id))
+        } else {
+            no_token_control_summary(state, name)
+        };
         return attach_budget(
             worker.to_summary_value(control),
             "summary",
@@ -358,7 +393,11 @@ fn session_summary_view(state: &AppState, name: &str, include: &[String]) -> Val
         "report_ready": projection.get("report_ready").cloned().unwrap_or_else(|| json!(false)),
         "projection_seq": projection.get("projection_last_session_seq").cloned().unwrap_or_else(|| json!(0)),
         "projection_stale": projection.get("projection_stale").cloned().unwrap_or_else(|| json!(true)),
-        "control": control_summary_for_session(state, name, None),
+        "control": if wants_control {
+            control_summary_for_session(state, name, owner_id)
+        } else {
+            no_token_control_summary(state, name)
+        },
         "workspace": projection.get("workspace").cloned().unwrap_or(Value::Null),
         "claude_cwd": projection.get("claude_cwd").cloned().unwrap_or(Value::Null),
         "warnings": projection.get("warnings").cloned().unwrap_or_else(|| json!([]))
@@ -397,9 +436,19 @@ fn slim_control_summary(control: Value) -> Value {
     json!({
         "available": true,
         "token": control.get("token").cloned().unwrap_or(Value::Null),
+        "token_included": control.get("token").and_then(Value::as_str).is_some(),
         "expires_at": control.get("expires_at").cloned().unwrap_or(Value::Null),
         "ttl_seconds": control.get("ttl_seconds").cloned().unwrap_or(Value::Null),
         "token_required_for": ["interrupt", "stop", "kill", "approve_plan", "start_auto"],
+    })
+}
+
+fn no_token_control_summary(state: &AppState, name: &str) -> Value {
+    let live = state.sessions.lock().unwrap().contains_key(name);
+    json!({
+        "available": live,
+        "token_included": false,
+        "token_required_for": ["interrupt", "stop", "kill", "approve_plan", "start_auto"]
     })
 }
 
@@ -565,7 +614,7 @@ fn session_debug_view(
     let mut response = json!({
         "schema_version": 1,
         "view": "debug",
-        "summary": session_summary_view(state, name, &[]),
+        "summary": session_summary_view(state, name, &[], None),
     });
     let session = if wants_clean_tail || wants_screen || wants_plan {
         Some(get_session(state, name).ok_or_else(|| {
@@ -1103,10 +1152,26 @@ fn truncate_utf8_owned(text: &str, cap_bytes: usize) -> String {
     text[..end].to_string()
 }
 
-fn mcp_session_send(state: &AppState, args: &Value) -> Result<Value, String> {
+fn mcp_session_send(
+    state: &AppState,
+    args: &Value,
+    client: Option<&McpClientContext>,
+) -> Result<Value, String> {
     let name = required_str(args, "name")?;
     let action = args.get("action").and_then(Value::as_str).unwrap_or("send");
-    let args = session_send_args_with_default_idempotency(state, name, action, args)?;
+    let mut args = if args.is_object() {
+        args.clone()
+    } else {
+        json!({})
+    };
+    if args.get("owner_id").and_then(Value::as_str).is_none() {
+        if let Some(owner_id) = client_owner_id_optional(client) {
+            args.as_object_mut()
+                .unwrap()
+                .insert("owner_id".to_string(), json!(owner_id));
+        }
+    }
+    let args = session_send_args_with_default_idempotency(state, name, action, &args)?;
     let args = match session_send_args_with_control_token(state, name, action, &args) {
         Ok(args) => args,
         Err(value) => return Ok(value),
@@ -1769,7 +1834,11 @@ fn update_pty_workflow_route(
     )
 }
 
-fn mcp_report(state: &Arc<AppState>, args: &Value) -> Result<Value, String> {
+fn mcp_report(
+    state: &Arc<AppState>,
+    args: &Value,
+    _client: Option<&McpClientContext>,
+) -> Result<Value, String> {
     match args
         .get("action")
         .and_then(Value::as_str)
@@ -1955,6 +2024,7 @@ mod tests {
             &json!({
                 route_id: {
                     "route_id": route_id,
+                    "owner_id": "codex",
                     "recommended_runtime": "pty",
                     "runtime": "pty",
                     "session_name": session_name,
@@ -2020,6 +2090,7 @@ mod tests {
         let include_enum = session_tool["inputSchema"]["properties"]["include"]["items"]["enum"]
             .as_array()
             .unwrap();
+        assert!(include_enum.iter().any(|item| item == "control"));
         assert!(include_enum.iter().any(|item| item == "clean_tail"));
         assert!(include_enum.iter().any(|item| item == "plan"));
         assert!(include_enum.iter().any(|item| item == "debug"));
@@ -2150,12 +2221,14 @@ mod tests {
             json!({"wrapper_session": "worker-a", "status": "needs_permission"}),
         );
 
-        let summary = mcp_session(&state, &json!({"name": "worker-a"})).unwrap();
+        let summary = mcp_session(&state, &json!({"name": "worker-a"}), None).unwrap();
         assert_eq!(summary["view"], "summary");
         assert_eq!(summary["schema_version"], 2);
         assert_eq!(summary["worker"], "worker-a");
         assert_eq!(summary["state"], "done");
         assert_eq!(summary["can_wait"], false);
+        assert_eq!(summary["control"]["token_included"], false);
+        assert!(summary["control"].get("token").is_none());
         assert!(summary.get("clean_tail").is_none());
         assert!(summary.get("events").is_none());
         assert_eq!(summary["budget"]["view"], "summary");
@@ -2163,6 +2236,7 @@ mod tests {
         let summary_ignores_debug_include = mcp_session(
             &state,
             &json!({"name": "worker-a", "view": "summary", "include": ["clean_tail", "events"]}),
+            None,
         )
         .unwrap();
         assert_eq!(summary_ignores_debug_include["view"], "summary");
@@ -2172,6 +2246,7 @@ mod tests {
         let err = mcp_session(
             &state,
             &json!({"name": "worker-a", "view": "debug", "include": ["clean_tail"]}),
+            None,
         )
         .unwrap_err();
         assert!(err.contains("session is not live"));
@@ -2264,6 +2339,7 @@ mod tests {
         let result = mcp_session_send(
             &state,
             &json!({"name": "worker-a", "action": "submit_pending_prompt"}),
+            None,
         )
         .unwrap();
         assert_eq!(result["ok"], true);
@@ -2421,7 +2497,7 @@ mod tests {
             }),
         );
 
-        let tui = mcp_session(&state, &json!({"name": "worker-a", "view": "tui"})).unwrap();
+        let tui = mcp_session(&state, &json!({"name": "worker-a", "view": "tui"}), None).unwrap();
         assert_eq!(
             tui["status"]["route_status"],
             "prompt_commit_unacknowledged"
@@ -2443,7 +2519,7 @@ mod tests {
         let state = AppState::test(root.clone());
 
         let result =
-            mcp_session_send(&state, &json!({"name": "worker-a", "action": "stop"})).unwrap();
+            mcp_session_send(&state, &json!({"name": "worker-a", "action": "stop"}), None).unwrap();
 
         assert_eq!(result["ok"], false);
         assert_eq!(result["status"], "missing_control_token");
@@ -2485,7 +2561,8 @@ mod tests {
             }),
         );
 
-        let events = mcp_session(&state, &json!({"name": "worker-a", "view": "events"})).unwrap();
+        let events =
+            mcp_session(&state, &json!({"name": "worker-a", "view": "events"}), None).unwrap();
         assert_eq!(events["view"], "events");
         assert_eq!(events["events"][1]["kind"], "denied_write");
         assert_eq!(events["events"][1]["actionability"], "requires_supervisor");
@@ -2495,7 +2572,7 @@ mod tests {
         assert!(!rendered.contains("secret source content"));
         assert!(!rendered.contains("private task"));
 
-        let raw = mcp_session(&state, &json!({"name": "worker-a", "view": "raw"})).unwrap();
+        let raw = mcp_session(&state, &json!({"name": "worker-a", "view": "raw"}), None).unwrap();
         assert_eq!(raw["view"], "raw");
         assert!(raw["events"][0].get("data").is_some());
         let _ = std::fs::remove_dir_all(root);
@@ -2526,6 +2603,7 @@ mod tests {
         let events = mcp_session(
             &state,
             &json!({"name": "worker-a", "view": "events", "limit": 200}),
+            None,
         )
         .unwrap();
         let rendered = serde_json::to_string(&events).unwrap();
@@ -2570,6 +2648,7 @@ mod tests {
         let tui = mcp_session(
             &state,
             &json!({"name": "worker-a", "view": "tui", "include": ["clean_tail", "events"]}),
+            None,
         )
         .unwrap();
         assert_eq!(tui["view"], "tui");
@@ -2626,7 +2705,7 @@ mod tests {
         )
         .unwrap();
 
-        let tui = mcp_session(&state, &json!({"name": "worker-a", "view": "tui"})).unwrap();
+        let tui = mcp_session(&state, &json!({"name": "worker-a", "view": "tui"}), None).unwrap();
         let rendered = serde_json::to_string(&tui).unwrap();
         assert!(
             rendered.len() <= TUI_VIEW_MAX_BYTES,
@@ -2676,7 +2755,7 @@ mod tests {
         )
         .unwrap();
 
-        let tui = mcp_session(&state, &json!({"name": "worker-a", "view": "tui"})).unwrap();
+        let tui = mcp_session(&state, &json!({"name": "worker-a", "view": "tui"}), None).unwrap();
         assert_eq!(tui["status"]["route_status"], "prompt_missing");
         assert_eq!(tui["status"]["prompt"]["state"], "prompt_missing");
         assert_eq!(tui["status"]["prompt"]["can_submit_pending_prompt"], true);
@@ -2728,7 +2807,7 @@ mod tests {
             }),
         );
 
-        let reports = mcp_report(&state, &json!({"action": "accept"})).unwrap();
+        let reports = mcp_report(&state, &json!({"action": "accept"}), None).unwrap();
         assert_eq!(reports[0]["confidence"]["band"], "high");
         assert!(
             reports[0]["confidence"]["evidence"]

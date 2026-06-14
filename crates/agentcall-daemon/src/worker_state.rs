@@ -1,6 +1,7 @@
 use crate::projection::session_projection_summary;
 use crate::prompt_gate::{
-    PromptGateState, PromptGateView, refresh_prompt_gate_timeouts_for_session,
+    PromptGateState, PromptGateView, prompt_gate_for_session,
+    refresh_prompt_gate_timeouts_for_session,
 };
 use crate::routes::route_for_wrapper_session;
 use crate::session::configured_claude_workspace;
@@ -210,8 +211,27 @@ impl WorkerStateView {
 }
 
 pub(crate) fn worker_state_for_session(state: &AppState, session_name: &str) -> WorkerStateView {
+    worker_state_for_session_with_gate(
+        state,
+        session_name,
+        refresh_prompt_gate_timeouts_for_session(state, session_name),
+    )
+}
+
+pub(crate) fn worker_snapshot_for_session(state: &AppState, session_name: &str) -> WorkerStateView {
+    worker_state_for_session_with_gate(
+        state,
+        session_name,
+        prompt_gate_for_session(state, session_name),
+    )
+}
+
+fn worker_state_for_session_with_gate(
+    state: &AppState,
+    session_name: &str,
+    prompt_gate: PromptGateView,
+) -> WorkerStateView {
     let projection = session_projection_summary(state, session_name);
-    let prompt_gate = refresh_prompt_gate_timeouts_for_session(state, session_name);
     let route = route_for_wrapper_session(state, session_name).map(|(_, route)| route);
     let workspace = workspace_projection(state, route.as_ref());
     let mut report = report_projection_from_route(route.as_ref());

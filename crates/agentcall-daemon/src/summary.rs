@@ -15,7 +15,7 @@ use crate::store::EventQuery;
 use crate::terminal::{clean_terminal_text, tail_lines};
 use crate::terminal_screen::TerminalEmulator;
 use crate::util::now_ms;
-use crate::worker_state::worker_state_for_session;
+use crate::worker_state::worker_snapshot_for_session;
 use serde_json::Value;
 use std::collections::HashSet;
 use std::fs;
@@ -27,14 +27,10 @@ const STALE_SESSION_MS: u64 = 5 * 60 * 1000;
 const PATIENCE_SECONDS: u64 = 60;
 const STALL_THRESHOLD_SECONDS: u64 = 300;
 
-pub(crate) fn board_owner_filter(scope: Option<&str>, owner_id: Option<&str>) -> Option<String> {
+pub(crate) fn board_owner_filter(_scope: Option<&str>, owner_id: Option<&str>) -> Option<String> {
     owner_id
         .filter(|value| !value.trim().is_empty())
         .map(str::to_string)
-        .or_else(|| match scope {
-            Some("mine") => Some("codex".to_string()),
-            _ => None,
-        })
 }
 
 pub(crate) fn board_state(
@@ -185,7 +181,7 @@ pub(crate) fn board_state(
 fn v6_compact_board_state(
     state: &AppState,
     filter: Option<&str>,
-    _owner_id: Option<&str>,
+    owner_id: Option<&str>,
     workspace_filter: Option<&str>,
 ) -> serde_json::Value {
     let runtime_sessions = list_sessions(state);
@@ -193,7 +189,12 @@ fn v6_compact_board_state(
     let all_workers: Vec<serde_json::Value> = runtime_sessions
         .iter()
         .filter(|session| session.status == "running")
-        .map(|session| worker_state_for_session(state, &session.name).to_board_worker())
+        .filter(|session| session_matches_owner(state, &session.name, owner_id))
+        .map(|session| {
+            let mut worker = worker_snapshot_for_session(state, &session.name).to_board_worker();
+            enrich_board_worker_owner(state, &session.name, owner_id, &mut worker);
+            worker
+        })
         .filter(|worker| worker_matches_workspace_filter(worker, workspace_filter))
         .collect();
     let attention_workers: Vec<serde_json::Value> = all_workers
@@ -241,6 +242,11 @@ fn v6_compact_board_state(
         "workspace_filter_applied": workspace_filter.is_some(),
         "view": "compact",
         "filter": filter.unwrap_or("attention"),
+        "owner": {
+            "bound": owner_id.is_some(),
+            "owner_id": owner_id,
+            "scope": if owner_id.is_some() { "mine" } else { "all_or_unbound" }
+        },
         "workers": workers,
         "attention": attention_names,
         "counts": {
@@ -248,6 +254,55 @@ fn v6_compact_board_state(
             "attention": attention_workers.len()
         }
     })
+}
+
+fn session_matches_owner(state: &AppState, session_name: &str, owner_id: Option<&str>) -> bool {
+    let Some(owner_id) = owner_id else {
+        return true;
+    };
+    session_owner_id(state, session_name).as_deref() == Some(owner_id)
+}
+
+fn enrich_board_worker_owner(
+    state: &AppState,
+    session_name: &str,
+    owner_id: Option<&str>,
+    worker: &mut Value,
+) {
+    let actual_owner = session_owner_id(state, session_name);
+    if let Some(object) = worker.as_object_mut() {
+        let owner_visible = owner_id
+            .and_then(|expected| actual_owner.as_deref().map(|actual| actual == expected))
+            .unwrap_or(false);
+        object.insert(
+            "owner".to_string(),
+            serde_json::json!({
+                "owner_id": actual_owner,
+                "owner_visible": owner_visible
+            }),
+        );
+        object.insert(
+            "owner_visible".to_string(),
+            serde_json::json!(owner_visible),
+        );
+        object.insert(
+            "control".to_string(),
+            serde_json::json!({
+                "available": owner_visible,
+                "token_included": false,
+                "token_required_for": ["interrupt", "stop", "kill", "approve_plan", "start_auto"]
+            }),
+        );
+    }
+}
+
+fn session_owner_id(state: &AppState, session_name: &str) -> Option<String> {
+    state
+        .owner_leases
+        .lock()
+        .unwrap()
+        .get(session_name)
+        .map(|lease| lease.owner_id.clone())
 }
 
 fn worker_matches_workspace_filter(worker: &Value, workspace_filter: Option<&str>) -> bool {

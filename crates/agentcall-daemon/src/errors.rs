@@ -6,6 +6,7 @@ pub(crate) enum ErrorCode {
     OwnerLeaseExists,
     OwnerConflict,
     OwnerMismatch,
+    OwnerUnbound,
     StaleLease,
     StaleLeaseGeneration,
     ExpiredLease,
@@ -29,6 +30,7 @@ impl ErrorCode {
             Self::OwnerLeaseExists => "owner_lease_exists",
             Self::OwnerConflict => "owner_conflict",
             Self::OwnerMismatch => "owner_mismatch",
+            Self::OwnerUnbound => "owner_unbound",
             Self::StaleLease => "stale_lease",
             Self::StaleLeaseGeneration => "stale_lease_generation",
             Self::ExpiredLease => "expired_lease",
@@ -52,6 +54,7 @@ impl ErrorCode {
             "owner_lease_exists" => Self::OwnerLeaseExists,
             "owner_conflict" => Self::OwnerConflict,
             "owner_mismatch" => Self::OwnerMismatch,
+            "owner_unbound" => Self::OwnerUnbound,
             "stale_lease" => Self::StaleLease,
             "stale_lease_generation" => Self::StaleLeaseGeneration,
             "expired_lease" => Self::ExpiredLease,
@@ -76,6 +79,7 @@ impl ErrorCode {
             | Self::OwnerLeaseExists
             | Self::OwnerConflict
             | Self::OwnerMismatch
+            | Self::OwnerUnbound
             | Self::StaleLease
             | Self::StaleLeaseGeneration
             | Self::ExpiredLease => 409,
@@ -109,6 +113,11 @@ impl ErrorCode {
                 "safety_lock",
                 false,
                 "The session belongs to another owner.",
+            ),
+            Self::OwnerUnbound => (
+                "safety_lock",
+                false,
+                "Bind the caller owner before requesting control or owner-scoped state.",
             ),
             Self::StaleLease | Self::StaleLeaseGeneration | Self::ExpiredLease => (
                 "safety_lock",

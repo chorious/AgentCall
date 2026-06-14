@@ -65,10 +65,19 @@ pub(crate) fn control_summary_for_session(
     session_id: &str,
     owner_id: Option<&str>,
 ) -> Value {
-    match mint_control_token(state, session_id, owner_id.unwrap_or("codex")) {
+    let Some(owner_id) = owner_id else {
+        return json!({
+            "available": state.sessions.lock().unwrap().contains_key(session_id),
+            "token_included": false,
+            "token_required_for": ["interrupt", "stop", "kill", "approve_plan", "start_auto"],
+            "reason": "control token is minted only when caller explicitly requests control with a bound owner"
+        });
+    };
+    match mint_control_token(state, session_id, owner_id) {
         Ok((token, claims)) => json!({
             "available": true,
             "token": token,
+            "token_included": true,
             "expires_at": claims.expires_at,
             "ttl_seconds": CONTROL_TOKEN_TTL_SECONDS,
             "control_epoch": claims.control_epoch,

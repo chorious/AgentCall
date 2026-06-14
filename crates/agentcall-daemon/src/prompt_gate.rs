@@ -188,9 +188,11 @@ fn daemon_auto_submit_pending_prompt(
     let attempt_index = view.commit_attempts.saturating_add(1);
     let attempt_id = prompt_commit_attempt_id(&route_id, wrapper_session, attempt_index);
     let sent_at_ms = now_ms();
+    let owner_id = owner_id_for_session(state, wrapper_session)
+        .ok_or_else(|| "cannot auto-submit prompt: session owner is unbound".to_string())?;
     let args = json!({
         "idempotency_key": attempt_id,
-        "owner_id": "codex"
+        "owner_id": owner_id
     });
     let mut command =
         match prepare_session_send_command(state, wrapper_session, "submit_pending_prompt", &args)?
@@ -238,6 +240,23 @@ fn daemon_auto_submit_pending_prompt(
             }
         }),
     )
+}
+
+fn owner_id_for_session(state: &AppState, wrapper_session: &str) -> Option<String> {
+    state
+        .owner_leases
+        .lock()
+        .unwrap()
+        .get(wrapper_session)
+        .map(|lease| lease.owner_id.clone())
+        .or_else(|| {
+            route_for_wrapper_session(state, wrapper_session).and_then(|(_, route)| {
+                route
+                    .get("owner_id")
+                    .and_then(Value::as_str)
+                    .map(str::to_string)
+            })
+        })
 }
 
 fn prompt_commit_attempts_for_session(

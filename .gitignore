@@ -1,4 +1,5 @@
 .agentcall/
+.agents/
 .agentcall_build/
 .agentcall_hook_smoke/
 .agentcall_pytest/

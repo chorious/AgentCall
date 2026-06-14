@@ -699,6 +699,7 @@ fn start_pty_route(
             &session_name,
             short_prompt.clone(),
             Some(handoff_path.clone()),
+            owner_id,
         )
     } else {
         submit_pty_prompt_without_hook_ack(
@@ -706,6 +707,7 @@ fn start_pty_route(
             &record.route_id,
             &session_name,
             short_prompt.clone(),
+            owner_id,
         )
     };
     let prompt_status = prompt_gate
@@ -1069,6 +1071,7 @@ fn submit_pty_prompt_with_ack(
     wrapper_session: &str,
     prompt: String,
     handoff_path: Option<PathBuf>,
+    owner_id: &str,
 ) -> Value {
     let idempotency_key = route_prompt_id(route_id, wrapper_session);
     let now = now_ms();
@@ -1076,7 +1079,7 @@ fn submit_pty_prompt_with_ack(
         "text": prompt,
         "enter": true,
         "idempotency_key": idempotency_key.clone(),
-        "owner_id": "codex"
+        "owner_id": owner_id
     });
     let command = match prepare_session_send_command(state, wrapper_session, "send", &args) {
         Ok(PreparedCommand::Submit(command)) => command,
@@ -1177,13 +1180,14 @@ fn submit_pty_prompt_without_hook_ack(
     route_id: &str,
     wrapper_session: &str,
     prompt: String,
+    owner_id: &str,
 ) -> Value {
     let idempotency_key = format!("route_prompt:{route_id}:{wrapper_session}");
     let args = json!({
         "text": prompt,
         "enter": true,
         "idempotency_key": idempotency_key,
-        "owner_id": "codex"
+        "owner_id": owner_id
     });
     let command = match prepare_session_send_command(state, wrapper_session, "send", &args) {
         Ok(PreparedCommand::Submit(command)) => command,
@@ -1932,6 +1936,7 @@ mod tests {
             "missing-worker",
             "do work".to_string(),
             None,
+            "codex",
         );
 
         assert_eq!(gate["status"], "prompt_commit_failed");
