@@ -81,7 +81,7 @@ impl RuntimeStore for SqliteRuntimeStore {
     }
 
     fn supports_parallel_writes(&self) -> bool {
-        true
+        false
     }
 
     fn next_event_global_seq(&self, fallback: u64) -> Result<u64, String> {
@@ -453,7 +453,9 @@ impl RuntimeStore for SqliteRuntimeStore {
 
 const SQLITE_SCHEMA: &str = r#"
 PRAGMA journal_mode = WAL;
+PRAGMA synchronous = NORMAL;
 PRAGMA busy_timeout = 5000;
+PRAGMA wal_autocheckpoint = 1000;
 
 CREATE TABLE IF NOT EXISTS sessions (
   session_id TEXT PRIMARY KEY,
@@ -573,6 +575,10 @@ fn open_connection(path: &Path) -> Result<Connection, String> {
     let conn = Connection::open(path).map_err(|err| err.to_string())?;
     conn.busy_timeout(Duration::from_millis(5000))
         .map_err(|err| err.to_string())?;
+    conn.execute_batch(
+        "PRAGMA journal_mode = WAL; PRAGMA synchronous = NORMAL; PRAGMA wal_autocheckpoint = 1000;",
+    )
+    .map_err(|err| err.to_string())?;
     Ok(conn)
 }
 

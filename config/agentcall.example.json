@@ -1,7 +1,7 @@
 {
   "claude_workspace": "D:\\guKimi",
   "store_backend": "sqlite",
-  "store_writer_threads": 6,
+  "store_writer_threads": 1,
   "max_sessions": 6,
   "per_owner_max_sessions": 6,
   "experimental_sdk_runtime": false,

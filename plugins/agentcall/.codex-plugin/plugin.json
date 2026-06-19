@@ -1,6 +1,6 @@
 {
   "name": "agentcall",
-  "version": "6.8.2",
+  "version": "6.8.3",
   "description": "AgentCall checkpoint tools for Codex-driven Claude Code PTY workers.",
   "author": {
     "name": "MUSHI"

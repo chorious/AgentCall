@@ -26,6 +26,7 @@ use std::sync::atomic::Ordering;
 const STALE_SESSION_MS: u64 = 5 * 60 * 1000;
 const PATIENCE_SECONDS: u64 = 60;
 const STALL_THRESHOLD_SECONDS: u64 = 300;
+const RUNTIME_CLEANUP_MIN_INTERVAL_MS: u64 = 30 * 1000;
 
 pub(crate) fn board_owner_filter(_scope: Option<&str>, owner_id: Option<&str>) -> Option<String> {
     owner_id
@@ -651,6 +652,18 @@ fn command_exists(command: &str) -> bool {
 }
 
 fn cleanup_stale_runtime_state(state: &AppState, live_sessions: &[SessionInfo]) {
+    let now = now_ms();
+    let last_cleanup = state.last_runtime_cleanup_ms.load(Ordering::Relaxed);
+    if now.saturating_sub(last_cleanup) < RUNTIME_CLEANUP_MIN_INTERVAL_MS {
+        return;
+    }
+    if state
+        .last_runtime_cleanup_ms
+        .compare_exchange(last_cleanup, now, Ordering::SeqCst, Ordering::Relaxed)
+        .is_err()
+    {
+        return;
+    }
     let live_names: HashSet<String> = live_sessions
         .iter()
         .filter(|session| session.status == "running")
@@ -659,7 +672,6 @@ fn cleanup_stale_runtime_state(state: &AppState, live_sessions: &[SessionInfo]) 
     let _ = release_orphaned_runtime_leases(state, &live_names);
     let agent_dir = state.workspace.join(".agentcall");
     let state_dir = agent_dir.join("state");
-    let now = now_ms();
     let _guard = state.state_writer.lock().unwrap();
 
     let active_path = state_dir.join("active_sessions.json");

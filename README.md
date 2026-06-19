@@ -1,16 +1,16 @@
 # AgentCall
 
-当前版本 / Current version: `v6.8.2`
+当前版本 / Current version: `v6.8.3`
 
 AgentCall is a local coordination plane that lets **Codex supervise Claude Code PTY utility workers** through a daemon-backed MCP interface. Codex stays the parent agent: it reads a compact board, starts bounded workers, sends safe commands, waits with patience hints, asks for reports, and accepts or revises deliverables. Claude Code workers do the visible PTY work under hook-aware policy and file ownership.
 
 AgentCall 是一个本地多 Agent 协作控制面：让 **Codex 指挥 Claude Code PTY worker 集群**。Codex 负责拆分、监督、验收和整合；Claude Code worker 负责执行边界明确的实现、审查、证据检查和报告任务。
 
-v6.8.1 延续 v6.8 owner/batch snapshot 主线，并修紧普通 Codex session 的全局可见性：MCP owner 在缺少 `CODEX_THREAD_ID` 时不再退回全局 `codex`，而是使用当前 MCP 进程级 owner；`agentcall_board` 的普通 compact 请求即使传入 `scope=all` 也只看当前 owner；`agentcall_daemon(status)` 默认返回 owner-safe health，只有 `debug=true` 才暴露全局 worker 数。冻结实现基线仍见 [v6.2 code plan](docs/v6.2-code-plan.md)。
+v6.8.3 keeps the v6.8 owner/batch snapshot line and fixes the SQLite observation hot path: SQLite now uses one daemon store writer with WAL/`synchronous=NORMAL`, and compact board stale-runtime cleanup is throttled so normal board refreshes do not queue behind hook-heavy write bursts. The frozen implementation baseline remains [v6.2 code plan](docs/v6.2-code-plan.md).
 
 ## Product Shape / 产品特点
 
-v6.8.2 closes the accepted-report lifecycle gap: destructive control tokens now last 5 minutes, `report_accepted` on a still-live PTY worker projects as `accepted_live`, and daemon auto-closes accepted live workers after a 5 minute grace period if Codex does not stop them first. The frozen implementation baseline remains [v6.2 code plan](docs/v6.2-code-plan.md).
+v6.8.2 closed the accepted-report lifecycle gap: destructive control tokens now last 5 minutes, `report_accepted` on a still-live PTY worker projects as `accepted_live`, and daemon auto-closes accepted live workers after a 5 minute grace period if Codex does not stop them first.
 
 - **Codex parent, Claude workers**: Codex coordinates; Claude Code executes bounded PTY utility work.
 - **PTY-first**: ACP is no longer the default path. PTY workers preserve human visibility and handoff.
@@ -20,7 +20,7 @@ v6.8.2 closes the accepted-report lifecycle gap: destructive control tokens now 
 - **Bounded write policy**: write tools are constrained by route containment; Bash remains readonly-only in the default policy.
 - **Two worker kinds**: `coding` workers modify implementation paths under exclusive workspace lease; `report` workers share the workspace and write only report/scratch artifacts.
 - **Typed error codes**: safety-lock errors are produced from Rust `ErrorCode` variants and serialized as stable snake_case JSON codes.
-- **SQLite writer fanout**: SQLite/WAL store writes can fan out to six daemon writer threads; JSON remains safety-capped to one writer.
+- **SQLite single-writer WAL store**: SQLite/WAL writes are serialized through one daemon writer to avoid busy-lock contention; JSON remains safety-capped to one writer.
 - **Report-ready closure**: route can mint a unique report path, `request_report` is a state transition, and daemon-observed report writes update route/session projection to `report_ready`.
 - **Prompt commit contract**: daemon auto-commits stale `prompt_pending_ack`; manual `submit_pending_prompt` is only a debug/recovery signal and must converge to `prompt_submitted` or `prompt_commit_unacknowledged`.
 - **Readable wrapper**: raw output, clean output, and LLM summary are separate surfaces.
@@ -72,7 +72,7 @@ Set `claude_workspace`:
 {
   "claude_workspace": "D:\\guKimi",
   "store_backend": "sqlite",
-  "store_writer_threads": 6,
+  "store_writer_threads": 1,
   "max_sessions": 6,
   "per_owner_max_sessions": 6,
   "experimental_sdk_runtime": false,
@@ -106,7 +106,7 @@ python agentcall.py paths
 python agentcall.py logs doctor
 python agentcall.py sessions cleanup --stale-after 5m
 python agentcall.py release-check
-python agentcall.py runtime-release --version 6.8.2
+python agentcall.py runtime-release --version 6.8.3
 ```
 
 The scripts are intentionally loud: missing Cargo, stale hooks, daemon health timeout, plugin validation failure, pytest failure, or whitespace diff errors should point to the failing subsystem.

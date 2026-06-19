@@ -560,13 +560,13 @@ mod tests {
     }
 
     #[test]
-    fn sqlite_store_writer_uses_parallel_threads_when_requested() {
+    fn sqlite_store_writer_stays_single_thread_to_avoid_busy_writer_contention() {
         let root = test_workspace("writer-sqlite-commands");
         let store: Arc<dyn RuntimeStore> = Arc::new(StoreWriterRuntimeStore::new(
             Arc::new(crate::store_sqlite::SqliteRuntimeStore::new(root.clone()).unwrap()),
             6,
         ));
-        assert_eq!(store.writer_threads(), 6);
+        assert_eq!(store.writer_threads(), 1);
         let mut workers = Vec::new();
         for idx in 0..24 {
             let store = Arc::clone(&store);

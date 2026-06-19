@@ -36,6 +36,7 @@ pub(crate) struct AppState {
     pub(crate) event_session_seq: Mutex<HashMap<String, u64>>,
     pub(crate) projections: Mutex<HashMap<String, SessionProjectionV1>>,
     pub(crate) state_writer: Mutex<()>,
+    pub(crate) last_runtime_cleanup_ms: AtomicU64,
 }
 
 impl AppState {
@@ -82,6 +83,7 @@ impl AppState {
             event_session_seq: Mutex::new(event_session_seq),
             projections: Mutex::new(HashMap::new()),
             state_writer: Mutex::new(()),
+            last_runtime_cleanup_ms: AtomicU64::new(0),
         }
     }
 

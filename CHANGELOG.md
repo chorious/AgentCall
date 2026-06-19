@@ -1,5 +1,12 @@
 # CHANGELOG
 
+## v6.8.3 - SQLite Single-writer Observation Patch
+
+- SQLite RuntimeStore now uses a single daemon store writer even when `store_writer_threads` is configured above 1, avoiding multi-connection writer contention under hook-heavy Claude PTY workloads.
+- SQLite connections now use WAL with `synchronous=NORMAL` and a stable autocheckpoint setting on every connection, keeping read projections responsive while the writer drains hook events.
+- Compact board stale-runtime cleanup is throttled to once every 30 seconds, so ordinary board refreshes no longer grab the global state-writer lock on every observation.
+- Documentation and config templates now describe SQLite as the recommended single-writer backend; JSON remains a single-writer fallback.
+
 ## v6.8.2 - Accepted-live Closure Patch
 
 - Control tokens for destructive session actions now live for 5 minutes instead of 60 seconds, reducing false `stale_control_token` failures during normal report cleanup.
