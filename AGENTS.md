@@ -27,7 +27,7 @@ AgentCall lets Codex supervise Claude Code PTY utility workers through a local R
 
 ## Version Discipline
 
-- Current product version: `6.8.3`.
+- Current product version: `6.9.0`.
 - Product version is the single public version source. Keep these in lockstep: README/CHANGELOG, Rust crate versions, `pyproject.toml`, MCP `SERVER_VERSION`, Codex plugin manifest, `Cargo.lock`, and the live daemon build version.
 - Do not claim a version bump is complete after only editing source files. Rebuild and restart daemon/MCP where applicable, then verify `agentcall_daemon(action=status)` reports the same build version.
 - If source version and live daemon version differ, report version drift explicitly and rebuild/restart before continuing live validation.
@@ -105,7 +105,8 @@ Use `agentcall_daemon(action=status)` as the real availability check. `tool_sear
 - Do not use raw PTY output as the primary status source when projection is available.
 - Review only when there is drift, blocker, failed validation, low confidence, or requested review.
 - Do not mechanically review a clean report.
-- If a worker repeats a denied action, treat it as `blocked_by_policy`; do not keep waiting.
+- If a worker repeats a denied action or folder heartbeat audit reports an unapproved changed folder, treat it as `blocked_by_policy`; do not keep waiting.
+- If `policy_block.category=workspace_audit_changed_dir`, Codex may approve an expected folder with `agentcall_session_send(action=approve_changed_dir, dir=..., reason=...)`; approvals are session-scoped and must not be treated as global write permission.
 - Use `interrupt` only when the worker is drifting, doing the wrong thing, or must be reclaimed immediately.
 
 ## Coding Rules
@@ -141,7 +142,7 @@ git diff --check
 - Put old reviews under `docs/arch/review/`.
 - Root directory should stay focused on source entrypoints, README, CHANGELOG, config template, and build manifests.
 
-## Current v6.8 Status
+## Current v6.9 Status
 
 See `docs/v6.2-code-plan.md` for the frozen implementation baseline. Do not edit that plan during implementation.
 
@@ -154,6 +155,9 @@ See `docs/v6.2-code-plan.md` for the frozen implementation baseline. Do not edit
 - v6.8.1 closes the remaining global visibility leak: ordinary MCP board/status calls are owner-safe, `scope=all` is ignored for non-debug compact board views, and fallback MCP owner ids are per MCP process instead of global `codex`.
 - v6.8.2 closes the accepted-report cleanup gap: destructive control tokens last 5 minutes, live accepted workers project as `accepted_live`, and daemon auto-closes accepted live PTY workers after a 5 minute grace period if Codex does not stop them first.
 - v6.8.3 closes the SQLite writer-contention regression: SQLite uses a single daemon store writer with WAL/`synchronous=NORMAL`, compact board stale-runtime cleanup is throttled, and `store_writer_threads>1` is ignored for SQLite to keep board observation responsive during hook-heavy worker bursts.
+- v6.9 replaces Bash readonly-only preemption with monitored execution: PTY route startup records a lightweight folder-audit baseline, hook turns update changed-folder heartbeats, and daemon policy-blocks only when target-workspace folders change outside scratch/report/write boundaries.
+- v6.9 adds `approve_changed_dir` as a session-scoped Codex judgment path for expected folder changes and exposes blocked folder details in `policy_block.path_diagnosis`.
+- v6.9 makes `accepted_live` cleanup easier: default session summary includes a fresh stop control token when owner-bound Codex inspects an accepted live worker, and the primary stop action carries that token in `args.control_token`.
 - `workspace_busy`, `owner_lease_exists`, `capacity_exceeded`, and control-precondition failures must surface structured error codes and details instead of a bare `400`.
 - New safety-lock codes must be added as `ErrorCode` enum variants first; do not introduce ad hoc string-only error codes in daemon live paths.
 - SQLite is the recommended RuntimeStore backend for live multi-worker use. It intentionally uses one daemon store writer; `store_writer_threads>1` is ignored for SQLite to avoid busy writer contention. JSON remains a single-writer safety fallback even if a larger writer count is configured.
@@ -163,7 +167,8 @@ See `docs/v6.2-code-plan.md` for the frozen implementation baseline. Do not edit
 - `agentcall_route` mints a unique per-route report path under the target workspace when `report_path` is omitted.
 - `agentcall_session_send(action=request_report)` is a finite report state transition; observe `report_requested`, `report_drafting`, `report_ready`, or `report_overdue`.
 - Report acceptance confidence is split into `overall`, `artifact`, `daemon_write`, and `route_match`; `overall=high` requires daemon-observed evidence.
-- `agentcall_session` default summary must expose `state`, `why`, `can_wait`, `primary_action`, `available_actions`, `debug_actions`, report info, workspace projection, and a short-lived control token if available.
+- `agentcall_session` default summary must expose `state`, `why`, `can_wait`, `primary_action`, `available_actions`, `debug_actions`, report info, workspace projection, active policy block details, and a short-lived control token if available.
+- Bash is `monitored`, not a filesystem sandbox. Do not claim it proves command safety; it observes folder-level side effects and blocks on unapproved changed target folders.
 - Compact board must list current live workers and attention only; historical projections belong in debug/raw views.
 - Board/session must distinguish daemon workspace, target workspace, Claude cwd, and report workspace.
 - `/api/*` requires daemon token unless `dev_open_loopback=true` is explicitly set in local config.

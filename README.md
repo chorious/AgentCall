@@ -1,23 +1,23 @@
 # AgentCall
 
-当前版本 / Current version: `v6.8.3`
+当前版本 / Current version: `v6.9.0`
 
 AgentCall is a local coordination plane that lets **Codex supervise Claude Code PTY utility workers** through a daemon-backed MCP interface. Codex stays the parent agent: it reads a compact board, starts bounded workers, sends safe commands, waits with patience hints, asks for reports, and accepts or revises deliverables. Claude Code workers do the visible PTY work under hook-aware policy and file ownership.
 
 AgentCall 是一个本地多 Agent 协作控制面：让 **Codex 指挥 Claude Code PTY worker 集群**。Codex 负责拆分、监督、验收和整合；Claude Code worker 负责执行边界明确的实现、审查、证据检查和报告任务。
 
-v6.8.3 keeps the v6.8 owner/batch snapshot line and fixes the SQLite observation hot path: SQLite now uses one daemon store writer with WAL/`synchronous=NORMAL`, and compact board stale-runtime cleanup is throttled so normal board refreshes do not queue behind hook-heavy write bursts. The frozen implementation baseline remains [v6.2 code plan](docs/v6.2-code-plan.md).
+v6.9.0 keeps the v6.8 owner/batch snapshot line and makes Bash execution practical for bounded workers: PTY routes now use a lightweight folder heartbeat audit, ordinary helper scripts run under monitored policy, and daemon policy-blocks only when changed target folders fall outside scratch/report/write boundaries. The frozen implementation baseline remains [v6.2 code plan](docs/v6.2-code-plan.md).
 
 ## Product Shape / 产品特点
 
-v6.8.2 closed the accepted-report lifecycle gap: destructive control tokens now last 5 minutes, `report_accepted` on a still-live PTY worker projects as `accepted_live`, and daemon auto-closes accepted live workers after a 5 minute grace period if Codex does not stop them first.
+v6.9.0 also makes closure easier: `agentcall_session(view=summary)` automatically includes a stop control token when a live worker is already in `accepted_live`, so Codex can follow the primary stop action without an extra control-token read.
 
 - **Codex parent, Claude workers**: Codex coordinates; Claude Code executes bounded PTY utility work.
 - **PTY-first**: ACP is no longer the default path. PTY workers preserve human visibility and handoff.
 - **Rust daemon authority**: runtime events, claims, sessions, bindings, routes, summaries, and board projection are daemon-owned.
 - **Hook-aware state**: Claude/Codex hooks provide structured liveness, attention, report, permission, and policy signals.
 - **Projection-first MCP**: Codex should read compact board/session projections, not raw PTY logs by default.
-- **Bounded write policy**: write tools are constrained by route containment; Bash remains readonly-only in the default policy.
+- **Bounded write policy**: write tools are constrained by route containment; Bash is monitored by lightweight folder heartbeat audit instead of being rejected solely because it may write.
 - **Two worker kinds**: `coding` workers modify implementation paths under exclusive workspace lease; `report` workers share the workspace and write only report/scratch artifacts.
 - **Typed error codes**: safety-lock errors are produced from Rust `ErrorCode` variants and serialized as stable snake_case JSON codes.
 - **SQLite single-writer WAL store**: SQLite/WAL writes are serialized through one daemon writer to avoid busy-lock contention; JSON remains safety-capped to one writer.
@@ -106,7 +106,7 @@ python agentcall.py paths
 python agentcall.py logs doctor
 python agentcall.py sessions cleanup --stale-after 5m
 python agentcall.py release-check
-python agentcall.py runtime-release --version 6.8.3
+python agentcall.py runtime-release --version 6.9.0
 ```
 
 The scripts are intentionally loud: missing Cargo, stale hooks, daemon health timeout, plugin validation failure, pytest failure, or whitespace diff errors should point to the failing subsystem.
@@ -215,6 +215,16 @@ Do not pass `read_only`; it is no longer a route parameter. A worker that must p
 Route/session/report projections distinguish `daemon_workspace`, `target_workspace`, `claude_cwd`, and `report_workspace`. The route `workspace` is the task target; it does not override Claude Code cwd.
 
 `write_paths` define where Write/Edit/MultiEdit may modify files. `reference_paths` are read/context recommendations for the worker, not daemon-enforced read permissions.
+
+Bash runs under `bash_write_policy=monitored`: obvious destructive commands are still rejected before execution, but ordinary helper commands such as `python <scratch-script>` are allowed. After each tool turn, the Claude hook records a lightweight folder heartbeat. The daemon compares changed target-workspace folders against scratch/report/write boundaries and moves the session to `blocked_by_policy` only when a changed folder is outside the allowed set.
+
+When folder audit blocks a worker, inspect `policy_block.path_diagnosis.blocked_dirs`. If the changed folder is expected for this session, use:
+
+```text
+agentcall_session_send(action=approve_changed_dir, name=..., dir=..., reason=...)
+```
+
+The approval is session-scoped; it does not create a global permanent whitelist.
 
 If `agentcall_session` returns `state=prompt_pending`, `state=prompt_missing`, or `state=prompt_commit_unacknowledged`, follow `primary_action`. `submit_pending_prompt` is a debug/recovery action, not the default path. A successful call means only that the commit signal was sent; it returns `not_completed=true` and must be followed by `agentcall_session(name=...)` until `UserPromptSubmit`, tool progress, report evidence, or explicit failure appears.
 

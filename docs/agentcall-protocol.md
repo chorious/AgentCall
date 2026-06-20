@@ -48,7 +48,7 @@ Board and session projections are project-aware. Read `workspace.daemon_workspac
 | `report_requested` / `report_drafting` | Wait inside the deadline; refresh `agentcall_session` rather than sending more prompts. |
 | `report_overdue` | Inspect, interrupt, or stop; do not keep waiting as if it were ordinary working. |
 | `needs_permission` | Use `agentcall_session_send(action=select_option, choice="1|2|3")` only after reading the structured interaction. |
-| `blocked_by_policy` | Do not repeat the denied command. Adjust write paths/task, add reference paths as context if useful, request a blocker report, interrupt, or stop. |
+| `blocked_by_policy` | Inspect `policy_block`. If `category=workspace_audit_changed_dir` and the folder change is expected, use `approve_changed_dir`; otherwise adjust scope, request a blocker report, interrupt, or stop. |
 | `report_ready` | Call `agentcall_report(action=accept, session_id=...)` and inspect validation/confidence. |
 | `confidence.overall=medium` | Report artifact exists, but daemon evidence is incomplete; inspect before final closure. |
 | `confidence.overall=low` | Treat the report as unproven. Inspect evidence or request a revised report. |
@@ -59,9 +59,13 @@ Codex sends intent; the daemon generates idempotency, attaches leases, checks pr
 
 Use `control_token` only for destructive or phase-changing actions such as `interrupt`, `stop`, `kill`, `approve_plan`, and `start_auto`. Fetch a fresh token from `agentcall_session(name)` before using those actions.
 
+For `accepted_live`, the default owner-bound summary may include a fresh stop token directly in `primary_action.args.control_token`; use that payload instead of doing an extra control-token read.
+
 Do not provide `idempotency_key`, `owner_lease_id`, `lease_generation`, or `precondition` in normal flow.
 
 `agentcall_session_send(action=request_report)` is a state transition, not just natural language. It records `report_requested`, returns a request id/deadline, and expects later daemon-observed report write evidence. After requesting a report, wait for `report_drafting`, `report_ready`, or `report_overdue`.
+
+`agentcall_session_send(action=approve_changed_dir, dir=..., reason=...)` is session-scoped approval for a folder heartbeat audit block. Use it only after inspecting `policy_block.path_diagnosis.blocked_dirs`; it is not a global write-path expansion.
 
 ## Permission And Menu Rules
 
@@ -74,6 +78,8 @@ When a worker is still running, ordinary `send` may be queued and not heard imme
 ## Runtime Rules
 
 PTY is the default and production runtime. It is human-visible and hook-aware. Historical ACP/SDK paths are not part of the normal Codex control loop.
+
+Bash is monitored, not sandboxed. Ordinary helper scripts may run, and hook heartbeats audit changed target folders after tool turns. Do not describe this as proof of command-level filesystem isolation.
 
 ## Report Acceptance Rules
 

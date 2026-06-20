@@ -4,6 +4,7 @@ use crate::state::{
     AppState, append_agent_event, append_agent_event_locked, read_json_file, write_json_file,
 };
 use crate::store::ReportIndexRecord;
+use crate::workspace_audit::{self, WorkspaceAuditPolicy, WorkspaceAuditRoot};
 use serde::Deserialize;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -894,6 +895,17 @@ pub(crate) fn pre_tool_use_claim_locked(
         {
             return Ok(decision);
         }
+        if let Some(policy_block) =
+            workspace_audit::active_workspace_audit_block_locked(state_dir, wrapper)
+        {
+            return Ok(serde_json::json!({
+                "allowed": false,
+                "reason": "workspace audit is waiting for supervisor approval",
+                "policy_block": policy_block,
+                "files": extract_tool_files(payload),
+                "conflicts": []
+            }));
+        }
         if let Some(decision) =
             pty_plan_policy_decision(state, state_dir, wrapper, tool_name, payload)?
         {
@@ -999,15 +1011,30 @@ pub(crate) fn post_tool_use_observe_locked(
     wrapper_session: Option<&str>,
 ) -> Result<serde_json::Value, String> {
     let tool_name = tool_name.unwrap_or("");
+    let workspace_audit = if let Some(wrapper) = wrapper_session {
+        if let Some(policy) = pty_path_policy_for_wrapper(state, wrapper) {
+            workspace_audit::observe_post_tool_heartbeat_locked(
+                state,
+                state_dir,
+                wrapper,
+                tool_name,
+                &workspace_audit_policy_from_pty_policy(&policy),
+            )?
+        } else {
+            serde_json::Value::Null
+        }
+    } else {
+        serde_json::Value::Null
+    };
     let files = extract_tool_files(payload);
     if files.is_empty() {
         return Ok(
-            serde_json::json!({"allowed": true, "reason": "no file paths observed", "files": [], "conflicts": []}),
+            serde_json::json!({"allowed": true, "reason": "no file paths observed", "files": [], "conflicts": [], "workspace_audit": workspace_audit}),
         );
     }
     if !is_write_tool(tool_name) {
         return Ok(
-            serde_json::json!({"allowed": true, "reason": "read observed", "files": files, "conflicts": []}),
+            serde_json::json!({"allowed": true, "reason": "read observed", "files": files, "conflicts": [], "workspace_audit": workspace_audit}),
         );
     }
     let path = state_dir.join("file_claims.json");
@@ -1087,11 +1114,12 @@ pub(crate) fn post_tool_use_observe_locked(
             "report_path": report_path,
             "report_source": "hook_write",
             "wrapper_session": wrapper,
-            "route_id": route_id
+            "route_id": route_id,
+            "workspace_audit": workspace_audit
         }));
     }
     Ok(
-        serde_json::json!({"allowed": true, "reason": "write observed", "files": files, "conflicts": []}),
+        serde_json::json!({"allowed": true, "reason": "write observed", "files": files, "conflicts": [], "workspace_audit": workspace_audit}),
     )
 }
 
@@ -1470,7 +1498,7 @@ fn pty_path_policy_for_wrapper(state: &AppState, wrapper_session: &str) -> Optio
         bash_write_policy: containment
             .get("bash_write_policy")
             .and_then(serde_json::Value::as_str)
-            .unwrap_or("readonly_only")
+            .unwrap_or("monitored")
             .to_string(),
     })
 }
@@ -1541,13 +1569,40 @@ fn evaluate_pty_pre_tool_policy(
             files,
         );
     }
-    if tool_name == "Bash" && !bash_readonly_allowed(payload) {
-        return HookPolicyDecision::deny(
-            "PTY path policy denies non-read-only bash when write_paths are enforced".to_string(),
-            extract_tool_files(payload),
-        );
+    if tool_name == "Bash" {
+        if let Some(denial) = bash_preflight_denial(payload) {
+            return HookPolicyDecision::deny(denial, extract_tool_files(payload));
+        }
+        return HookPolicyDecision::allow(extract_tool_files(payload));
     }
     HookPolicyDecision::allow(extract_tool_files(payload))
+}
+
+fn bash_preflight_denial(payload: &serde_json::Value) -> Option<String> {
+    if bash_readonly_allowed(payload) {
+        return None;
+    }
+    let command = bash_command(payload)?.to_ascii_lowercase();
+    let dangerous = [
+        "rm -rf",
+        "git reset --hard",
+        "git clean -fd",
+        "git clean -xdf",
+        "remove-item -recurse",
+        "rmdir /s",
+        "del /s",
+        "format ",
+    ];
+    if dangerous.iter().any(|needle| command.contains(needle)) {
+        return Some("PTY path policy denies obviously destructive bash command".to_string());
+    }
+    if command.contains("git clone ") {
+        return Some(
+            "PTY path policy denies git clone in a bounded worker; create scratch artifacts instead"
+                .to_string(),
+        );
+    }
+    None
 }
 
 impl HookPolicyDecision {
@@ -1836,6 +1891,22 @@ fn policy_roots_json(policy: &PtyPathPolicy) -> serde_json::Value {
     })
 }
 
+fn workspace_audit_policy_from_pty_policy(policy: &PtyPathPolicy) -> WorkspaceAuditPolicy {
+    WorkspaceAuditPolicy {
+        mode: policy.mode.clone(),
+        target_workspace: policy.target_workspace.clone(),
+        scratch_root: policy.scratch_root.clone(),
+        writable_roots: policy
+            .writable_roots
+            .iter()
+            .map(|root| WorkspaceAuditRoot {
+                kind: root.kind.clone(),
+                abs: root.abs.clone(),
+            })
+            .collect(),
+    }
+}
+
 fn reset_policy_denials_for_wrapper_locked(
     state_dir: &Path,
     wrapper_session: &str,
@@ -1843,7 +1914,14 @@ fn reset_policy_denials_for_wrapper_locked(
     let path = state_dir.join("policy_denials.json");
     let mut denials = read_json_file(&path, serde_json::json!({}));
     if let Some(object) = denials.as_object_mut() {
-        object.remove(wrapper_session);
+        let keep_workspace_audit_block = object
+            .get(wrapper_session)
+            .and_then(|block| block.get("category"))
+            .and_then(serde_json::Value::as_str)
+            == Some("workspace_audit_changed_dir");
+        if !keep_workspace_audit_block {
+            object.remove(wrapper_session);
+        }
     }
     write_json_file(&path, &denials)
 }
@@ -1991,12 +2069,7 @@ fn inject_policy_guidance_locked(
 
 fn normalized_policy_target(tool_name: &str, payload: &serde_json::Value) -> String {
     if tool_name == "Bash" {
-        let command = payload
-            .get("tool_input")
-            .or_else(|| payload.get("toolInput"))
-            .and_then(|value| value.get("command"))
-            .and_then(serde_json::Value::as_str)
-            .unwrap_or("");
+        let command = bash_command(payload).unwrap_or("");
         return command.split_whitespace().collect::<Vec<_>>().join(" ");
     }
     let files = extract_tool_files(payload);
@@ -2009,6 +2082,14 @@ fn normalized_policy_target(tool_name: &str, payload: &serde_json::Value) -> Str
             .collect::<Vec<_>>()
             .join("|")
     }
+}
+
+fn bash_command(payload: &serde_json::Value) -> Option<&str> {
+    payload
+        .get("tool_input")
+        .or_else(|| payload.get("toolInput"))
+        .and_then(|value| value.get("command"))
+        .and_then(serde_json::Value::as_str)
 }
 
 fn policy_denial_category(tool_name: &str, reason: &str) -> String {
@@ -2870,6 +2951,51 @@ mod tests {
             "echo \"hello\" > \"E:\\GameProject\\RKV\\.agentcall-parallel\\vic2\\report.md\"",
         );
         assert!(!bash_readonly_allowed(&write));
+    }
+
+    #[test]
+    fn monitored_bash_allows_non_readonly_helper_script_preflight() {
+        let payload = bash_payload(
+            "claude-a",
+            "python \"D:\\guKimi\\.agentcall\\workspaces\\pty-a\\analyze.py\"",
+        );
+        let policy = PtyPathPolicy {
+            write_paths_input: vec![],
+            writable_paths: vec![],
+            writable_roots: vec![WritableRoot {
+                kind: "scratch".to_string(),
+                display: ".agentcall/workspaces/pty-a".to_string(),
+                abs: "D:\\guKimi\\.agentcall\\workspaces\\pty-a".to_string(),
+            }],
+            mode: "report".to_string(),
+            scratch_path: Some(".agentcall/workspaces/pty-a".to_string()),
+            process_cwd: Some("D:\\guKimi".to_string()),
+            target_workspace: Some("E:\\Project\\PyXLL".to_string()),
+            scratch_root: Some("D:\\guKimi\\.agentcall\\workspaces\\pty-a".to_string()),
+            bash_write_policy: "monitored".to_string(),
+        };
+        let decision = evaluate_pty_pre_tool_policy("Bash", &payload, &policy);
+        assert!(decision.allowed);
+        assert_eq!(decision.denial, None);
+    }
+
+    #[test]
+    fn monitored_bash_still_preflight_denies_obvious_destructive_commands() {
+        let payload = bash_payload("claude-a", "git reset --hard HEAD");
+        let policy = PtyPathPolicy {
+            write_paths_input: vec![],
+            writable_paths: vec![],
+            writable_roots: vec![],
+            mode: "coding".to_string(),
+            scratch_path: None,
+            process_cwd: None,
+            target_workspace: None,
+            scratch_root: None,
+            bash_write_policy: "monitored".to_string(),
+        };
+        let decision = evaluate_pty_pre_tool_policy("Bash", &payload, &policy);
+        assert!(!decision.allowed);
+        assert!(decision.denial.as_deref().unwrap().contains("destructive"));
     }
 
     #[test]

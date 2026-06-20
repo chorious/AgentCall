@@ -244,12 +244,15 @@ pub(crate) fn classify_session_send_action(action: &str) -> SessionSendSafety {
             requires_idempotency: true,
             requires_precondition: true,
         },
-        "send" | "continue" | "request_report" | "revise_plan" | "select_option" => {
-            SessionSendSafety {
-                requires_idempotency: true,
-                requires_precondition: false,
-            }
-        }
+        "send"
+        | "continue"
+        | "request_report"
+        | "revise_plan"
+        | "select_option"
+        | "approve_changed_dir" => SessionSendSafety {
+            requires_idempotency: true,
+            requires_precondition: false,
+        },
         _ => SessionSendSafety {
             requires_idempotency: true,
             requires_precondition: false,

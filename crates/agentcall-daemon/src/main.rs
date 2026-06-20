@@ -32,6 +32,7 @@ mod terminal;
 mod terminal_screen;
 mod util;
 mod worker_state;
+mod workspace_audit;
 
 use crate::config::LocalConfig;
 use crate::http::handle_connection;

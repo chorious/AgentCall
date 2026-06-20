@@ -15,6 +15,7 @@ use crate::session::{configured_claude_workspace, is_claude_command};
 use crate::state::{AppState, append_agent_event_locked, read_json_file, write_json_file};
 use crate::store::{RouteDecisionV1, SessionRecord};
 use crate::util::{now_ms, safe_name};
+use crate::workspace_audit;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::path::PathBuf;
@@ -658,6 +659,9 @@ fn start_pty_route(
     };
     let command = pty_command(req, &workflow, claude_session_id.as_deref())?;
     let containment = pty_containment(state, req, &session_name);
+    let audit_baseline =
+        workspace_audit::initialize_session_audit(state, &session_name, &containment)
+            .unwrap_or_else(|err| json!({"status": "unavailable", "error": err}));
     let target_workspace = route_target_workspace(state, req);
     let schedule = enforce_start_capacity(state, owner_id)?;
     let shared_workspace_lease = route_uses_shared_workspace_lease(state, req);
@@ -763,6 +767,7 @@ fn start_pty_route(
             "hint": "Claude Code PTY may spend time reading files, thinking, or preparing tool calls. Inspect session summary/attention before retrying or restarting."
         },
         "containment": containment,
+        "workspace_audit": audit_baseline,
         "toolchain_context": toolchain_context_value(state, req)
     });
     Ok(())
@@ -919,7 +924,7 @@ fn pty_containment(state: &AppState, req: &RouteRequest, session_name: &str) -> 
         },
         "writable_roots": writable_roots,
         "scratch_root": scratch_abs.display().to_string(),
-        "bash_write_policy": "readonly_only"
+        "bash_write_policy": "monitored"
     })
 }
 
@@ -1521,9 +1526,7 @@ fn pty_prompt_containment(containment: &Value) -> String {
         lines.push(format!("session scratch: {scratch}"));
     }
     if let Some(policy) = containment.get("bash_write_policy").and_then(Value::as_str) {
-        lines.push(format!(
-            "Bash write policy: {policy}; use Write/Edit for scratch/report artifacts"
-        ));
+        lines.push(format!("Bash write policy: {policy}; keep helper scripts and generated artifacts under session scratch/report paths; AgentCall monitors changed folders and will pause for supervisor approval if target folders change outside writable boundaries"));
     }
     if lines.is_empty() {
         "Use the task workspace carefully.".to_string()
@@ -2077,7 +2080,7 @@ mod tests {
         };
         let containment = pty_containment(&state, &req, "containment-a");
         assert_eq!(containment["mode"], "coding");
-        assert_eq!(containment["bash_write_policy"], "readonly_only");
+        assert_eq!(containment["bash_write_policy"], "monitored");
         assert_eq!(
             containment["scratch_path"],
             ".agentcall/workspaces/containment-a"

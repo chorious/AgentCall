@@ -395,6 +395,14 @@ pub(crate) fn apply_event_to_projection(
             projection.needs_attention = false;
             projection.last_progress_brief = Some(event.message.clone());
         }
+        "workspace_audit.approved" => {
+            projection.liveness_status = "working".into();
+            projection.attention_status = "none".into();
+            projection.needs_attention = false;
+            projection.last_error_brief = None;
+            projection.last_progress_brief = Some(event.message.clone());
+            projection.next_recommended_action = "wait".to_string();
+        }
         "session.actor_failed"
         | "session.writer_failed"
         | "session.writer_closed"

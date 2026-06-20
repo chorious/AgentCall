@@ -1,6 +1,7 @@
 use crate::accepted_live::{
     accepted_live_auto_close_projection, maybe_auto_close_accepted_live_session,
 };
+use crate::hooks::policy_denials_state;
 use crate::projection::session_projection_summary;
 use crate::prompt_gate::{
     PromptGateState, PromptGateView, prompt_gate_for_session,
@@ -167,12 +168,17 @@ pub(crate) struct WorkerStateView {
     pub(crate) patience: Value,
     pub(crate) report: Value,
     pub(crate) workspace: Value,
+    pub(crate) policy_block: Value,
     pub(crate) debug_refs: Value,
     pub(crate) prompt_gate: PromptGateView,
 }
 
 impl WorkerStateView {
     pub(crate) fn to_summary_value(&self, control: Value) -> Value {
+        let primary_action = action_with_control_token(self.primary_action.clone(), &control);
+        let available_actions =
+            actions_with_control_token(self.available_actions.clone(), &control);
+        let debug_actions = actions_with_control_token(self.debug_actions.clone(), &control);
         json!({
             "schema_version": 2,
             "view": "summary",
@@ -181,12 +187,13 @@ impl WorkerStateView {
             "state": self.state.as_str(),
             "why": self.why,
             "can_wait": self.can_wait,
-            "primary_action": self.primary_action,
-            "available_actions": self.available_actions,
-            "debug_actions": self.debug_actions,
+            "primary_action": primary_action,
+            "available_actions": available_actions,
+            "debug_actions": debug_actions,
             "patience": self.patience,
             "report": self.report,
             "workspace": self.workspace,
+            "policy_block": self.policy_block,
             "pending_interaction": pending_interaction_for_state(&self.state, &self.why),
             "control": control,
             "prompt_gate": self.prompt_gate.to_value(),
@@ -207,6 +214,7 @@ impl WorkerStateView {
             "patience": self.patience,
             "report": self.report,
             "workspace": self.workspace,
+            "policy_block": self.policy_block,
             "pending_interaction": pending_interaction_for_state(&self.state, &self.why),
         })
     }
@@ -237,6 +245,10 @@ fn worker_state_for_session_with_gate(
     let projection = session_projection_summary(state, session_name);
     let route = route_for_wrapper_session(state, session_name).map(|(_, route)| route);
     let workspace = workspace_projection(state, route.as_ref());
+    let policy_block = policy_denials_state(state)
+        .get(session_name)
+        .cloned()
+        .unwrap_or(Value::Null);
     let mut report = report_projection_from_route(route.as_ref());
     if let Some(route) = route.as_ref() {
         let auto_close = accepted_live_auto_close_projection(route, now_ms());
@@ -325,6 +337,7 @@ fn worker_state_for_session_with_gate(
         patience,
         report,
         workspace,
+        policy_block,
         debug_refs,
         prompt_gate,
     }
@@ -877,6 +890,31 @@ fn action(session_name: &str, kind: WorkerActionKind, tool: &str, requires_contr
     })
 }
 
+fn actions_with_control_token(actions: Vec<Value>, control: &Value) -> Vec<Value> {
+    actions
+        .into_iter()
+        .map(|action| action_with_control_token(action, control))
+        .collect()
+}
+
+fn action_with_control_token(mut action: Value, control: &Value) -> Value {
+    if action
+        .get("requires_control_token")
+        .and_then(Value::as_bool)
+        != Some(true)
+    {
+        return action;
+    }
+    let Some(token) = control.get("token").and_then(Value::as_str) else {
+        return action;
+    };
+    if let Some(args) = action.get_mut("args").and_then(Value::as_object_mut) {
+        args.insert("control_token".to_string(), json!(token));
+        action["control_token_included"] = json!(true);
+    }
+    action
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -915,5 +953,23 @@ mod tests {
             &WorkerStateKind::Failed,
             &WorkerStateKind::ReportDrafting
         ));
+    }
+
+    #[test]
+    fn control_token_is_injected_into_controlled_action_payload() {
+        let action = action(
+            "worker-a",
+            WorkerActionKind::Stop,
+            "agentcall_session_send",
+            true,
+        );
+        let control = json!({
+            "available": true,
+            "token": "control-token-a",
+            "token_included": true
+        });
+        let action = action_with_control_token(action, &control);
+        assert_eq!(action["control_token_included"], true);
+        assert_eq!(action["args"]["control_token"], "control-token-a");
     }
 }

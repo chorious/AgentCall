@@ -1,5 +1,13 @@
 # CHANGELOG
 
+## v6.9.0 - Lightweight Folder Audit And Monitored Bash
+
+- PTY routes now initialize a lightweight workspace-audit baseline and record folder-level hook heartbeats after tool turns; the daemon writes `workspace_audit.policy_blocked` only when changed target folders fall outside scratch/report/write boundaries.
+- Bash policy is now monitored instead of readonly-only: ordinary helper scripts can run, while obvious destructive commands and `git clone` are still rejected up front.
+- `agentcall_session_send(action=approve_changed_dir, dir=...)` lets Codex approve a changed folder for the current session and clears the audit block without adding a global whitelist.
+- Worker summaries now expose active `policy_block` details, including blocked folders and ready-to-send `approve_changed_dir` actions.
+- `accepted_live` summaries automatically include a fresh stop control token and inject it into the primary stop action, reducing stale/missing-token cleanup friction.
+
 ## v6.8.3 - SQLite Single-writer Observation Patch
 
 - SQLite RuntimeStore now uses a single daemon store writer even when `store_writer_threads` is configured above 1, avoiding multi-connection writer contention under hook-heavy Claude PTY workloads.

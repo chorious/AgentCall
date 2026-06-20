@@ -1,8 +1,8 @@
 # AgentCall Docs
 
-v6.8.3 adds SQLite single-writer observation hardening: SQLite/WAL writes are serialized through one daemon store writer, compact board stale-runtime cleanup is throttled, and hook-heavy worker bursts should no longer make normal board reads queue behind SQLite writer contention.
+v6.9.0 adds lightweight folder audit for monitored Bash: PTY routes record a workspace baseline, hook turns update changed-folder heartbeats, and daemon policy-blocks only when target folders change outside scratch/report/write boundaries.
 
-这是 AgentCall 的文档索引。当前主线是 `v6.8.3`：Codex 通过 AgentCall MCP/daemon 指挥 Claude Code PTY utility workers，daemon 负责状态权威、hook-aware projection、bounded write policy、compact board、枚举化安全锁错误、SQLite single-writer WAL store、prompt gate 自动自愈，以及按 Codex session/thread owner 隔离的 worker 并发额度。正常 worker 只剩 `coding` 与 `report` 两类；`read_only` route 线已移除。
+这是 AgentCall 的文档索引。当前主线是 `v6.9.0`：Codex 通过 AgentCall MCP/daemon 指挥 Claude Code PTY utility workers，daemon 负责状态权威、hook-aware projection、bounded write policy、folder heartbeat audit、compact board、枚举化安全锁错误、SQLite single-writer WAL store、prompt gate 自动自愈，以及按 Codex session/thread owner 隔离的 worker 并发额度。正常 worker 只剩 `coding` 与 `report` 两类；`read_only` route 线已移除。
 
 ## 当前入口
 
@@ -49,6 +49,7 @@ v6.8.3 adds SQLite single-writer observation hardening: SQLite/WAL writes are se
 
 最新实现审计和真实 worker 报告放在 [reports](reports)：
 
+- [report_v690_light_folder_audit_2026-06-20.md](reports/report_v690_light_folder_audit_2026-06-20.md)
 - [report_v7_worker_brief_research_2026-06-13.md](reports/report_v7_worker_brief_research_2026-06-13.md)
 - [report_v7_shared_context_research_2026-06-13.md](reports/report_v7_shared_context_research_2026-06-13.md)
 - [report_v6.7_demo_known_issues_and_v7_questions_2026-06-13.md](reports/report_v6.7_demo_known_issues_and_v7_questions_2026-06-13.md)

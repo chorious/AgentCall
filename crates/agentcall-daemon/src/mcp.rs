@@ -29,6 +29,7 @@ use crate::summary::{
 };
 use crate::util::now_ms;
 use crate::worker_state::{WorkerStateKind, worker_snapshot_for_session, worker_state_for_session};
+use crate::workspace_audit;
 use serde::Deserialize;
 use serde_json::{Value, json};
 use std::path::PathBuf;
@@ -116,10 +117,12 @@ pub(crate) fn mcp_tools() -> Vec<Value> {
                 "properties": {
                     "root": {"type": "string"},
                     "name": {"type": "string"},
-                    "action": {"type": "string", "enum": ["send", "continue", "request_report", "submit_pending_prompt", "select_option", "interrupt", "stop", "kill", "revise_plan", "approve_plan", "start_auto"], "default": "send"},
+                    "action": {"type": "string", "enum": ["send", "continue", "request_report", "submit_pending_prompt", "select_option", "interrupt", "stop", "kill", "revise_plan", "approve_plan", "start_auto", "approve_changed_dir"], "default": "send"},
                     "text": {"type": "string"},
                     "control_token": {"type": "string", "description": "Short-lived daemon-minted control token from agentcall_session(summary). Required for destructive or phase-changing actions."},
                     "choice": {"type": "string", "description": "Menu/permission choice for select_option, such as 1, 2, or 3."},
+                    "dir": {"type": "string", "description": "Changed directory to approve for the current session when action=approve_changed_dir."},
+                    "reason": {"type": "string", "description": "Short supervisor reason for approving a changed directory."},
                     "user_explicit_close": {"type": "boolean", "default": false, "description": "Set true only when the human explicitly wants to close/reclaim the worker before the patience window elapses."}
                 },
                 "required": ["name"],
@@ -354,7 +357,9 @@ fn session_summary_view_for_owner(
     let wants_control = include.iter().any(|item| item == "control");
     if !wants_screen {
         let worker = worker_snapshot_for_session(state, name);
-        let control = if wants_control {
+        let include_control =
+            wants_control || (owner_id.is_some() && worker.state == WorkerStateKind::AcceptedLive);
+        let control = if include_control {
             slim_control_summary(control_summary_for_session(state, name, owner_id))
         } else {
             no_token_control_summary(state, name)
@@ -1186,6 +1191,19 @@ fn mcp_session_send(
         Ok(args) => args,
         Err(value) => return Ok(value),
     };
+    if action == "approve_changed_dir" {
+        let dir = args
+            .get("dir")
+            .and_then(Value::as_str)
+            .filter(|value| !value.trim().is_empty())
+            .ok_or_else(|| "approve_changed_dir requires dir".to_string())?;
+        let owner_id = args.get("owner_id").and_then(Value::as_str);
+        let reason = args
+            .get("reason")
+            .or_else(|| args.get("text"))
+            .and_then(Value::as_str);
+        return workspace_audit::approve_changed_dir(state, name, dir, owner_id, reason);
+    }
     let user_explicit_close = args
         .get("user_explicit_close")
         .and_then(Value::as_bool)
