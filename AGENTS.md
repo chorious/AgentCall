@@ -27,7 +27,7 @@ AgentCall lets Codex supervise Claude Code PTY utility workers through a local R
 
 ## Version Discipline
 
-- Current product version: `6.9.0`.
+- Current product version: `6.9.1`.
 - Product version is the single public version source. Keep these in lockstep: README/CHANGELOG, Rust crate versions, `pyproject.toml`, MCP `SERVER_VERSION`, Codex plugin manifest, `Cargo.lock`, and the live daemon build version.
 - Do not claim a version bump is complete after only editing source files. Rebuild and restart daemon/MCP where applicable, then verify `agentcall_daemon(action=status)` reports the same build version.
 - If source version and live daemon version differ, report version drift explicitly and rebuild/restart before continuing live validation.
@@ -158,6 +158,9 @@ See `docs/v6.2-code-plan.md` for the frozen implementation baseline. Do not edit
 - v6.9 replaces Bash readonly-only preemption with monitored execution: PTY route startup records a lightweight folder-audit baseline, hook turns update changed-folder heartbeats, and daemon policy-blocks only when target-workspace folders change outside scratch/report/write boundaries.
 - v6.9 adds `approve_changed_dir` as a session-scoped Codex judgment path for expected folder changes and exposes blocked folder details in `policy_block.path_diagnosis`.
 - v6.9 makes `accepted_live` cleanup easier: default session summary includes a fresh stop control token when owner-bound Codex inspects an accepted live worker, and the primary stop action carries that token in `args.control_token`.
+- v6.9.1 keeps MCP bridge tool metadata aligned with daemon metadata: the bridge prefers live `/api/mcp/tools`, static fallback exposes `approve_changed_dir`, and release-check compares daemon/bridge schemas for canonical tools.
+- v6.9.1 injects `agentcall-version.json` during `runtime-release`; MCP hot-reads it and rejects daemons whose `/api/runtime/health` version or binary path does not match the manifest and compiled MCP `SERVER_VERSION`.
+- v6.9.1 makes compact board a cold store-projection read for all compact filters; it must not sweep live PTYs, run stale-runtime cleanup, or acquire the daemon state-writer lock on the board read path.
 - `workspace_busy`, `owner_lease_exists`, `capacity_exceeded`, and control-precondition failures must surface structured error codes and details instead of a bare `400`.
 - New safety-lock codes must be added as `ErrorCode` enum variants first; do not introduce ad hoc string-only error codes in daemon live paths.
 - SQLite is the recommended RuntimeStore backend for live multi-worker use. It intentionally uses one daemon store writer; `store_writer_threads>1` is ignored for SQLite to avoid busy writer contention. JSON remains a single-writer safety fallback even if a larger writer count is configured.

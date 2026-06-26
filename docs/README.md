@@ -1,8 +1,8 @@
 # AgentCall Docs
 
-v6.9.0 adds lightweight folder audit for monitored Bash: PTY routes record a workspace baseline, hook turns update changed-folder heartbeats, and daemon policy-blocks only when target folders change outside scratch/report/write boundaries.
+v6.9.1 keeps lightweight folder audit for monitored Bash, hardens MCP/daemon runtime identity with a release-injected manifest, and makes compact board a cold store-projection read.
 
-这是 AgentCall 的文档索引。当前主线是 `v6.9.0`：Codex 通过 AgentCall MCP/daemon 指挥 Claude Code PTY utility workers，daemon 负责状态权威、hook-aware projection、bounded write policy、folder heartbeat audit、compact board、枚举化安全锁错误、SQLite single-writer WAL store、prompt gate 自动自愈，以及按 Codex session/thread owner 隔离的 worker 并发额度。正常 worker 只剩 `coding` 与 `report` 两类；`read_only` route 线已移除。
+这是 AgentCall 的文档索引。当前主线是 `v6.9.1`：Codex 通过 AgentCall MCP/daemon 指挥 Claude Code PTY utility workers，daemon 负责状态权威、hook-aware projection、bounded write policy、folder heartbeat audit、cold compact board、枚举化安全锁错误、SQLite single-writer WAL store、prompt gate 自动自愈，以及按 Codex session/thread owner 隔离的 worker 并发额度。正常 worker 只剩 `coding` 与 `report` 两类；`read_only` route 线已移除。
 
 ## 当前入口
 
@@ -21,6 +21,8 @@ v6.9.0 adds lightweight folder audit for monitored Bash: PTY routes record a wor
 - [v7 Shared Context Research](reports/report_v7_shared_context_research_2026-06-13.md)
 - [v7 Worker Brief Research](reports/report_v7_worker_brief_research_2026-06-13.md)
 - [v6.6 Code Optimization Closure](reports/report_v6.6_code_optimization_closure_2026-06-13.md)
+- [v6.9.1 MCP Schema Alignment](reports/report_v691_mcp_schema_alignment_2026-06-21.md)
+- [v6.9.1 Runtime Identity And Cold Board](reports/report_v691_runtime_identity_cold_board_2026-06-26.md)
 - [v5 Implementation Deep Audit](reports/v5-implementation-deep-audit.md)
 - [MCP transport recovery](mcp-transport-recovery.md)
 
@@ -50,6 +52,7 @@ v6.9.0 adds lightweight folder audit for monitored Bash: PTY routes record a wor
 最新实现审计和真实 worker 报告放在 [reports](reports)：
 
 - [report_v690_light_folder_audit_2026-06-20.md](reports/report_v690_light_folder_audit_2026-06-20.md)
+- [report_v691_runtime_identity_cold_board_2026-06-26.md](reports/report_v691_runtime_identity_cold_board_2026-06-26.md)
 - [report_v7_worker_brief_research_2026-06-13.md](reports/report_v7_worker_brief_research_2026-06-13.md)
 - [report_v7_shared_context_research_2026-06-13.md](reports/report_v7_shared_context_research_2026-06-13.md)
 - [report_v6.7_demo_known_issues_and_v7_questions_2026-06-13.md](reports/report_v6.7_demo_known_issues_and_v7_questions_2026-06-13.md)

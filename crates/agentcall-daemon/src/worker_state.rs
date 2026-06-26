@@ -200,24 +200,6 @@ impl WorkerStateView {
             "debug_refs": self.debug_refs,
         })
     }
-
-    pub(crate) fn to_board_worker(&self) -> Value {
-        json!({
-            "name": self.worker,
-            "worker": self.worker,
-            "state": self.state.as_str(),
-            "why": self.why,
-            "can_wait": self.can_wait,
-            "primary_action": self.primary_action,
-            "available_actions": self.available_actions,
-            "debug_actions": self.debug_actions,
-            "patience": self.patience,
-            "report": self.report,
-            "workspace": self.workspace,
-            "policy_block": self.policy_block,
-            "pending_interaction": pending_interaction_for_state(&self.state, &self.why),
-        })
-    }
 }
 
 pub(crate) fn worker_state_for_session(state: &AppState, session_name: &str) -> WorkerStateView {

@@ -1,5 +1,5 @@
 use crate::events::EventEnvelopeV1;
-use crate::session::{Session, SessionInfo, list_sessions};
+use crate::session::{Session, SessionInfo};
 use crate::state::AppState;
 use crate::store::BoardQuery;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
@@ -441,7 +441,12 @@ pub(crate) fn apply_event_to_projection(
     }
 }
 
-pub(crate) fn board_attention_projection(state: &AppState, owner_id: Option<&str>) -> Value {
+pub(crate) fn board_attention_projection(
+    state: &AppState,
+    owner_id: Option<&str>,
+    filter: Option<&str>,
+    workspace_filter: Option<&str>,
+) -> Value {
     let all = state
         .store
         .list_board_projection(BoardQuery {
@@ -449,75 +454,111 @@ pub(crate) fn board_attention_projection(state: &AppState, owner_id: Option<&str
             owner_id: owner_id.map(str::to_string),
         })
         .unwrap_or_else(|_| serde_json::json!({"sessions": []}));
-    let attention_projection = state
-        .store
-        .list_board_projection(BoardQuery {
-            attention_only: true,
-            owner_id: owner_id.map(str::to_string),
-        })
-        .unwrap_or_else(|_| serde_json::json!({"sessions": []}));
-    let live_sessions = list_sessions(state);
-    let runtime_sessions = runtime_session_items(&live_sessions);
-    let historical_sessions = projection_items(all.get("sessions").and_then(Value::as_array));
-    let attention = projection_items(
-        attention_projection
-            .get("sessions")
-            .and_then(Value::as_array),
+    let all_workers = board_projection_items(
+        all.get("sessions").and_then(Value::as_array),
+        workspace_filter,
+        false,
     );
+    let attention_workers = board_projection_items(
+        all.get("sessions").and_then(Value::as_array),
+        workspace_filter,
+        true,
+    );
+    let workers = if filter == Some("all") {
+        all_workers.clone()
+    } else {
+        attention_workers.clone()
+    };
+    let attention = attention_workers
+        .iter()
+        .filter_map(|worker| {
+            worker
+                .get("name")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        })
+        .collect::<Vec<_>>();
     serde_json::json!({
+        "schema_version": 2,
         "workspace": state.workspace,
+        "daemon_workspace": state.workspace,
+        "workspace_filter": workspace_filter,
+        "workspace_filter_applied": workspace_filter.is_some(),
         "view": "compact",
-        "filter": "attention",
-        "owner_id": owner_id,
+        "filter": filter.unwrap_or("attention"),
+        "owner": {
+            "bound": owner_id.is_some(),
+            "owner_id": owner_id,
+            "scope": if owner_id.is_some() { "mine" } else { "all_or_unbound" }
+        },
         "projection_only": true,
+        "cold_state": true,
         "store_backend": state.store.backend_name(),
-        "runtime_sessions": runtime_sessions.clone(),
-        "live_daemon_sessions": runtime_sessions,
+        "workers": workers,
+        "runtime_sessions": all_workers.clone(),
+        "live_daemon_sessions": all_workers,
         "live_daemon_sessions_deprecated_alias": true,
-        "historical_sessions": historical_sessions.clone(),
         "counts": {
-            "runtime": live_sessions.len(),
-            "historical": historical_sessions.len(),
-            "attention": attention.len(),
+            "runtime_workers": all_workers.len(),
+            "attention": attention_workers.len(),
         },
         "attention": attention,
     })
 }
 
-fn runtime_session_items(items: &[SessionInfo]) -> Vec<Value> {
-    items
-        .iter()
-        .map(|session| {
-            serde_json::json!({
-                "session": session.name,
-                "name": session.name,
-                "runtime": "pty",
-                "status": session.status,
-                "liveness_status": if session.status == "running" { "working" } else { session.status.as_str() },
-                "attention_status": "none",
-                "needs_attention": false,
-                "cwd": session.cwd,
-                "child_pid": session.child_pid,
-                "created_at": session.created_at,
-                "updated_at": session.updated_at,
-                "replay_bytes": session.replay_bytes,
-                "decode_health": session.decode_health,
-            })
-        })
-        .collect()
-}
-
-fn projection_items(items: Option<&Vec<Value>>) -> Vec<Value> {
+fn board_projection_items(
+    items: Option<&Vec<Value>>,
+    workspace_filter: Option<&str>,
+    attention_only: bool,
+) -> Vec<Value> {
     items
         .into_iter()
         .flatten()
+        .filter(|projection| is_current_board_projection(projection))
+        .filter(|projection| {
+            !attention_only
+                || projection
+                    .get("needs_attention")
+                    .and_then(Value::as_bool)
+                    == Some(true)
+        })
+        .filter(|projection| projection_matches_workspace(projection, workspace_filter))
         .map(|projection| {
+            let session = projection.get("session_id").cloned().unwrap_or(Value::Null);
+            let liveness = projection
+                .get("liveness_status")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown");
+            let attention = projection
+                .get("attention_status")
+                .and_then(Value::as_str)
+                .unwrap_or("none");
+            let needs_attention = projection
+                .get("needs_attention")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            let state = if needs_attention && attention != "none" {
+                attention
+            } else {
+                liveness
+            };
             serde_json::json!({
-                "session": projection.get("session_id").cloned().unwrap_or(Value::Null),
+                "session": session.clone(),
+                "name": session.clone(),
+                "worker": session,
+                "state": state,
+                "can_wait": !needs_attention,
+                "primary_action": {
+                    "kind": projection.get("next_recommended_action").cloned().unwrap_or_else(|| serde_json::json!("wait"))
+                },
                 "owner": projection.get("owner").cloned().unwrap_or(Value::Null),
                 "liveness_status": projection.get("liveness_status").cloned().unwrap_or(Value::Null),
                 "attention_status": projection.get("attention_status").cloned().unwrap_or(Value::Null),
                 "needs_attention": projection.get("needs_attention").cloned().unwrap_or(Value::Null),
+                "workspace": {
+                    "target_workspace": projection.get("workspace").cloned().unwrap_or(Value::Null),
+                    "claude_cwd": projection.get("claude_cwd").cloned().unwrap_or(Value::Null),
+                },
                 "projection_stale": projection.get("projection_stale").cloned().unwrap_or(Value::Null),
                 "projection_last_global_seq": projection.get("projection_last_global_seq").cloned().unwrap_or(Value::Null),
                 "projection_last_session_seq": projection.get("projection_last_session_seq").cloned().unwrap_or(Value::Null),
@@ -527,6 +568,50 @@ fn projection_items(items: Option<&Vec<Value>>) -> Vec<Value> {
             })
         })
         .collect()
+}
+
+fn is_current_board_projection(projection: &Value) -> bool {
+    if projection
+        .get("needs_attention")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+    {
+        return true;
+    }
+    if projection
+        .get("projection_stale")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+    {
+        return false;
+    }
+    let liveness = projection
+        .get("liveness_status")
+        .and_then(Value::as_str)
+        .unwrap_or("unknown");
+    !matches!(
+        liveness,
+        "stopped" | "killed" | "completed" | "terminal" | "cleanup_observed"
+    )
+}
+
+fn projection_matches_workspace(projection: &Value, workspace_filter: Option<&str>) -> bool {
+    let Some(filter) = workspace_filter.filter(|value| !value.trim().is_empty()) else {
+        return true;
+    };
+    let wanted = normalized_projection_path(filter);
+    projection
+        .get("workspace")
+        .and_then(Value::as_str)
+        .into_iter()
+        .chain(projection.get("claude_cwd").and_then(Value::as_str))
+        .any(|candidate| normalized_projection_path(candidate) == wanted)
+}
+
+fn normalized_projection_path(path: &str) -> String {
+    path.replace('\\', "/")
+        .trim_end_matches('/')
+        .to_ascii_lowercase()
 }
 
 fn reduce_session_start_event(projection: &mut SessionProjectionV1, event: &EventEnvelopeV1) {

@@ -1,5 +1,15 @@
 # CHANGELOG
 
+## v6.9.1 - Runtime Identity And Cold Board Patch
+
+- MCP bridge `tools/list` now prefers the live daemon `/api/mcp/tools` schema when the daemon is reachable, so Codex sees daemon-supported actions instead of stale bridge fallback metadata.
+- The static MCP bridge fallback schema now exposes `agentcall_session_send(action=approve_changed_dir, dir=..., reason=...)`, matching the v6.9 daemon action for folder-audit approvals.
+- Release architecture audit now compares daemon and bridge fallback schemas for canonical tools, including properties, required fields, and enum values, to catch schema drift before release.
+- `runtime-release` now writes `agentcall-version.json` into the versioned runtime directory with the expected product version and daemon/MCP/hook binary locations.
+- MCP start/status/proxy calls now validate daemon `/api/runtime/health` against the hot-read runtime manifest and compiled `SERVER_VERSION`; mismatched daemon versions or binary paths are rejected with `daemon_version_drift` instead of reusing a stale daemon on the port.
+- Compact board reads are now cold projection reads for every compact filter: the daemon returns store-backed board projection state directly, without live PTY sweeps, stale-runtime cleanup, or state-writer lock acquisition on the board read path.
+- Runtime and scheduler health reads no longer perform read-time maintenance writes, keeping control-panel polling isolated from hook/store write traffic.
+
 ## v6.9.0 - Lightweight Folder Audit And Monitored Bash
 
 - PTY routes now initialize a lightweight workspace-audit baseline and record folder-level hook heartbeats after tool turns; the daemon writes `workspace_audit.policy_blocked` only when changed target folders fall outside scratch/report/write boundaries.

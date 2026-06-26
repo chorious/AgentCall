@@ -1,9 +1,27 @@
-use crate::bootstrap::daemon_control;
+use crate::bootstrap::{daemon_control, ensure_daemon_runtime, ensure_daemon_runtime_with_timeout};
 use crate::config::Config;
-use crate::daemon_client::daemon_post_json;
+use crate::daemon_client::{daemon_get_with_timeout, daemon_post_json};
 use serde_json::{Value, json};
+use std::time::Duration;
 
-pub(crate) fn list_tools(_config: &Config) -> Vec<Value> {
+const TOOL_LIST_DAEMON_TIMEOUT: Duration = Duration::from_millis(350);
+const DAEMON_PROXY_TOOL_NAMES: &[&str] = &[
+    "agentcall_board",
+    "agentcall_route",
+    "agentcall_session",
+    "agentcall_session_send",
+    "agentcall_report",
+];
+
+pub(crate) fn list_tools(config: &Config) -> Vec<Value> {
+    if ensure_daemon_runtime_with_timeout(config, TOOL_LIST_DAEMON_TIMEOUT).is_ok()
+        && let Ok(value) =
+            daemon_get_with_timeout(config, "/api/mcp/tools", TOOL_LIST_DAEMON_TIMEOUT)
+    {
+        if let Some(tools) = daemon_proxy_tools(value) {
+            return bridge_tools(tools);
+        }
+    }
     canonical_tools()
 }
 
@@ -11,6 +29,7 @@ pub(crate) fn call_tool(config: &Config, name: &str, args: Value) -> Result<Valu
     if name == "agentcall_daemon" {
         return daemon_control(config, args);
     }
+    ensure_daemon_runtime(config)?;
     daemon_post_json(
         config,
         "/api/mcp/call",
@@ -111,12 +130,14 @@ fn session_send_tool() -> Value {
             "properties": {
                 "root": {"type": "string"},
                 "name": {"type": "string"},
-                    "action": {"type": "string", "enum": ["send", "continue", "request_report", "submit_pending_prompt", "select_option", "interrupt", "stop", "kill", "revise_plan", "approve_plan", "start_auto"], "default": "send"},
-                    "text": {"type": "string"},
-                    "control_token": {"type": "string", "description": "Short-lived daemon-minted control token from agentcall_session(summary). Required for destructive or phase-changing actions."},
-                    "choice": {"type": "string", "description": "Menu/permission choice for select_option, such as 1, 2, or 3."},
-                    "user_explicit_close": {"type": "boolean", "default": false, "description": "Set true only when the human explicitly wants to close/reclaim the worker before the patience window elapses."}
-                },
+                "action": {"type": "string", "enum": ["send", "continue", "request_report", "submit_pending_prompt", "select_option", "interrupt", "stop", "kill", "revise_plan", "approve_plan", "start_auto", "approve_changed_dir"], "default": "send"},
+                "text": {"type": "string"},
+                "control_token": {"type": "string", "description": "Short-lived daemon-minted control token from agentcall_session(summary). Required for destructive or phase-changing actions."},
+                "choice": {"type": "string", "description": "Menu/permission choice for select_option, such as 1, 2, or 3."},
+                "dir": {"type": "string", "description": "Changed directory to approve for the current session when action=approve_changed_dir."},
+                "reason": {"type": "string", "description": "Short supervisor reason for approving a changed directory."},
+                "user_explicit_close": {"type": "boolean", "default": false, "description": "Set true only when the human explicitly wants to close/reclaim the worker before the patience window elapses."}
+            },
             "required": ["name"],
             "additionalProperties": false
         }
@@ -141,14 +162,37 @@ fn report_tool() -> Value {
 }
 
 fn canonical_tools() -> Vec<Value> {
-    vec![
-        daemon_tool(),
+    bridge_tools(vec![
         board_tool(),
         route_tool(),
         session_tool(),
         session_send_tool(),
         report_tool(),
-    ]
+    ])
+}
+
+fn bridge_tools(proxy_tools: Vec<Value>) -> Vec<Value> {
+    let mut tools = vec![daemon_tool()];
+    tools.extend(proxy_tools);
+    tools
+}
+
+fn daemon_proxy_tools(value: Value) -> Option<Vec<Value>> {
+    let tools = value.as_array()?;
+    if tools.len() != DAEMON_PROXY_TOOL_NAMES.len() {
+        return None;
+    }
+    let mut proxy_tools = Vec::with_capacity(tools.len());
+    for (tool, expected_name) in tools.iter().zip(DAEMON_PROXY_TOOL_NAMES) {
+        if tool.get("name").and_then(Value::as_str) != Some(*expected_name) {
+            return None;
+        }
+        if tool.get("inputSchema").is_none() {
+            return None;
+        }
+        proxy_tools.push(tool.clone());
+    }
+    Some(proxy_tools)
 }
 
 #[cfg(test)]
@@ -272,5 +316,36 @@ mod tests {
         let actions = properties["action"]["enum"].as_array().unwrap();
         assert!(actions.contains(&json!("kill")));
         assert!(actions.contains(&json!("submit_pending_prompt")));
+        assert!(actions.contains(&json!("approve_changed_dir")));
+        assert!(properties.get("dir").is_some());
+        assert!(properties.get("reason").is_some());
+    }
+
+    #[test]
+    fn daemon_proxy_tools_accept_canonical_daemon_tool_order() {
+        let proxy_tools = vec![
+            board_tool(),
+            route_tool(),
+            session_tool(),
+            session_send_tool(),
+            report_tool(),
+        ];
+        let tools = daemon_proxy_tools(Value::Array(proxy_tools.clone())).unwrap();
+        assert_eq!(tools, proxy_tools);
+    }
+
+    #[test]
+    fn daemon_proxy_tools_reject_wrong_or_partial_tool_order() {
+        assert!(daemon_proxy_tools(json!([board_tool(), session_tool()])).is_none());
+        assert!(
+            daemon_proxy_tools(json!([
+                route_tool(),
+                board_tool(),
+                session_tool(),
+                session_send_tool(),
+                report_tool()
+            ]))
+            .is_none()
+        );
     }
 }

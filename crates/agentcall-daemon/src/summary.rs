@@ -1,23 +1,19 @@
 use crate::hooks::{
     pending_supervisor_instructions_state, policy_denials_state, runtime_bindings_state,
 };
-use crate::ownership::{
-    owner_leases_summary, release_orphaned_runtime_leases, workspace_leases_summary,
-};
+use crate::ownership::{owner_leases_summary, workspace_leases_summary};
 use crate::process::default_process_controller_kind;
 use crate::projection::board_attention_projection;
 use crate::routes::routes_state;
 use crate::runtime_sdk::sdk_runtime_enabled;
 use crate::scheduler::scheduler_health;
-use crate::session::{Session, SessionInfo, list_sessions};
+use crate::session::{Session, list_sessions};
 use crate::state::{AppState, read_json_file, write_json_file};
 use crate::store::EventQuery;
 use crate::terminal::{clean_terminal_text, tail_lines};
 use crate::terminal_screen::TerminalEmulator;
 use crate::util::now_ms;
-use crate::worker_state::worker_snapshot_for_session;
 use serde_json::Value;
-use std::collections::HashSet;
 use std::fs;
 use std::path::Path;
 use std::sync::Arc;
@@ -26,7 +22,6 @@ use std::sync::atomic::Ordering;
 const STALE_SESSION_MS: u64 = 5 * 60 * 1000;
 const PATIENCE_SECONDS: u64 = 60;
 const STALL_THRESHOLD_SECONDS: u64 = 300;
-const RUNTIME_CLEANUP_MIN_INTERVAL_MS: u64 = 30 * 1000;
 
 pub(crate) fn board_owner_filter(_scope: Option<&str>, owner_id: Option<&str>) -> Option<String> {
     owner_id
@@ -43,14 +38,10 @@ pub(crate) fn board_state(
     workspace_filter: Option<&str>,
 ) -> serde_json::Value {
     if view == Some("compact") {
-        return v6_compact_board_state(state, filter, owner_id, workspace_filter);
-    }
-    if view == Some("compact") && filter == Some("attention") {
-        return board_attention_projection(state, owner_id);
+        return board_attention_projection(state, owner_id, filter, workspace_filter);
     }
     let agent_dir = state.workspace.join(".agentcall");
     let runtime_sessions = list_sessions(state);
-    cleanup_stale_runtime_state(state, &runtime_sessions);
     let attention = attention_items(state);
     if filter == Some("attention") {
         return serde_json::json!({
@@ -179,145 +170,6 @@ pub(crate) fn board_state(
     selected
 }
 
-fn v6_compact_board_state(
-    state: &AppState,
-    filter: Option<&str>,
-    owner_id: Option<&str>,
-    workspace_filter: Option<&str>,
-) -> serde_json::Value {
-    let runtime_sessions = list_sessions(state);
-    cleanup_stale_runtime_state(state, &runtime_sessions);
-    let all_workers: Vec<serde_json::Value> = runtime_sessions
-        .iter()
-        .filter(|session| session.status == "running")
-        .filter(|session| session_matches_owner(state, &session.name, owner_id))
-        .map(|session| {
-            let mut worker = worker_snapshot_for_session(state, &session.name).to_board_worker();
-            enrich_board_worker_owner(state, &session.name, owner_id, &mut worker);
-            worker
-        })
-        .filter(|worker| worker_matches_workspace_filter(worker, workspace_filter))
-        .collect();
-    let attention_workers: Vec<serde_json::Value> = all_workers
-        .iter()
-        .filter(|worker| {
-            let state = worker
-                .get("state")
-                .and_then(Value::as_str)
-                .unwrap_or("starting");
-            let can_wait = worker
-                .get("can_wait")
-                .and_then(Value::as_bool)
-                .unwrap_or(false);
-            !can_wait
-                || matches!(
-                    state,
-                    "prompt_missing"
-                        | "needs_permission"
-                        | "blocked_by_policy"
-                        | "report_ready"
-                        | "accepted_live"
-                        | "failed"
-                )
-        })
-        .cloned()
-        .collect();
-    let workers = if filter == Some("attention") {
-        attention_workers.clone()
-    } else {
-        all_workers.clone()
-    };
-    let attention_names = attention_workers
-        .iter()
-        .filter_map(|worker| {
-            worker
-                .get("name")
-                .and_then(Value::as_str)
-                .map(str::to_string)
-        })
-        .collect::<Vec<_>>();
-    serde_json::json!({
-        "schema_version": 2,
-        "workspace": state.workspace,
-        "daemon_workspace": state.workspace,
-        "workspace_filter": workspace_filter,
-        "workspace_filter_applied": workspace_filter.is_some(),
-        "view": "compact",
-        "filter": filter.unwrap_or("attention"),
-        "owner": {
-            "bound": owner_id.is_some(),
-            "owner_id": owner_id,
-            "scope": if owner_id.is_some() { "mine" } else { "all_or_unbound" }
-        },
-        "workers": workers,
-        "attention": attention_names,
-        "counts": {
-            "runtime_workers": all_workers.len(),
-            "attention": attention_workers.len()
-        }
-    })
-}
-
-fn session_matches_owner(state: &AppState, session_name: &str, owner_id: Option<&str>) -> bool {
-    let Some(owner_id) = owner_id else {
-        return true;
-    };
-    session_owner_id(state, session_name).as_deref() == Some(owner_id)
-}
-
-fn enrich_board_worker_owner(
-    state: &AppState,
-    session_name: &str,
-    owner_id: Option<&str>,
-    worker: &mut Value,
-) {
-    let actual_owner = session_owner_id(state, session_name);
-    if let Some(object) = worker.as_object_mut() {
-        let owner_visible = owner_id
-            .and_then(|expected| actual_owner.as_deref().map(|actual| actual == expected))
-            .unwrap_or(false);
-        object.insert(
-            "owner".to_string(),
-            serde_json::json!({
-                "owner_id": actual_owner,
-                "owner_visible": owner_visible
-            }),
-        );
-        object.insert(
-            "owner_visible".to_string(),
-            serde_json::json!(owner_visible),
-        );
-        object.insert(
-            "control".to_string(),
-            serde_json::json!({
-                "available": owner_visible,
-                "token_included": false,
-                "token_required_for": ["interrupt", "stop", "kill", "approve_plan", "start_auto"]
-            }),
-        );
-    }
-}
-
-fn session_owner_id(state: &AppState, session_name: &str) -> Option<String> {
-    state
-        .owner_leases
-        .lock()
-        .unwrap()
-        .get(session_name)
-        .map(|lease| lease.owner_id.clone())
-}
-
-fn worker_matches_workspace_filter(worker: &Value, workspace_filter: Option<&str>) -> bool {
-    let Some(filter) = workspace_filter.filter(|value| !value.trim().is_empty()) else {
-        return true;
-    };
-    let target = worker
-        .pointer("/workspace/target_workspace")
-        .and_then(Value::as_str)
-        .or_else(|| worker.pointer("/workspace/target").and_then(Value::as_str));
-    target.is_some_and(|target| normalized_path_string(target) == normalized_path_string(filter))
-}
-
 fn filter_routes_by_workspace(
     routes: Value,
     workspace_filter: Option<&str>,
@@ -357,7 +209,6 @@ fn normalized_path_string(path: &str) -> String {
 
 pub(crate) fn runtime_health(state: &AppState) -> serde_json::Value {
     let sessions = list_sessions(state);
-    cleanup_stale_runtime_state(state, &sessions);
     let running_sessions = sessions
         .iter()
         .filter(|session| session.status == "running")
@@ -649,116 +500,6 @@ fn command_exists(command: &str) -> bool {
             candidate.exists()
         })
     })
-}
-
-fn cleanup_stale_runtime_state(state: &AppState, live_sessions: &[SessionInfo]) {
-    let now = now_ms();
-    let last_cleanup = state.last_runtime_cleanup_ms.load(Ordering::Relaxed);
-    if now.saturating_sub(last_cleanup) < RUNTIME_CLEANUP_MIN_INTERVAL_MS {
-        return;
-    }
-    if state
-        .last_runtime_cleanup_ms
-        .compare_exchange(last_cleanup, now, Ordering::SeqCst, Ordering::Relaxed)
-        .is_err()
-    {
-        return;
-    }
-    let live_names: HashSet<String> = live_sessions
-        .iter()
-        .filter(|session| session.status == "running")
-        .map(|session| session.name.clone())
-        .collect();
-    let _ = release_orphaned_runtime_leases(state, &live_names);
-    let agent_dir = state.workspace.join(".agentcall");
-    let state_dir = agent_dir.join("state");
-    let _guard = state.state_writer.lock().unwrap();
-
-    let active_path = state_dir.join("active_sessions.json");
-    let mut active_sessions = read_json_file(&active_path, serde_json::json!({}));
-    let mut active_changed = false;
-    if let Some(object) = active_sessions.as_object_mut() {
-        let stale_keys: Vec<String> = object
-            .iter()
-            .filter_map(|(key, value)| {
-                let wrapper = value
-                    .get("wrapper_session")
-                    .and_then(Value::as_str)
-                    .unwrap_or("");
-                let binding_source = value
-                    .get("binding_source")
-                    .and_then(Value::as_str)
-                    .unwrap_or("unbound");
-                let runtime = value.get("runtime").and_then(Value::as_str).unwrap_or("");
-                let owned_by_live_daemon = !wrapper.is_empty() && live_names.contains(wrapper);
-                let old_enough = value
-                    .get("updated_at")
-                    .and_then(Value::as_str)
-                    .and_then(timestamp_age_ms)
-                    .is_some_and(|age| age >= STALE_SESSION_MS);
-                let stale_projection =
-                    binding_source == "unbound" || runtime == "codex" || !owned_by_live_daemon;
-                if old_enough && stale_projection {
-                    Some(key.clone())
-                } else {
-                    None
-                }
-            })
-            .collect();
-        if !stale_keys.is_empty() {
-            active_changed = true;
-            for key in stale_keys {
-                object.remove(&key);
-            }
-        }
-    }
-    if active_changed {
-        let _ = write_json_file(&active_path, &active_sessions);
-    }
-
-    let pending_path = state_dir.join("pending_supervisor_instructions.json");
-    let mut pending = read_json_file(&pending_path, serde_json::json!({}));
-    let mut pending_changed = false;
-    if let Some(object) = pending.as_object_mut() {
-        let stale_wrappers: Vec<String> = object
-            .iter()
-            .filter_map(|(wrapper, value)| {
-                if live_names.contains(wrapper) {
-                    return None;
-                }
-                let stale = value
-                    .as_array()
-                    .map(|items| {
-                        items.iter().all(|item| {
-                            item.get("created_at")
-                                .and_then(Value::as_str)
-                                .and_then(timestamp_age_ms)
-                                .is_some_and(|age| age >= STALE_SESSION_MS)
-                        })
-                    })
-                    .unwrap_or(true);
-                if stale { Some(wrapper.clone()) } else { None }
-            })
-            .collect();
-        if !stale_wrappers.is_empty() {
-            pending_changed = true;
-            for wrapper in stale_wrappers {
-                object.remove(&wrapper);
-            }
-        }
-    }
-    if pending_changed {
-        let _ = write_json_file(&pending_path, &pending);
-    }
-
-    let _ = now;
-}
-
-fn timestamp_age_ms(timestamp: &str) -> Option<u64> {
-    let parsed = chrono::DateTime::parse_from_rfc3339(timestamp).ok()?;
-    let then = parsed.timestamp_millis();
-    let now = now_ms() as i64;
-    Some(now.saturating_sub(then).max(0) as u64)
 }
 
 pub(crate) fn session_summary(state: &AppState, session: &Arc<Session>) -> serde_json::Value {
@@ -1991,6 +1732,8 @@ mod tests {
         let state = AppState::test(root.clone());
         let board = board_state(&state, Some("compact"), Some("attention"), None, None, None);
         assert_eq!(board["schema_version"], 2);
+        assert_eq!(board["projection_only"], true);
+        assert_eq!(board["cold_state"], true);
         assert_eq!(board["workers"].as_array().unwrap().len(), 0);
         assert_eq!(board["counts"]["runtime_workers"], 0);
         assert_eq!(board["counts"]["attention"], 0);
@@ -2016,9 +1759,15 @@ mod tests {
 
         let board = board_state(&state, Some("compact"), Some("attention"), None, None, None);
         assert_eq!(board["schema_version"], 2);
-        assert_eq!(board["workers"].as_array().unwrap().len(), 0);
-        assert_eq!(board["attention"].as_array().unwrap().len(), 0);
-        assert_eq!(board["counts"]["runtime_workers"], 0);
+        assert_eq!(board["projection_only"], true);
+        assert_eq!(board["cold_state"], true);
+        assert_eq!(board["workers"].as_array().unwrap().len(), 1);
+        assert_eq!(board["workers"][0]["session"], "worker-a");
+        assert_eq!(board["workers"][0]["state"], "needs_permission");
+        assert_eq!(board["attention"].as_array().unwrap().len(), 1);
+        assert_eq!(board["attention"][0], "worker-a");
+        assert_eq!(board["counts"]["runtime_workers"], 1);
+        assert_eq!(board["counts"]["attention"], 1);
         assert!(board.get("historical_sessions").is_none());
         let _ = fs::remove_dir_all(root);
     }
@@ -2060,9 +1809,15 @@ mod tests {
             None,
         );
         assert_eq!(board["schema_version"], 2);
-        assert_eq!(board["workers"].as_array().unwrap().len(), 0);
-        assert_eq!(board["attention"].as_array().unwrap().len(), 0);
-        assert_eq!(board["counts"]["runtime_workers"], 0);
+        assert_eq!(board["projection_only"], true);
+        assert_eq!(board["cold_state"], true);
+        assert_eq!(board["workers"].as_array().unwrap().len(), 1);
+        assert_eq!(board["workers"][0]["session"], "codex-worker");
+        assert_eq!(board["workers"][0]["owner"], "codex");
+        assert_eq!(board["attention"].as_array().unwrap().len(), 1);
+        assert_eq!(board["attention"][0], "codex-worker");
+        assert_eq!(board["counts"]["runtime_workers"], 1);
+        assert_eq!(board["counts"]["attention"], 1);
         assert!(board.get("historical_sessions").is_none());
         let _ = fs::remove_dir_all(root);
     }

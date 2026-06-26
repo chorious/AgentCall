@@ -142,6 +142,8 @@ def run_release(root: Path, version: str, label: str, args: argparse.Namespace) 
         stop_existing_processes(root)
         print_step("sync", f"copying freshly built binaries into target/runtime/{version}")
         runtime_dir = sync_runtime_binaries(root, Path(build_target_dir), version)
+    print_step("manifest", f"writing runtime identity manifest for {version}")
+    write_runtime_version_manifest(root, runtime_dir, version)
 
     if not args.no_restart:
         print_step("start", "starting daemon as Windows breakaway process")
@@ -295,12 +297,16 @@ def update_cargo_lock(path: Path, version: str, dry_run: bool) -> bool:
     return changed
 
 
+def powershell_single_quote(value: str) -> str:
+    return "'" + value.replace("'", "''") + "'"
+
+
 def stop_existing_processes(root: Path) -> None:
     if os.name != "nt":
         return
     root_text = str(root.resolve())
     script = rf"""
-$root = {json.dumps(root_text)}
+$root = {powershell_single_quote(root_text)}
 $rootLower = $root.ToLowerInvariant().TrimEnd('\')
 $names = @('agentcall-mcp.exe', 'agentcall-daemon.exe')
 function Normalize-AgentCallPath($value) {{
@@ -309,18 +315,21 @@ function Normalize-AgentCallPath($value) {{
   if ($text.StartsWith('\??\')) {{ $text = $text.Substring(4) }}
   return $text.ToLowerInvariant()
 }}
-$matches = Get-CimInstance Win32_Process -ErrorAction SilentlyContinue |
+$matchedProcs = @(Get-CimInstance Win32_Process -ErrorAction SilentlyContinue |
   Where-Object {{
-    if (-not ($names -contains $_.Name)) {{ return $false }}
-    $path = Normalize-AgentCallPath $_.ExecutablePath
-    $cmd = Normalize-AgentCallPath $_.CommandLine
-    ($path.StartsWith($rootLower)) -or ($cmd.Contains($rootLower))
-  }}
-if (-not $matches) {{
+    if (-not ($names -contains $_.Name)) {{
+      $false
+    }} else {{
+      $path = Normalize-AgentCallPath $_.ExecutablePath
+      $cmd = Normalize-AgentCallPath $_.CommandLine
+      ($path.StartsWith($rootLower)) -or ($cmd.Contains($rootLower))
+    }}
+  }})
+if ($matchedProcs.Count -eq 0) {{
   Write-Output 'No stale AgentCall processes found under repo root.'
   exit 0
 }}
-foreach ($proc in $matches) {{
+foreach ($proc in $matchedProcs) {{
   Write-Output ("Stopping {{0}} pid={{1}} path={{2}}" -f $proc.Name, $proc.ProcessId, $proc.ExecutablePath)
   Stop-Process -Id $proc.ProcessId -Force -ErrorAction Stop
 }}
@@ -370,6 +379,30 @@ def sync_runtime_binaries(root: Path, build_target_dir: Path, version: str) -> P
         "binary_sync_locked",
         f"failed to sync runtime binaries into {dst_dir}; locked by live process: {last_error}",
     )
+
+
+def write_runtime_version_manifest(root: Path, runtime_dir: Path, version: str) -> Path:
+    runtime_dir.mkdir(parents=True, exist_ok=True)
+    manifest = {
+        "schema_version": 1,
+        "version": version,
+        "runtime_dir": str(runtime_dir),
+        "daemon_binary": str(runtime_dir / executable_name("agentcall-daemon")),
+        "mcp_binary": str(runtime_dir / executable_name("agentcall-mcp")),
+        "hook_binary": str(runtime_dir / executable_name("agentcall-hook")),
+        "binaries": {
+            "daemon": str(runtime_dir / executable_name("agentcall-daemon")),
+            "mcp": str(runtime_dir / executable_name("agentcall-mcp")),
+            "hook": str(runtime_dir / executable_name("agentcall-hook")),
+        },
+        "source_root": str(root),
+        "generated_by": "scripts/agentcall_runtime_release.py",
+        "generated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+    }
+    path = runtime_dir / "agentcall-version.json"
+    path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    return path
+
 
 def start_daemon_breakaway(root: Path, runtime_dir: Path) -> int:
     daemon = runtime_dir / executable_name("agentcall-daemon")

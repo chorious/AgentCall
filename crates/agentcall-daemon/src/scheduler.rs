@@ -95,13 +95,33 @@ pub(crate) fn scheduler_decision(state: &AppState, owner_id: &str) -> SchedulerD
 }
 
 pub(crate) fn scheduler_health(state: &AppState) -> Value {
-    let decision = scheduler_decision(state, "codex");
+    let max_sessions = state
+        .config
+        .max_sessions
+        .unwrap_or(DEFAULT_MAX_SESSIONS)
+        .max(1);
+    let per_owner_max_sessions = state
+        .config
+        .per_owner_max_sessions
+        .unwrap_or(DEFAULT_PER_OWNER_MAX_SESSIONS)
+        .max(1);
+    let live_sessions = state.sessions.lock().unwrap().len();
+    let now = chrono::Utc::now();
+    let owner_leases = state.owner_leases.lock().unwrap();
+    let active_leases = owner_leases
+        .values()
+        .filter(|lease| owner_lease_is_active(lease, now))
+        .count();
+    let codex_active_sessions = owner_leases
+        .values()
+        .filter(|lease| owner_lease_is_active(lease, now) && lease.owner_id == "codex")
+        .count();
     json!({
-        "active_sessions": decision.active_sessions,
-        "max_sessions": decision.max_sessions,
+        "active_sessions": live_sessions.max(active_leases),
+        "max_sessions": max_sessions,
         "global_capacity_policy": "advisory_only",
-        "codex_active_sessions": decision.active_owner_sessions,
-        "per_owner_max_sessions": decision.per_owner_max_sessions,
+        "codex_active_sessions": codex_active_sessions,
+        "per_owner_max_sessions": per_owner_max_sessions,
         "queue_policy": "reject_when_owner_full",
         "allow_hidden_queue": false,
     })
