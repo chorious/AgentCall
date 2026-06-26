@@ -1744,7 +1744,7 @@ mod tests {
     }
 
     #[test]
-    fn compact_attention_board_reads_store_projection_without_live_session() {
+    fn compact_attention_board_excludes_store_projection_without_live_session() {
         let root = std::env::temp_dir().join(format!(
             "agentcall-board-store-projection-test-{}",
             std::process::id()
@@ -1761,19 +1761,19 @@ mod tests {
         assert_eq!(board["schema_version"], 2);
         assert_eq!(board["projection_only"], true);
         assert_eq!(board["cold_state"], true);
-        assert_eq!(board["workers"].as_array().unwrap().len(), 1);
-        assert_eq!(board["workers"][0]["session"], "worker-a");
-        assert_eq!(board["workers"][0]["state"], "needs_permission");
-        assert_eq!(board["attention"].as_array().unwrap().len(), 1);
-        assert_eq!(board["attention"][0], "worker-a");
-        assert_eq!(board["counts"]["runtime_workers"], 1);
-        assert_eq!(board["counts"]["attention"], 1);
+        assert_eq!(board["current_indexed"], true);
+        assert_eq!(board["historical_projection_excluded"], true);
+        assert_eq!(board["workers"].as_array().unwrap().len(), 0);
+        assert_eq!(board["attention"].as_array().unwrap().len(), 0);
+        assert_eq!(board["counts"]["runtime_workers"], 0);
+        assert_eq!(board["counts"]["attention"], 0);
+        assert_eq!(board["counts"]["historical_projection_rows"], 1);
         assert!(board.get("historical_sessions").is_none());
         let _ = fs::remove_dir_all(root);
     }
 
     #[test]
-    fn compact_attention_board_can_filter_to_current_owner_projection() {
+    fn compact_attention_board_owner_filter_does_not_revive_historical_projection() {
         let root = std::env::temp_dir().join(format!(
             "agentcall-board-owner-filter-test-{}",
             std::process::id()
@@ -1811,13 +1811,12 @@ mod tests {
         assert_eq!(board["schema_version"], 2);
         assert_eq!(board["projection_only"], true);
         assert_eq!(board["cold_state"], true);
-        assert_eq!(board["workers"].as_array().unwrap().len(), 1);
-        assert_eq!(board["workers"][0]["session"], "codex-worker");
-        assert_eq!(board["workers"][0]["owner"], "codex");
-        assert_eq!(board["attention"].as_array().unwrap().len(), 1);
-        assert_eq!(board["attention"][0], "codex-worker");
-        assert_eq!(board["counts"]["runtime_workers"], 1);
-        assert_eq!(board["counts"]["attention"], 1);
+        assert_eq!(board["current_indexed"], true);
+        assert_eq!(board["workers"].as_array().unwrap().len(), 0);
+        assert_eq!(board["attention"].as_array().unwrap().len(), 0);
+        assert_eq!(board["counts"]["runtime_workers"], 0);
+        assert_eq!(board["counts"]["attention"], 0);
+        assert_eq!(board["counts"]["historical_projection_rows"], 1);
         assert!(board.get("historical_sessions").is_none());
         let _ = fs::remove_dir_all(root);
     }

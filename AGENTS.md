@@ -27,7 +27,7 @@ AgentCall lets Codex supervise Claude Code PTY utility workers through a local R
 
 ## Version Discipline
 
-- Current product version: `6.9.1`.
+- Current product version: `6.9.2`.
 - Product version is the single public version source. Keep these in lockstep: README/CHANGELOG, Rust crate versions, `pyproject.toml`, MCP `SERVER_VERSION`, Codex plugin manifest, `Cargo.lock`, and the live daemon build version.
 - Do not claim a version bump is complete after only editing source files. Rebuild and restart daemon/MCP where applicable, then verify `agentcall_daemon(action=status)` reports the same build version.
 - If source version and live daemon version differ, report version drift explicitly and rebuild/restart before continuing live validation.
@@ -87,12 +87,12 @@ agentcall_session_send(action=<primary_action.kind when applicable>)
 agentcall_report(action=request|accept)
 ```
 
-`agentcall_route` defaults to a daemon-owned PTY worker. Do not ask Codex to choose `runtime`, estimate task size, or hand-build lease/precondition/idempotency fields in the normal flow. `report_path` is optional; the daemon mints a unique report path when it is omitted.
+`agentcall_route` defaults to a daemon-owned PTY worker. Do not ask Codex to choose `runtime`, estimate task size, or hand-build lease/precondition/idempotency fields in the normal flow. `report_path` is optional; the daemon mints a unique report path when it is omitted. Route containment exposes `workspace_contract.v1`; prefer that contract for task root, artifact root, writable/readonly roots, and Bash side-effect mode instead of exposing daemon cwd internals.
 
 AgentCall has only two normal worker kinds:
 
-- `coding`: pass implementation `write_paths`; the worker receives an exclusive target workspace lease and may write only those paths plus scratch/report.
-- `report`: omit implementation `write_paths` or restrict them to report scope; the worker receives a shared report workspace lease and may write only scratch/report artifacts.
+- `coding`: pass implementation `write_paths`; the worker receives an exclusive target workspace lease, must target a dedicated git worktree branch for real Claude coding routes, and may write only those paths plus scratch/report.
+- `report`: omit implementation `write_paths` or restrict them to report scope; the worker receives a shared report workspace lease and may create/edit only its own report/scratch artifacts, not pre-existing project files.
 
 Do not pass or reintroduce `read_only`. A worker that should inspect and then write a report is a `report` worker, not a pure read-only worker.
 
@@ -101,7 +101,7 @@ Use `agentcall_daemon(action=status)` as the real availability check. `tool_sear
 ## Worker Discipline
 
 - Ask for a report or exact change summary at lifecycle end.
-- Do not write outside assigned `write_paths`, scratch, or `report_path`.
+- Do not write outside the assigned workspace contract. For report/review workers, do not modify pre-existing project files; create the requested report/scratch artifacts and then edit only files claimed by the same session.
 - Do not use raw PTY output as the primary status source when projection is available.
 - Review only when there is drift, blocker, failed validation, low confidence, or requested review.
 - Do not mechanically review a clean report.
@@ -161,6 +161,11 @@ See `docs/v6.2-code-plan.md` for the frozen implementation baseline. Do not edit
 - v6.9.1 keeps MCP bridge tool metadata aligned with daemon metadata: the bridge prefers live `/api/mcp/tools`, static fallback exposes `approve_changed_dir`, and release-check compares daemon/bridge schemas for canonical tools.
 - v6.9.1 injects `agentcall-version.json` during `runtime-release`; MCP hot-reads it and rejects daemons whose `/api/runtime/health` version or binary path does not match the manifest and compiled MCP `SERVER_VERSION`.
 - v6.9.1 makes compact board a cold store-projection read for all compact filters; it must not sweep live PTYs, run stale-runtime cleanup, or acquire the daemon state-writer lock on the board read path.
+- v6.9.2 keeps compact board cold but gates projection rows through the daemon current live-session index. Historical `needs_attention` projections belong only in debug/raw views and must not inflate ordinary compact board payloads.
+- v6.9.2 introduces `workspace_contract.v1` in PTY containment so Codex/UI can reason in task-root/artifact-root/writable/readonly/Bash-effect terms while daemon cwd, Claude cwd, route, prompt gate, hooks, claims, and audit remain implementation/debug details.
+- v6.9.2 makes report/review policy created-artifact based: report/review workers may create the requested report or scratch artifacts and keep editing files claimed by the same session; they must not edit pre-existing project files or use non-readonly Bash.
+- v6.9.2 requires real Claude coding routes to target a linked git worktree on a non-main branch and projects `coding_requires_worktree`, `worktree_path`, `branch`, `merge_requires_pr`, and `pr_report_path` for Codex.
+- v6.9.2 brings `agentcall-flow` under repository management and makes `runtime-release` require an explicit skill update decision through prompt, `--update-skills`, or `--skip-skill-update`.
 - `workspace_busy`, `owner_lease_exists`, `capacity_exceeded`, and control-precondition failures must surface structured error codes and details instead of a bare `400`.
 - New safety-lock codes must be added as `ErrorCode` enum variants first; do not introduce ad hoc string-only error codes in daemon live paths.
 - SQLite is the recommended RuntimeStore backend for live multi-worker use. It intentionally uses one daemon store writer; `store_writer_threads>1` is ignored for SQLite to avoid busy writer contention. JSON remains a single-writer safety fallback even if a larger writer count is configured.
@@ -171,7 +176,7 @@ See `docs/v6.2-code-plan.md` for the frozen implementation baseline. Do not edit
 - `agentcall_session_send(action=request_report)` is a finite report state transition; observe `report_requested`, `report_drafting`, `report_ready`, or `report_overdue`.
 - Report acceptance confidence is split into `overall`, `artifact`, `daemon_write`, and `route_match`; `overall=high` requires daemon-observed evidence.
 - `agentcall_session` default summary must expose `state`, `why`, `can_wait`, `primary_action`, `available_actions`, `debug_actions`, report info, workspace projection, active policy block details, and a short-lived control token if available.
-- Bash is `monitored`, not a filesystem sandbox. Do not claim it proves command safety; it observes folder-level side effects and blocks on unapproved changed target folders.
+- Coding/edit Bash is `monitored`, not a filesystem sandbox. Report/review Bash is readonly in pre-policy. Do not claim monitored Bash proves command safety; it observes folder-level side effects and blocks on unapproved changed target folders.
 - Compact board must list current live workers and attention only; historical projections belong in debug/raw views.
 - Board/session must distinguish daemon workspace, target workspace, Claude cwd, and report workspace.
 - `/api/*` requires daemon token unless `dev_open_loopback=true` is explicitly set in local config.

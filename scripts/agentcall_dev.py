@@ -88,6 +88,8 @@ def main() -> int:
     runtime_release.add_argument("--daemon-url", default=default_daemon_url(), help="Daemon URL.")
     runtime_release.add_argument("--skip-tests", action="store_true", help="Skip cargo test and pytest.")
     runtime_release.add_argument("--skip-release-check", action="store_true", help="Skip release-check.")
+    runtime_release.add_argument("--update-skills", action="store_true", help="Regenerate repository-managed AgentCall skills before release.")
+    runtime_release.add_argument("--skip-skill-update", action="store_true", help="Keep generated AgentCall skills unchanged for this release.")
     runtime_release.add_argument("--no-stop-existing", action="store_true", help="Do not stop old daemon/MCP processes.")
     runtime_release.add_argument("--no-restart", action="store_true", help="Do not start daemon after build.")
     runtime_release.add_argument("--dry-run", action="store_true", help="Print intended actions without writing.")
@@ -260,7 +262,7 @@ def cmd_release_check(root: Path, args: argparse.Namespace) -> int:
         env["PATH"] = str(cargo.parent) + os.pathsep + env.get("PATH", "")
 
     run_checked([sys.executable, "-m", "compileall", "scripts", "src"], root, "python compileall", env=env, timeout=120)
-    run_checked([sys.executable, "scripts/generate_agentcall_skill.py", "--check"], root, "agentcall supervisor skill check", env=env, timeout=60)
+    run_checked([sys.executable, "scripts/generate_agentcall_skill.py", "--check"], root, "agentcall skills check", env=env, timeout=60)
     run_checked([sys.executable, "scripts/agentcall_arch_audit.py"], root, "agentcall architecture audit", env=env, timeout=60)
     node = shutil.which("node")
     if node:
@@ -304,6 +306,8 @@ def cmd_runtime_release(root: Path, args: argparse.Namespace) -> int:
     for flag in [
         "skip_tests",
         "skip_release_check",
+        "update_skills",
+        "skip_skill_update",
         "no_stop_existing",
         "no_restart",
         "dry_run",

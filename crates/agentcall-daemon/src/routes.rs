@@ -1,5 +1,6 @@
 use crate::actor::submit_session_command;
 use crate::commands::{PreparedCommand, prepare_session_send_command};
+use crate::errors::{ErrorCode, structured_error};
 use crate::ownership::{
     install_reserved_route_leases, release_owner_lease, release_workspace_lease,
     reserve_route_leases,
@@ -18,7 +19,8 @@ use crate::util::{now_ms, safe_name};
 use crate::workspace_audit;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::sync::Arc;
 
 #[derive(Debug, Deserialize)]
@@ -658,6 +660,7 @@ fn start_pty_route(
         None
     };
     let command = pty_command(req, &workflow, claude_session_id.as_deref())?;
+    let coding_worktree = coding_worktree_contract(state, req, &command)?;
     let containment = pty_containment(state, req, &session_name);
     let audit_baseline =
         workspace_audit::initialize_session_audit(state, &session_name, &containment)
@@ -732,6 +735,12 @@ fn start_pty_route(
     record.result = json!({
         "runtime": "pty",
         "worker_kind": route_worker_kind(state, req),
+        "coding_requires_worktree": route_worker_kind(state, req) == "coding",
+        "coding_worktree": coding_worktree.clone(),
+        "worktree_path": coding_worktree.get("worktree_path").cloned().unwrap_or(Value::Null),
+        "branch": coding_worktree.get("branch").cloned().unwrap_or(Value::Null),
+        "merge_requires_pr": route_worker_kind(state, req) == "coding",
+        "pr_report_path": req.report_path.clone().map(Value::String).unwrap_or(Value::Null),
         "pty_workflow": workflow.as_str(),
         "workflow_status": if workflow == PtyWorkflow::PlanThenAuto { "plan_running" } else { "running" },
         "phase": if workflow == PtyWorkflow::PlanThenAuto { "plan" } else { "execute" },
@@ -790,6 +799,93 @@ fn route_worker_kind(state: &AppState, req: &RouteRequest) -> &'static str {
     } else {
         "coding"
     }
+}
+
+fn coding_worktree_contract(
+    state: &AppState,
+    req: &RouteRequest,
+    command: &[String],
+) -> Result<Value, String> {
+    if route_worker_kind(state, req) != "coding" {
+        return Ok(Value::Null);
+    }
+    let target_workspace = route_target_workspace(state, req);
+    if !is_claude_command(command) {
+        return Ok(json!({
+            "enforced": false,
+            "reason": "custom_non_claude_command",
+            "worktree_path": target_workspace.display().to_string(),
+            "merge_requires_pr": true,
+            "pr_report_path": req.report_path.clone().unwrap_or_default()
+        }));
+    }
+    let git = inspect_git_worktree(&target_workspace);
+    if git
+        .get("linked_worktree")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+        && git
+            .get("branch")
+            .and_then(Value::as_str)
+            .is_some_and(|branch| {
+                !branch.is_empty() && !matches!(branch, "main" | "master" | "HEAD")
+            })
+    {
+        return Ok(json!({
+            "enforced": true,
+            "worktree_path": target_workspace.display().to_string(),
+            "branch": git.get("branch").cloned().unwrap_or(Value::Null),
+            "linked_worktree": true,
+            "merge_requires_pr": true,
+            "pr_report_path": req.report_path.clone().unwrap_or_default(),
+            "git": git
+        }));
+    }
+    Err(structured_error(
+        ErrorCode::CodingRequiresWorktree,
+        "coding_requires_worktree: coding PTY routes must target a dedicated git worktree branch",
+        json!({
+            "workspace": target_workspace.display().to_string(),
+            "branch": git.get("branch").cloned().unwrap_or(Value::Null),
+            "linked_worktree": git.get("linked_worktree").cloned().unwrap_or(Value::Bool(false)),
+            "merge_requires_pr": true,
+            "pr_report_path": req.report_path.clone().unwrap_or_default(),
+            "suggested_action": "Create a git worktree on a feature branch and pass that path as workspace for coding workers. Use report/review mode for shared-workspace analysis."
+        }),
+    ))
+}
+
+fn inspect_git_worktree(workspace: &Path) -> Value {
+    let inside = git_output(workspace, &["rev-parse", "--is-inside-work-tree"])
+        .map(|value| value == "true")
+        .unwrap_or(false);
+    let branch = git_output(workspace, &["rev-parse", "--abbrev-ref", "HEAD"]);
+    let toplevel = git_output(workspace, &["rev-parse", "--show-toplevel"]);
+    let git_common_dir = git_output(workspace, &["rev-parse", "--git-common-dir"]);
+    let dot_git = workspace.join(".git");
+    let linked_worktree = inside && dot_git.is_file();
+    json!({
+        "inside_worktree": inside,
+        "linked_worktree": linked_worktree,
+        "branch": branch.unwrap_or_default(),
+        "toplevel": toplevel.unwrap_or_default(),
+        "git_common_dir": git_common_dir.unwrap_or_default(),
+        "dot_git_is_file": dot_git.is_file(),
+        "dot_git_is_dir": dot_git.is_dir(),
+    })
+}
+
+fn git_output(workspace: &Path, args: &[&str]) -> Option<String> {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(workspace)
+        .args(args)
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    Some(String::from_utf8_lossy(&output.stdout).trim().to_string())
 }
 
 fn route_worker_kind_hint(req: &RouteRequest) -> &'static str {
@@ -866,6 +962,7 @@ fn report_scope_prefix(path: &str) -> bool {
 }
 
 fn pty_containment(state: &AppState, req: &RouteRequest, session_name: &str) -> Value {
+    let worker_kind = route_worker_kind(state, req);
     let write_paths_input = req.write_paths.clone().unwrap_or_default();
     let reference_paths = req.reference_paths.clone().unwrap_or_default();
     let scratch_path = format!(".agentcall/workspaces/{session_name}");
@@ -893,14 +990,16 @@ fn pty_containment(state: &AppState, req: &RouteRequest, session_name: &str) -> 
             "abs": materialize_route_path(&target_workspace, report_path).display().to_string()
         }));
     }
-    for path in &write_paths_input {
-        if !path.trim().is_empty() && !writable_paths.iter().any(|item| item == path) {
-            writable_paths.push(path.clone());
-            writable_roots.push(json!({
-                "kind": "write_path",
-                "display": path,
-                "abs": materialize_route_path(&target_workspace, path).display().to_string()
-            }));
+    if worker_kind != "report" {
+        for path in &write_paths_input {
+            if !path.trim().is_empty() && !writable_paths.iter().any(|item| item == path) {
+                writable_paths.push(path.clone());
+                writable_roots.push(json!({
+                    "kind": "write_path",
+                    "display": path,
+                    "abs": materialize_route_path(&target_workspace, path).display().to_string()
+                }));
+            }
         }
     }
     let _ = std::fs::create_dir_all(&scratch_abs);
@@ -910,8 +1009,17 @@ fn pty_containment(state: &AppState, req: &RouteRequest, session_name: &str) -> 
             "# AgentCall Session Scratch\n\nSession: `{session_name}`\n\nThis directory is writable for bounded helper artifacts, temporary scripts, and report material. Do not write outside route containment.\n"
         ),
     );
+    let workspace_contract = workspace_contract_value(
+        worker_kind,
+        &target_workspace,
+        &process_cwd,
+        &scratch_abs,
+        &reference_paths,
+        &writable_roots,
+    );
     json!({
-        "mode": route_worker_kind(state, req),
+        "mode": worker_kind,
+        "task_mode": if worker_kind == "report" { "report" } else { "edit" },
         "write_paths_input": write_paths_input,
         "reference_paths": reference_paths,
         "writable_paths": writable_paths,
@@ -924,7 +1032,74 @@ fn pty_containment(state: &AppState, req: &RouteRequest, session_name: &str) -> 
         },
         "writable_roots": writable_roots,
         "scratch_root": scratch_abs.display().to_string(),
-        "bash_write_policy": "monitored"
+        "bash_write_policy": if worker_kind == "report" { "readonly" } else { "monitored" },
+        "workspace_contract": workspace_contract
+    })
+}
+
+fn workspace_contract_value(
+    worker_kind: &str,
+    target_workspace: &std::path::Path,
+    process_cwd: &std::path::Path,
+    scratch_abs: &std::path::Path,
+    reference_paths: &[String],
+    writable_roots: &[Value],
+) -> Value {
+    let artifact_root = writable_roots
+        .iter()
+        .find(|root| root.get("kind").and_then(Value::as_str) == Some("report"))
+        .and_then(|root| root.get("abs").and_then(Value::as_str))
+        .and_then(|path| std::path::Path::new(path).parent())
+        .map(|path| path.display().to_string())
+        .unwrap_or_else(|| {
+            target_workspace
+                .join(".agents/agentcall")
+                .display()
+                .to_string()
+        });
+    let writable = writable_roots
+        .iter()
+        .filter_map(|root| {
+            let kind = root.get("kind").and_then(Value::as_str)?;
+            let path = root.get("abs").and_then(Value::as_str)?;
+            let contract_kind = match kind {
+                "write_path" => "code",
+                "report" => "report",
+                "scratch" => "scratch",
+                other => other,
+            };
+            Some(json!({
+                "kind": contract_kind,
+                "path": path,
+            }))
+        })
+        .collect::<Vec<_>>();
+    let readonly = reference_paths
+        .iter()
+        .filter(|path| !path.trim().is_empty())
+        .map(|path| {
+            json!({
+                "kind": "reference",
+                "path": materialize_route_path(target_workspace, path).display().to_string()
+            })
+        })
+        .collect::<Vec<_>>();
+    json!({
+        "schema": "workspace_contract.v1",
+        "task_root": target_workspace.display().to_string(),
+        "mode": if worker_kind == "report" { "report" } else { "edit" },
+        "runtime_root": process_cwd.display().to_string(),
+        "scratch_root": scratch_abs.display().to_string(),
+        "artifact_root": artifact_root,
+        "writable": writable,
+        "readonly": readonly,
+        "deny_write": [
+            target_workspace.join(".git").display().to_string(),
+            target_workspace.join(".claude").display().to_string(),
+            target_workspace.join(".codex").display().to_string(),
+            target_workspace.join(".agentcall").display().to_string()
+        ],
+        "bash_effects": if worker_kind == "report" { "readonly" } else { "project" }
     })
 }
 
@@ -1854,6 +2029,35 @@ mod tests {
     }
 
     #[test]
+    fn coding_claude_route_requires_linked_worktree_branch() {
+        let workspace = test_workspace("route-coding-worktree-required");
+        let state = Arc::new(AppState::test(workspace));
+        let req = report_route(
+            "impl-a",
+            Some(vec!["src".to_string()]),
+            ".agents/agentcall/impl-a.md",
+        );
+        let err = coding_worktree_contract(&state, &req, &["claude".to_string()]).unwrap_err();
+        assert!(err.contains("coding_requires_worktree"));
+    }
+
+    #[test]
+    fn coding_custom_command_keeps_worktree_gate_advisory_for_smoke_workers() {
+        let workspace = test_workspace("route-coding-custom-command");
+        let state = Arc::new(AppState::test(workspace.clone()));
+        let req = report_route(
+            "impl-a",
+            Some(vec!["src".to_string()]),
+            ".agents/agentcall/impl-a.md",
+        );
+        let contract =
+            coding_worktree_contract(&state, &req, &["fake-worker".to_string()]).unwrap();
+        assert_eq!(contract["enforced"], false);
+        assert_eq!(contract["reason"], "custom_non_claude_command");
+        assert_eq!(contract["merge_requires_pr"], true);
+    }
+
+    #[test]
     fn explicit_duplicate_report_path_is_projected_as_warning() {
         let workspace = test_workspace("route-report-duplicate");
         let state = Arc::new(AppState::test(workspace.clone()));
@@ -2082,6 +2286,12 @@ mod tests {
         assert_eq!(containment["mode"], "coding");
         assert_eq!(containment["bash_write_policy"], "monitored");
         assert_eq!(
+            containment["workspace_contract"]["schema"],
+            "workspace_contract.v1"
+        );
+        assert_eq!(containment["workspace_contract"]["mode"], "edit");
+        assert_eq!(containment["workspace_contract"]["bash_effects"], "project");
+        assert_eq!(
             containment["scratch_path"],
             ".agentcall/workspaces/containment-a"
         );
@@ -2205,6 +2415,16 @@ mod tests {
         };
         let containment = pty_containment(&state, &req, "containment-report");
         assert_eq!(containment["mode"], "report");
+        assert_eq!(containment["bash_write_policy"], "readonly");
+        assert_eq!(
+            containment["workspace_contract"]["schema"],
+            "workspace_contract.v1"
+        );
+        assert_eq!(containment["workspace_contract"]["mode"], "report");
+        assert_eq!(
+            containment["workspace_contract"]["bash_effects"],
+            "readonly"
+        );
         let writable = containment["writable_paths"].as_array().unwrap();
         assert!(writable.iter().any(|value| value == "docs/report.md"));
         assert!(!writable.iter().any(|value| value == "src"));

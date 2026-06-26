@@ -4,6 +4,7 @@ use crate::state::AppState;
 use crate::store::BoardQuery;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use serde_json::Value;
+use std::collections::HashSet;
 use std::fmt;
 use std::sync::Arc;
 
@@ -447,6 +448,7 @@ pub(crate) fn board_attention_projection(
     filter: Option<&str>,
     workspace_filter: Option<&str>,
 ) -> Value {
+    let current_sessions = current_board_session_names(state);
     let all = state
         .store
         .list_board_projection(BoardQuery {
@@ -456,11 +458,13 @@ pub(crate) fn board_attention_projection(
         .unwrap_or_else(|_| serde_json::json!({"sessions": []}));
     let all_workers = board_projection_items(
         all.get("sessions").and_then(Value::as_array),
+        &current_sessions,
         workspace_filter,
         false,
     );
     let attention_workers = board_projection_items(
         all.get("sessions").and_then(Value::as_array),
+        &current_sessions,
         workspace_filter,
         true,
     );
@@ -493,6 +497,9 @@ pub(crate) fn board_attention_projection(
         },
         "projection_only": true,
         "cold_state": true,
+        "current_indexed": true,
+        "current_index_source": "daemon_live_sessions",
+        "historical_projection_excluded": true,
         "store_backend": state.store.backend_name(),
         "workers": workers,
         "runtime_sessions": all_workers.clone(),
@@ -501,19 +508,27 @@ pub(crate) fn board_attention_projection(
         "counts": {
             "runtime_workers": all_workers.len(),
             "attention": attention_workers.len(),
+            "current_index": current_sessions.len(),
+            "historical_projection_rows": all.get("sessions").and_then(Value::as_array).map(|items| items.len()).unwrap_or(0),
         },
         "attention": attention,
     })
 }
 
+fn current_board_session_names(state: &AppState) -> HashSet<String> {
+    state.sessions.lock().unwrap().keys().cloned().collect()
+}
+
 fn board_projection_items(
     items: Option<&Vec<Value>>,
+    current_sessions: &HashSet<String>,
     workspace_filter: Option<&str>,
     attention_only: bool,
 ) -> Vec<Value> {
     items
         .into_iter()
         .flatten()
+        .filter(|projection| projection_session_is_current(projection, current_sessions))
         .filter(|projection| is_current_board_projection(projection))
         .filter(|projection| {
             !attention_only
@@ -570,14 +585,14 @@ fn board_projection_items(
         .collect()
 }
 
+fn projection_session_is_current(projection: &Value, current_sessions: &HashSet<String>) -> bool {
+    projection
+        .get("session_id")
+        .and_then(Value::as_str)
+        .is_some_and(|session_id| current_sessions.contains(session_id))
+}
+
 fn is_current_board_projection(projection: &Value) -> bool {
-    if projection
-        .get("needs_attention")
-        .and_then(Value::as_bool)
-        .unwrap_or(false)
-    {
-        return true;
-    }
     if projection
         .get("projection_stale")
         .and_then(Value::as_bool)
@@ -1127,6 +1142,48 @@ mod tests {
         assert_eq!(summary["session"], "worker-missing");
         assert_eq!(summary["attention_status"], "low_confidence");
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn compact_board_projection_items_exclude_historical_attention_rows() {
+        let projections = vec![
+            serde_json::json!({
+                "session_id": "live-worker",
+                "needs_attention": true,
+                "attention_status": "needs_permission",
+                "liveness_status": "working",
+                "workspace": "E:/Project/App",
+                "projection_stale": false
+            }),
+            serde_json::json!({
+                "session_id": "old-attention",
+                "needs_attention": true,
+                "attention_status": "low_confidence",
+                "liveness_status": "working",
+                "workspace": "E:/Project/App",
+                "projection_stale": false
+            }),
+            serde_json::json!({
+                "session_id": "old-terminal",
+                "needs_attention": true,
+                "attention_status": "report_ready",
+                "liveness_status": "completed",
+                "workspace": "E:/Project/App",
+                "projection_stale": false
+            }),
+        ];
+        let current_sessions = HashSet::from(["live-worker".to_string()]);
+
+        let workers = board_projection_items(
+            Some(&projections),
+            &current_sessions,
+            Some("E:/Project/App"),
+            true,
+        );
+
+        assert_eq!(workers.len(), 1);
+        assert_eq!(workers[0]["session"], "live-worker");
+        assert_eq!(workers[0]["state"], "needs_permission");
     }
 
     fn test_projection_event(

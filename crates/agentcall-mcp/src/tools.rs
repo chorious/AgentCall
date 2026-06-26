@@ -88,7 +88,7 @@ fn route_tool() -> Value {
                 "objective": {"type": "string"},
                 "workspace": {"type": "string"},
                 "session_name": {"type": "string"},
-                "write_paths": {"type": "array", "items": {"type": "string"}, "description": "Paths the worker may modify, plus daemon-minted scratch/report paths."},
+                "write_paths": {"type": "array", "items": {"type": "string"}, "description": "Implementation write scope for coding workers. Omit or restrict to report scope for report/review workers; they may only create/edit their own report/scratch artifacts."},
                 "reference_paths": {"type": "array", "items": {"type": "string"}, "description": "Recommended read/context paths for the worker. This is not a read permission boundary."},
                 "acceptance_criteria": {"type": "array", "items": {"type": "string"}},
                 "report_path": {"type": "string"}

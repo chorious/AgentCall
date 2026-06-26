@@ -912,7 +912,9 @@ pub(crate) fn pre_tool_use_claim_locked(
             return Ok(decision);
         }
         if let Some(policy) = pty_path_policy_for_wrapper(state, wrapper) {
-            let policy_decision = evaluate_pty_pre_tool_policy(tool_name, payload, &policy);
+            let policy_decision = evaluate_pty_pre_tool_policy_locked(
+                state_dir, session_id, tool_name, payload, &policy,
+            )?;
             if let Some(denial) = policy_decision.denial.as_deref() {
                 let policy_block = record_policy_denial_locked(
                     state, state_dir, wrapper, tool_name, payload, &denial, &policy,
@@ -1576,6 +1578,142 @@ fn evaluate_pty_pre_tool_policy(
         return HookPolicyDecision::allow(extract_tool_files(payload));
     }
     HookPolicyDecision::allow(extract_tool_files(payload))
+}
+
+fn evaluate_pty_pre_tool_policy_locked(
+    state_dir: &Path,
+    session_id: &str,
+    tool_name: &str,
+    payload: &serde_json::Value,
+    policy: &PtyPathPolicy,
+) -> Result<HookPolicyDecision, String> {
+    if matches!(policy.mode.as_str(), "report" | "review") {
+        if tool_name == "Bash" && !bash_readonly_allowed(payload) {
+            return Ok(HookPolicyDecision::deny(
+                "report/review worker Bash is readonly; write temporary scripts or generated artifacts through explicit scratch/report file tools"
+                    .to_string(),
+                extract_tool_files(payload),
+            ));
+        }
+        if is_write_tool(tool_name) {
+            return evaluate_report_worker_write_policy(
+                state_dir, session_id, tool_name, payload, policy,
+            );
+        }
+    }
+    Ok(evaluate_pty_pre_tool_policy(tool_name, payload, policy))
+}
+
+fn evaluate_report_worker_write_policy(
+    state_dir: &Path,
+    session_id: &str,
+    _tool_name: &str,
+    payload: &serde_json::Value,
+    policy: &PtyPathPolicy,
+) -> Result<HookPolicyDecision, String> {
+    let files = extract_tool_files(payload);
+    if files.is_empty() {
+        return Ok(HookPolicyDecision::deny(
+            "report/review worker write tool requires an explicit file path".to_string(),
+            files,
+        ));
+    }
+    let path = state_dir.join("file_claims.json");
+    let mut claims = read_json_file(&path, serde_json::json!({}));
+    if !claims.is_object() {
+        claims = serde_json::json!({});
+    }
+    mark_expired_claims_stale(&mut claims);
+    write_json_file(&path, &claims)?;
+
+    if files
+        .iter()
+        .all(|file| report_worker_write_allowed(file, session_id, policy, &claims))
+    {
+        return Ok(HookPolicyDecision::allow(files));
+    }
+    Ok(HookPolicyDecision::deny(
+        "report/review worker may only create a new report artifact or edit files already claimed by this session under report/scratch"
+            .to_string(),
+        files,
+    ))
+}
+
+fn report_worker_write_allowed(
+    file: &str,
+    session_id: &str,
+    policy: &PtyPathPolicy,
+    claims: &serde_json::Value,
+) -> bool {
+    if claim_owned_by_session(claims, file, session_id) {
+        return true;
+    }
+    if file_inside_session_scratch(file, policy) {
+        return true;
+    }
+    if !file_matches_report_artifact(file, policy) {
+        return false;
+    }
+    !policy_file_exists(file, policy)
+}
+
+fn claim_owned_by_session(claims: &serde_json::Value, file: &str, session_id: &str) -> bool {
+    claims
+        .get(file)
+        .and_then(serde_json::Value::as_object)
+        .is_some_and(|claim| {
+            claim.get("session_id").and_then(serde_json::Value::as_str) == Some(session_id)
+                && matches!(
+                    claim.get("status").and_then(serde_json::Value::as_str),
+                    Some("active") | Some("stale")
+                )
+        })
+}
+
+fn file_inside_session_scratch(file: &str, policy: &PtyPathPolicy) -> bool {
+    policy
+        .scratch_path
+        .as_ref()
+        .is_some_and(|scratch| path_within_or_equal(file, scratch))
+        || policy.scratch_root.as_ref().is_some_and(|scratch| {
+            path_within_or_equal(&policy_abs_path_string(file, policy), scratch)
+        })
+}
+
+fn file_matches_report_artifact(file: &str, policy: &PtyPathPolicy) -> bool {
+    policy
+        .writable_roots
+        .iter()
+        .filter(|root| root.kind == "report")
+        .any(|root| {
+            normalize_compare_path(file) == normalize_compare_path(&root.display)
+                || normalize_compare_path(&policy_abs_path_string(file, policy))
+                    == normalize_compare_path(&root.abs)
+        })
+}
+
+fn policy_file_exists(file: &str, policy: &PtyPathPolicy) -> bool {
+    policy_abs_path(file, policy).exists()
+}
+
+fn policy_abs_path_string(file: &str, policy: &PtyPathPolicy) -> String {
+    policy_abs_path(file, policy)
+        .to_string_lossy()
+        .replace('\\', "/")
+}
+
+fn policy_abs_path(file: &str, policy: &PtyPathPolicy) -> PathBuf {
+    let candidate = PathBuf::from(file);
+    if candidate.is_absolute() {
+        return candidate;
+    }
+    if let Some(target_workspace) = policy.target_workspace.as_ref() {
+        return PathBuf::from(target_workspace).join(candidate);
+    }
+    if let Some(process_cwd) = policy.process_cwd.as_ref() {
+        return PathBuf::from(process_cwd).join(candidate);
+    }
+    candidate
 }
 
 fn bash_preflight_denial(payload: &serde_json::Value) -> Option<String> {
@@ -2409,6 +2547,8 @@ mod tests {
             .join("state")
             .join("routes.json");
         let scratch = format!(".agentcall/workspaces/{wrapper_session}");
+        let scratch_abs = state.workspace.join(&scratch);
+        let report_abs = state.workspace.join(report_path);
         let writable_paths = serde_json::json!([report_path, scratch]);
         write_json_file(
             &path,
@@ -2432,7 +2572,24 @@ mod tests {
                             "write_paths_input": ["docs/reports"],
                             "writable_paths": writable_paths,
                             "scratch_path": scratch,
-                            "bash_write_policy": "readonly_only"
+                            "roots": {
+                                "process_cwd": state.workspace.display().to_string(),
+                                "target_workspace": state.workspace.display().to_string(),
+                                "scratch_root": scratch_abs.display().to_string()
+                            },
+                            "writable_roots": [
+                                {
+                                    "kind": "report",
+                                    "display": report_path,
+                                    "abs": report_abs.display().to_string()
+                                },
+                                {
+                                    "kind": "scratch",
+                                    "display": scratch,
+                                    "abs": scratch_abs.display().to_string()
+                                }
+                            ],
+                            "bash_write_policy": "readonly"
                         }
                     }
                 }
@@ -3274,6 +3431,89 @@ mod tests {
                 .as_str()
                 .unwrap()
                 .contains("report route")
+        );
+    }
+
+    #[test]
+    fn pty_report_route_allows_new_report_then_claimed_edit() {
+        let state = test_state("pty-report-created-claim");
+        install_pty_report_route(&state, "pty-a", "docs/reports/review.md");
+        let mut payload = write_payload("claude-a", "docs/reports/review.md");
+        payload["wrapper_session"] = serde_json::json!("pty-a");
+
+        let first = ingest_hook(
+            &state,
+            HookIngestRequest {
+                event: "PreToolUse".to_string(),
+                payload: payload.clone(),
+                runtime: Some("claude-code-session".to_string()),
+            },
+        )
+        .unwrap();
+        assert_eq!(first["decision"]["allowed"], true);
+
+        let second = ingest_hook(
+            &state,
+            HookIngestRequest {
+                event: "PreToolUse".to_string(),
+                payload,
+                runtime: Some("claude-code-session".to_string()),
+            },
+        )
+        .unwrap();
+        assert_eq!(second["decision"]["allowed"], true);
+    }
+
+    #[test]
+    fn pty_report_route_denies_existing_project_file_edit() {
+        let state = test_state("pty-report-existing-deny");
+        install_pty_report_route(&state, "pty-a", "docs/reports/review.md");
+        let existing = state.workspace.join("docs/reports/old.md");
+        fs::create_dir_all(existing.parent().unwrap()).unwrap();
+        fs::write(&existing, "old").unwrap();
+        let mut payload = write_payload("claude-a", "docs/reports/old.md");
+        payload["wrapper_session"] = serde_json::json!("pty-a");
+
+        let result = ingest_hook(
+            &state,
+            HookIngestRequest {
+                event: "PreToolUse".to_string(),
+                payload,
+                runtime: Some("claude-code-session".to_string()),
+            },
+        )
+        .unwrap();
+        assert_eq!(result["decision"]["allowed"], false);
+        assert!(
+            result["decision"]["reason"]
+                .as_str()
+                .unwrap()
+                .contains("only create a new report artifact")
+        );
+    }
+
+    #[test]
+    fn pty_report_route_denies_non_readonly_bash() {
+        let state = test_state("pty-report-bash-deny");
+        install_pty_report_route(&state, "pty-a", "docs/reports/review.md");
+        let mut payload = bash_payload("claude-a", "python .agentcall/workspaces/pty-a/analyze.py");
+        payload["wrapper_session"] = serde_json::json!("pty-a");
+
+        let result = ingest_hook(
+            &state,
+            HookIngestRequest {
+                event: "PreToolUse".to_string(),
+                payload,
+                runtime: Some("claude-code-session".to_string()),
+            },
+        )
+        .unwrap();
+        assert_eq!(result["decision"]["allowed"], false);
+        assert!(
+            result["decision"]["reason"]
+                .as_str()
+                .unwrap()
+                .contains("Bash is readonly")
         );
     }
 

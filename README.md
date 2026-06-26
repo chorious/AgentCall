@@ -1,12 +1,12 @@
 # AgentCall
 
-当前版本 / Current version: `v6.9.1`
+当前版本 / Current version: `v6.9.2`
 
 AgentCall is a local coordination plane that lets **Codex supervise Claude Code PTY utility workers** through a daemon-backed MCP interface. Codex stays the parent agent: it reads a compact board, starts bounded workers, sends safe commands, waits with patience hints, asks for reports, and accepts or revises deliverables. Claude Code workers do the visible PTY work under hook-aware policy and file ownership.
 
 AgentCall 是一个本地多 Agent 协作控制面：让 **Codex 指挥 Claude Code PTY worker 集群**。Codex 负责拆分、监督、验收和整合；Claude Code worker 负责执行边界明确的实现、审查、证据检查和报告任务。
 
-v6.9.1 keeps the v6.9 monitored Bash/folder-audit line and hardens MCP/daemon alignment: the stdio bridge prefers the live daemon tool schema, validates the daemon version and binary path against a release-injected runtime manifest, and compact board reads now come from cold store projections instead of live PTY/state-writer work. The frozen implementation baseline remains [v6.2 code plan](docs/v6.2-code-plan.md).
+v6.9.2 keeps the v6.9 monitored execution line but makes the default surfaces smaller and clearer: compact board reads cold projections through the daemon current-session index, route containment emits a `workspace_contract.v1`, report/review workers can only create or edit their own report/scratch artifacts, and real Claude coding workers must run in a dedicated git worktree branch with PR-style closure. The frozen implementation baseline remains [v6.2 code plan](docs/v6.2-code-plan.md).
 
 ## Product Shape / 产品特点
 
@@ -17,10 +17,11 @@ v6.9 also makes closure easier: `agentcall_session(view=summary)` automatically 
 - **Rust daemon authority**: runtime events, claims, sessions, bindings, routes, summaries, and board projection are daemon-owned.
 - **Hook-aware state**: Claude/Codex hooks provide structured liveness, attention, report, permission, and policy signals.
 - **Projection-first MCP**: Codex should read compact board/session projections, not raw PTY logs by default.
-- **Cold compact board**: compact board reads return store-backed projection state and do not sweep live PTYs or perform cleanup writes.
+- **Current cold compact board**: compact board reads store-backed projection rows but returns only daemon-current live sessions; historical projections stay in debug/raw views.
 - **Runtime identity guard**: `runtime-release` injects `agentcall-version.json`, and MCP rejects a daemon whose health version or binary path does not match that manifest.
-- **Bounded write policy**: write tools are constrained by route containment; Bash is monitored by lightweight folder heartbeat audit instead of being rejected solely because it may write.
-- **Two worker kinds**: `coding` workers modify implementation paths under exclusive workspace lease; `report` workers share the workspace and write only report/scratch artifacts.
+- **Workspace contract**: PTY containment projects task root, runtime root, artifact root, writable/readonly roots, deny-write roots, and Bash side-effect mode as `workspace_contract.v1`.
+- **Bounded write policy**: write tools are constrained by route containment; report/review workers may only create or edit their own report/scratch artifacts, while coding Bash remains monitored by lightweight folder heartbeat audit.
+- **Two worker kinds**: `coding` workers modify implementation paths from a dedicated worktree branch under exclusive workspace lease; `report` workers share the workspace and write only own report/scratch artifacts.
 - **Typed error codes**: safety-lock errors are produced from Rust `ErrorCode` variants and serialized as stable snake_case JSON codes.
 - **SQLite single-writer WAL store**: SQLite/WAL writes are serialized through one daemon writer to avoid busy-lock contention; JSON remains safety-capped to one writer.
 - **Report-ready closure**: route can mint a unique report path, `request_report` is a state transition, and daemon-observed report writes update route/session projection to `report_ready`.
@@ -108,12 +109,12 @@ python agentcall.py paths
 python agentcall.py logs doctor
 python agentcall.py sessions cleanup --stale-after 5m
 python agentcall.py release-check
-python agentcall.py runtime-release --version 6.9.1
+python agentcall.py runtime-release --version 6.9.2 --update-skills
 ```
 
 The scripts are intentionally loud: missing Cargo, stale hooks, daemon health timeout, plugin validation failure, pytest failure, or whitespace diff errors should point to the failing subsystem.
 
-`runtime-release` is the version/runtime alignment path. It updates version files, builds the workspace, writes `agentcall-version.json` into the versioned runtime directory, stops stale AgentCall daemon/MCP processes, starts the daemon as a Windows breakaway process, and verifies `/api/runtime/health` reports the requested live version and binary. Use `--dry-run`, `--skip-tests`, or `--no-restart` for narrower maintenance runs.
+`runtime-release` is the version/runtime alignment path. It updates version files, builds the workspace, writes `agentcall-version.json` into the versioned runtime directory, stops stale AgentCall daemon/MCP processes, starts the daemon as a Windows breakaway process, and verifies `/api/runtime/health` reports the requested live version and binary. It also requires an explicit repository-managed skill decision: use `--update-skills`, `--skip-skill-update`, or answer the interactive prompt. Use `--dry-run`, `--skip-tests`, or `--no-restart` for narrower maintenance runs.
 
 ## Hooks And cwd / Hooks 与 cwd
 

@@ -58,6 +58,16 @@ def main() -> int:
         help="Skip python agentcall.py release-check after build.",
     )
     parser.add_argument(
+        "--update-skills",
+        action="store_true",
+        help="Regenerate repository-managed AgentCall skills before release.",
+    )
+    parser.add_argument(
+        "--skip-skill-update",
+        action="store_true",
+        help="Keep generated AgentCall skills unchanged for this release.",
+    )
+    parser.add_argument(
         "--no-stop-existing",
         action="store_true",
         help="Do not stop existing agentcall-daemon.exe / agentcall-mcp.exe processes.",
@@ -92,6 +102,7 @@ def main() -> int:
 def run_release(root: Path, version: str, label: str, args: argparse.Namespace) -> int:
     require_repo(root)
     validate_version(version)
+    handle_skill_update_decision(root, args)
     print_step("version", f"aligning AgentCall version to {version}")
     changed = align_versions(root, version, label, dry_run=args.dry_run)
     for path in changed:
@@ -171,6 +182,36 @@ def run_release(root: Path, version: str, label: str, args: argparse.Namespace) 
         )
         print("[NOTE] Codex MCP stdio transports may need a new Codex session/plugin reload to bind to the versioned runtime agentcall-mcp.exe.")
     return 0
+
+
+def handle_skill_update_decision(root: Path, args: argparse.Namespace) -> None:
+    if args.update_skills and args.skip_skill_update:
+        raise ReleaseError(
+            "skill_update_decision_conflict",
+            "Use only one of --update-skills or --skip-skill-update.",
+        )
+    update_skills = args.update_skills
+    if not args.update_skills and not args.skip_skill_update:
+        if not sys.stdin.isatty():
+            raise ReleaseError(
+                "skill_update_decision_required",
+                "runtime-release requires --update-skills or --skip-skill-update in non-interactive mode.",
+            )
+        answer = input("Update repository-managed AgentCall skills before release? [Y/n] ").strip().lower()
+        update_skills = answer not in {"n", "no"}
+    if update_skills:
+        print_step("skills", "python scripts/generate_agentcall_skill.py")
+        if args.dry_run:
+            print("[DRY-RUN] skill generation skipped")
+        else:
+            run_checked(
+                [sys.executable, "scripts/generate_agentcall_skill.py"],
+                root,
+                "generate AgentCall skills",
+                timeout=60,
+            )
+    else:
+        print("[NOTE] repository-managed AgentCall skills left unchanged by explicit release decision")
 
 
 def align_versions(root: Path, version: str, label: str, dry_run: bool) -> list[str]:

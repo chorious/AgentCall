@@ -147,6 +147,9 @@ def check_mcp_bridge_schema_alignment(root: Path) -> list[str]:
 def check_board_attention_fast_path(root: Path) -> list[str]:
     path = root / "crates" / "agentcall-daemon" / "src" / "summary.rs"
     text = path.read_text(encoding="utf-8")
+    projection = (root / "crates" / "agentcall-daemon" / "src" / "projection.rs").read_text(
+        encoding="utf-8"
+    )
     body = extract_rust_item_body(text, "pub(crate) fn board_state")
     failures: list[str] = []
     marker = 'if view == Some("compact")'
@@ -174,6 +177,18 @@ def check_board_attention_fast_path(root: Path) -> list[str]:
     ):
         if removed_item in text:
             failures.append(f"summary.rs must not retain old read/write mixed helper {removed_item}")
+    for required in (
+        "current_board_session_names",
+        '"current_index_source": "daemon_live_sessions"',
+        '"historical_projection_excluded": true',
+        "projection_session_is_current",
+    ):
+        if required not in projection:
+            failures.append(f"compact board current projection guard missing marker: {required}")
+    if "needs_attention" in projection and "return true;" in extract_rust_item_body(
+        projection, "fn is_current_board_projection"
+    ):
+        failures.append("compact board must not treat needs_attention alone as current")
     return failures
 
 
@@ -200,6 +215,10 @@ def check_mcp_runtime_manifest_guard(root: Path) -> list[str]:
         failures.append("MCP proxy tools must validate daemon runtime identity before forwarding")
     if "write_runtime_version_manifest(root, runtime_dir, version)" not in release:
         failures.append("runtime-release must write the MCP hot-read runtime version manifest")
+    if "handle_skill_update_decision(root, args)" not in release:
+        failures.append("runtime-release must require an explicit AgentCall skill update decision")
+    if '"skill_update_decision_required"' not in release:
+        failures.append("runtime-release non-interactive skill update gate must expose skill_update_decision_required")
     if '"agentcall-version.json"' not in release:
         failures.append("runtime-release manifest filename must be agentcall-version.json")
     if "$matchedProcs = @(" not in release:

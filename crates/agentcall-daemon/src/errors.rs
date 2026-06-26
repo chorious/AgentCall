@@ -11,6 +11,7 @@ pub(crate) enum ErrorCode {
     StaleLeaseGeneration,
     ExpiredLease,
     CapacityExceeded,
+    CodingRequiresWorktree,
     MissingControlToken,
     InvalidControlToken,
     MissingPrecondition,
@@ -35,6 +36,7 @@ impl ErrorCode {
             Self::StaleLeaseGeneration => "stale_lease_generation",
             Self::ExpiredLease => "expired_lease",
             Self::CapacityExceeded => "capacity_exceeded",
+            Self::CodingRequiresWorktree => "coding_requires_worktree",
             Self::MissingControlToken => "missing_control_token",
             Self::InvalidControlToken => "invalid_control_token",
             Self::MissingPrecondition => "missing_precondition",
@@ -59,6 +61,7 @@ impl ErrorCode {
             "stale_lease_generation" => Self::StaleLeaseGeneration,
             "expired_lease" => Self::ExpiredLease,
             "capacity_exceeded" => Self::CapacityExceeded,
+            "coding_requires_worktree" => Self::CodingRequiresWorktree,
             "missing_control_token" => Self::MissingControlToken,
             "invalid_control_token" => Self::InvalidControlToken,
             "missing_precondition" => Self::MissingPrecondition,
@@ -84,6 +87,7 @@ impl ErrorCode {
             | Self::StaleLeaseGeneration
             | Self::ExpiredLease => 409,
             Self::CapacityExceeded => 429,
+            Self::CodingRequiresWorktree => 409,
             Self::MissingControlToken
             | Self::InvalidControlToken
             | Self::MissingPrecondition
@@ -128,6 +132,11 @@ impl ErrorCode {
                 "safety_lock",
                 true,
                 "Active worker capacity is full; wait for a worker to finish or stop an obsolete session.",
+            ),
+            Self::CodingRequiresWorktree => (
+                "safety_lock",
+                false,
+                "Start coding workers in a dedicated git worktree branch and merge through a PR-style review report.",
             ),
             Self::MissingControlToken | Self::InvalidControlToken | Self::MissingPrecondition => (
                 "safety_lock",
@@ -237,6 +246,8 @@ fn classify_message(message: &str) -> ErrorCode {
         ErrorCode::ExpiredLease
     } else if lower.starts_with("capacity_exceeded:") {
         ErrorCode::CapacityExceeded
+    } else if lower.starts_with("coding_requires_worktree:") {
+        ErrorCode::CodingRequiresWorktree
     } else if lower.contains("missing control token") || lower.contains("control_token_required") {
         ErrorCode::MissingControlToken
     } else if lower.contains("invalid control token") {
@@ -256,7 +267,9 @@ fn details_from_message(code: ErrorCode, message: &str) -> Value {
     match code {
         ErrorCode::WorkspaceBusy => parse_workspace_busy(message),
         ErrorCode::OwnerLeaseExists => parse_key_values(message),
-        ErrorCode::CapacityExceeded => parse_key_values(message),
+        ErrorCode::CapacityExceeded | ErrorCode::CodingRequiresWorktree => {
+            parse_key_values(message)
+        }
         _ => json!({}),
     }
 }

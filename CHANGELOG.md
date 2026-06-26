@@ -1,5 +1,16 @@
 # CHANGELOG
 
+## v6.9.2 - Current Board And Workspace Contract Patch
+
+- Compact board now gates cold projection rows through the daemon's current live-session index. Historical `needs_attention` projections stay available to debug/raw views, but no longer inflate ordinary board payloads or make the control panel appear stuck.
+- Compact board responses now expose `current_indexed`, `current_index_source=daemon_live_sessions`, and `historical_projection_excluded` markers so MCP/frontends can distinguish current state from archived projection rows.
+- PTY route containment now emits a lightweight `workspace_contract.v1` with task root, runtime root, artifact root, writable roots, readonly references, deny-write paths, and Bash side-effect mode.
+- Report/review workers now enforce created-artifact semantics in hook pre-policy: they may create the requested report or scratch artifacts and continue editing files claimed by the same session, but cannot modify pre-existing project files.
+- Report/review worker Bash is readonly in pre-policy; edit/coding Bash remains monitored by folder heartbeat and destructive-command preflight.
+- Real Claude coding routes now require a dedicated linked git worktree on a non-main branch and project `coding_requires_worktree`, branch, worktree path, `merge_requires_pr`, and PR report path in the route result. Custom fake/smoke worker commands keep an advisory gate for tests.
+- `agentcall-flow` is now repository-managed under `docs/agentcall-flow/` and generated into `.codex/skills/agentcall-flow`; release-check validates both supervisor and flow skills.
+- `runtime-release` now requires an explicit skill-update decision through the interactive prompt or non-interactive `--update-skills` / `--skip-skill-update` flags.
+
 ## v6.9.1 - Runtime Identity And Cold Board Patch
 
 - MCP bridge `tools/list` now prefers the live daemon `/api/mcp/tools` schema when the daemon is reachable, so Codex sees daemon-supported actions instead of stale bridge fallback metadata.

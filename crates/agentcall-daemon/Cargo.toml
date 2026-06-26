@@ -1,6 +1,6 @@
 [package]
 name = "agentcall-daemon"
-version = "6.9.1"
+version = "6.9.2"
 edition = "2024"
 
 [dependencies]

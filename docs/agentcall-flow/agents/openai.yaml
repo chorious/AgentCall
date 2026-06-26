@@ -1,0 +1,4 @@
+interface:
+  display_name: "AgentCall Flow"
+  short_description: "Coordinate AgentCall code review fix flows"
+  default_prompt: "Use $agentcall-flow to coordinate a plan-first AgentCall code, review, fix, and report workflow."

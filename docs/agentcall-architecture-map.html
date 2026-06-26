@@ -1,0 +1,806 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>AgentCall v6.9.1 Architecture Map</title>
+  <style>
+    :root {
+      --bg: #f6f7f8;
+      --panel: #ffffff;
+      --ink: #182026;
+      --muted: #5c6670;
+      --line: #d8dde2;
+      --line-strong: #aab4bd;
+      --codex: #2f6f73;
+      --mcp: #6b5b95;
+      --daemon: #234f7a;
+      --worker: #9a5a2e;
+      --store: #526735;
+      --hook: #8a4350;
+      --warn: #b36b00;
+      --good: #28724f;
+      --bad: #a23b3b;
+      --soft-codex: #e5f0f0;
+      --soft-mcp: #eeeaf5;
+      --soft-daemon: #e7eef6;
+      --soft-worker: #f3ebe4;
+      --soft-store: #eaf0e2;
+      --soft-hook: #f3e8ea;
+      --shadow: 0 1px 2px rgba(18, 28, 36, 0.06);
+      font-family: Inter, "Segoe UI", "Microsoft YaHei", Arial, sans-serif;
+    }
+
+    * { box-sizing: border-box; }
+    html { scroll-behavior: smooth; }
+    body {
+      margin: 0;
+      background: var(--bg);
+      color: var(--ink);
+      line-height: 1.55;
+    }
+    a { color: var(--daemon); text-decoration: none; }
+    a:hover { text-decoration: underline; }
+    code {
+      font-family: "Cascadia Mono", "Consolas", monospace;
+      font-size: 0.92em;
+      background: #eef1f3;
+      border: 1px solid #dde3e7;
+      border-radius: 4px;
+      padding: 0.08rem 0.28rem;
+    }
+    .page {
+      display: grid;
+      grid-template-columns: 268px minmax(0, 1fr);
+      min-height: 100vh;
+    }
+    aside {
+      position: sticky;
+      top: 0;
+      height: 100vh;
+      padding: 22px 18px;
+      border-right: 1px solid var(--line);
+      background: #ffffff;
+      overflow: auto;
+    }
+    main {
+      padding: 28px;
+      max-width: 1420px;
+    }
+    .brand {
+      display: grid;
+      gap: 6px;
+      margin-bottom: 20px;
+    }
+    .brand strong {
+      font-size: 18px;
+      letter-spacing: 0;
+    }
+    .brand span {
+      color: var(--muted);
+      font-size: 13px;
+    }
+    nav {
+      display: grid;
+      gap: 4px;
+      margin-top: 16px;
+    }
+    nav a {
+      display: block;
+      padding: 7px 8px;
+      border-radius: 6px;
+      color: #2e3942;
+      font-size: 13px;
+    }
+    nav a:hover {
+      background: #eef2f4;
+      text-decoration: none;
+    }
+    .hero {
+      display: grid;
+      gap: 16px;
+      margin-bottom: 24px;
+      padding: 24px;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: linear-gradient(135deg, #ffffff 0%, #f2f5f6 100%);
+      box-shadow: var(--shadow);
+    }
+    h1, h2, h3 {
+      margin: 0;
+      letter-spacing: 0;
+      line-height: 1.2;
+    }
+    h1 {
+      font-size: clamp(30px, 4vw, 54px);
+      max-width: 980px;
+    }
+    h2 {
+      font-size: 24px;
+      margin-bottom: 12px;
+    }
+    h3 {
+      font-size: 16px;
+      margin-bottom: 8px;
+    }
+    p { margin: 0 0 10px; }
+    .subtitle {
+      color: var(--muted);
+      max-width: 980px;
+      font-size: 16px;
+    }
+    .chips {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+    }
+    .chip {
+      padding: 6px 8px;
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      background: #fff;
+      color: #39444d;
+      font-size: 12px;
+      white-space: nowrap;
+    }
+    section {
+      margin: 22px 0;
+    }
+    .panel {
+      background: var(--panel);
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      box-shadow: var(--shadow);
+      padding: 18px;
+    }
+    .grid {
+      display: grid;
+      gap: 14px;
+    }
+    .grid.two { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+    .grid.three { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+    .grid.four { grid-template-columns: repeat(4, minmax(0, 1fr)); }
+    .card {
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      padding: 14px;
+      background: #fff;
+      min-width: 0;
+    }
+    .card .kicker {
+      display: block;
+      margin-bottom: 6px;
+      color: var(--muted);
+      font-size: 12px;
+      text-transform: uppercase;
+      letter-spacing: 0.04em;
+    }
+    .card.codex { border-top: 4px solid var(--codex); background: var(--soft-codex); }
+    .card.mcp { border-top: 4px solid var(--mcp); background: var(--soft-mcp); }
+    .card.daemon { border-top: 4px solid var(--daemon); background: var(--soft-daemon); }
+    .card.worker { border-top: 4px solid var(--worker); background: var(--soft-worker); }
+    .card.store { border-top: 4px solid var(--store); background: var(--soft-store); }
+    .card.hook { border-top: 4px solid var(--hook); background: var(--soft-hook); }
+    .flow {
+      display: grid;
+      grid-template-columns: repeat(6, minmax(150px, 1fr));
+      gap: 10px;
+      align-items: stretch;
+      overflow-x: auto;
+      padding-bottom: 4px;
+    }
+    .node {
+      position: relative;
+      min-height: 112px;
+      padding: 13px;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: #fff;
+    }
+    .node::after {
+      content: "";
+      position: absolute;
+      top: 50%;
+      right: -10px;
+      width: 10px;
+      height: 2px;
+      background: var(--line-strong);
+    }
+    .node:last-child::after { display: none; }
+    .node b { display: block; margin-bottom: 5px; }
+    .node small { color: var(--muted); display: block; }
+    .legend {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 10px;
+      margin-top: 12px;
+    }
+    .legend span {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      font-size: 12px;
+      color: var(--muted);
+    }
+    .dot {
+      width: 10px;
+      height: 10px;
+      border-radius: 50%;
+      display: inline-block;
+    }
+    .swimlane {
+      display: grid;
+      gap: 8px;
+    }
+    .lane {
+      display: grid;
+      grid-template-columns: 145px minmax(0, 1fr);
+      gap: 10px;
+      align-items: stretch;
+    }
+    .lane-title {
+      border-radius: 8px;
+      padding: 10px;
+      color: #fff;
+      font-weight: 700;
+      display: flex;
+      align-items: center;
+      min-height: 58px;
+    }
+    .lane-title.codex { background: var(--codex); }
+    .lane-title.mcp { background: var(--mcp); }
+    .lane-title.daemon { background: var(--daemon); }
+    .lane-title.worker { background: var(--worker); }
+    .lane-title.store { background: var(--store); }
+    .lane-title.hook { background: var(--hook); }
+    .lane-body {
+      display: grid;
+      grid-template-columns: repeat(4, minmax(130px, 1fr));
+      gap: 8px;
+    }
+    .step {
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      padding: 10px;
+      background: #fff;
+      min-height: 58px;
+      font-size: 13px;
+    }
+    .step strong { display: block; margin-bottom: 3px; }
+    .step span { color: var(--muted); }
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      font-size: 13px;
+    }
+    th, td {
+      border-bottom: 1px solid var(--line);
+      padding: 10px;
+      text-align: left;
+      vertical-align: top;
+    }
+    th {
+      background: #f0f3f5;
+      font-size: 12px;
+      color: #3d4a54;
+      text-transform: uppercase;
+      letter-spacing: 0.04em;
+    }
+    tr:last-child td { border-bottom: 0; }
+    .callout {
+      border-left: 4px solid var(--warn);
+      background: #fff8ed;
+      padding: 12px 14px;
+      border-radius: 6px;
+      margin: 12px 0;
+    }
+    .callout.good {
+      border-left-color: var(--good);
+      background: #eef8f2;
+    }
+    .callout.bad {
+      border-left-color: var(--bad);
+      background: #fbefef;
+    }
+    .mini-list {
+      margin: 0;
+      padding-left: 18px;
+    }
+    .mini-list li { margin: 4px 0; }
+    .status {
+      display: inline-block;
+      border-radius: 4px;
+      padding: 2px 6px;
+      font-size: 12px;
+      font-weight: 700;
+      color: #fff;
+      white-space: nowrap;
+    }
+    .status.good { background: var(--good); }
+    .status.warn { background: var(--warn); }
+    .status.bad { background: var(--bad); }
+    .status.neutral { background: #66727c; }
+    .map-svg {
+      width: 100%;
+      min-height: 300px;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: #fff;
+    }
+    details {
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: #fff;
+      padding: 10px 12px;
+    }
+    details + details { margin-top: 8px; }
+    summary {
+      cursor: pointer;
+      font-weight: 700;
+    }
+    pre {
+      margin: 10px 0 0;
+      overflow: auto;
+      background: #101820;
+      color: #edf3f5;
+      padding: 12px;
+      border-radius: 8px;
+      font-size: 12px;
+    }
+    .footer {
+      color: var(--muted);
+      font-size: 12px;
+      padding: 24px 0;
+    }
+
+    @media (max-width: 1080px) {
+      .page { grid-template-columns: 1fr; }
+      aside {
+        position: static;
+        height: auto;
+        border-right: 0;
+        border-bottom: 1px solid var(--line);
+      }
+      main { padding: 18px; }
+      .grid.two, .grid.three, .grid.four { grid-template-columns: 1fr; }
+      .flow { grid-template-columns: repeat(6, 210px); }
+      .lane { grid-template-columns: 1fr; }
+      .lane-body { grid-template-columns: 1fr; }
+    }
+  </style>
+</head>
+<body>
+  <div class="page">
+    <aside>
+      <div class="brand">
+        <strong>AgentCall 架构地图</strong>
+        <span>v6.9.1 · 当前主线理解版</span>
+      </div>
+      <nav aria-label="目录">
+        <a href="#summary">总览</a>
+        <a href="#circuit">一张总图</a>
+        <a href="#layers">职责分层</a>
+        <a href="#paths">三条核心路径</a>
+        <a href="#state">状态与读写边界</a>
+        <a href="#workspace">Workspace 模型</a>
+        <a href="#tools">MCP 工具面</a>
+        <a href="#lifecycle">Worker 生命周期</a>
+        <a href="#modules">代码地图</a>
+        <a href="#timeouts">超时排查入口</a>
+        <a href="#rules">架构规则</a>
+      </nav>
+    </aside>
+
+    <main>
+      <header class="hero" id="summary">
+        <div class="chips">
+          <span class="chip">Codex parent</span>
+          <span class="chip">Rust daemon authority</span>
+          <span class="chip">PTY-first Claude workers</span>
+          <span class="chip">SQLite single writer</span>
+          <span class="chip">Projection-first board/session</span>
+        </div>
+        <h1>AgentCall 当前架构：一个本地多 Agent 控制面</h1>
+        <p class="subtitle">
+          AgentCall 不是“后台自动化平台”，而是 Codex 指挥 Claude Code PTY worker 的本地控制面。Codex 负责监督和验收；daemon 负责状态权威、路由、PTY、hooks、store、projection；Claude worker 负责可见的工程执行。
+        </p>
+      </header>
+
+      <section class="grid three">
+        <div class="card codex">
+          <span class="kicker">Parent</span>
+          <h3>Codex 做决策</h3>
+          <p>拆任务、派 worker、读 board/session、验收 report。正常情况不读 raw terminal 当状态源。</p>
+        </div>
+        <div class="card daemon">
+          <span class="kicker">Authority</span>
+          <h3>Daemon 写状态</h3>
+          <p>routes、sessions、events、claims、leases、bindings、projections 都以 Rust daemon 为 live authority。</p>
+        </div>
+        <div class="card worker">
+          <span class="kicker">Runtime</span>
+          <h3>Claude Code 做工作</h3>
+          <p>Daemon-owned PTY worker 在配置的 <code>claude_workspace</code> 中运行，任务目标 workspace 由 route 描述。</p>
+        </div>
+      </section>
+
+      <section id="circuit" class="panel">
+        <h2>一张总图</h2>
+        <div class="flow" role="img" aria-label="AgentCall control loop">
+          <div class="node" style="border-top:4px solid var(--codex)">
+            <b>Codex Thread</b>
+            <small>supervisor, planner, reviewer</small>
+            <small>工具调用入口</small>
+          </div>
+          <div class="node" style="border-top:4px solid var(--mcp)">
+            <b>MCP Bridge</b>
+            <small>stdio, tool schema, owner id</small>
+            <small>runtime identity guard</small>
+          </div>
+          <div class="node" style="border-top:4px solid var(--daemon)">
+            <b>Rust Daemon HTTP</b>
+            <small>/api/mcp/call, /api/routes</small>
+            <small>/api/board, /api/runtime/health</small>
+          </div>
+          <div class="node" style="border-top:4px solid var(--worker)">
+            <b>SessionActor + PTY</b>
+            <small>ordered input, stop, kill</small>
+            <small>visible Claude Code process</small>
+          </div>
+          <div class="node" style="border-top:4px solid var(--hook)">
+            <b>Claude/Codex Hooks</b>
+            <small>permission, tool use, report writes</small>
+            <small>folder heartbeat audit</small>
+          </div>
+          <div class="node" style="border-top:4px solid var(--store)">
+            <b>RuntimeStore</b>
+            <small>events, projections, commands</small>
+            <small>SQLite WAL single writer</small>
+          </div>
+        </div>
+        <div class="legend">
+          <span><i class="dot" style="background:var(--codex)"></i>supervision</span>
+          <span><i class="dot" style="background:var(--mcp)"></i>tool transport</span>
+          <span><i class="dot" style="background:var(--daemon)"></i>authority</span>
+          <span><i class="dot" style="background:var(--worker)"></i>visible work</span>
+          <span><i class="dot" style="background:var(--hook)"></i>observations</span>
+          <span><i class="dot" style="background:var(--store)"></i>durable state</span>
+        </div>
+      </section>
+
+      <section id="layers" class="panel">
+        <h2>职责分层</h2>
+        <table>
+          <thead>
+            <tr>
+              <th>层</th>
+              <th>拥有的东西</th>
+              <th>不该拥有的东西</th>
+              <th>关键文件</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td><span class="status good">Codex</span></td>
+              <td>任务拆分、监督策略、报告验收、最终整合。</td>
+              <td>默认读 raw PTY；直接伪造 daemon 状态；绕过 report evidence。</td>
+              <td><code>plugins/agentcall/skills</code>, <code>docs/agentcall-protocol.md</code></td>
+            </tr>
+            <tr>
+              <td><span class="status neutral">MCP Bridge</span></td>
+              <td>稳定工具 schema、stdio 协议、owner id、daemon start/status。</td>
+              <td>live state authority；自己维护 worker lifecycle。</td>
+              <td><code>crates/agentcall-mcp/src/tools.rs</code>, <code>bootstrap.rs</code></td>
+            </tr>
+            <tr>
+              <td><span class="status good">Daemon</span></td>
+              <td>HTTP API、route/session/report、events、claims、leases、projection、health。</td>
+              <td>Codex 插件生命周期；用户最终合并决策。</td>
+              <td><code>http.rs</code>, <code>mcp.rs</code>, <code>routes.rs</code>, <code>summary.rs</code></td>
+            </tr>
+            <tr>
+              <td><span class="status neutral">SessionActor</span></td>
+              <td>PTY 输入排序、command completion、interrupt/stop/kill dispatch。</td>
+              <td>policy 判断、report 验收、全局调度。</td>
+              <td><code>actor.rs</code>, <code>commands.rs</code>, <code>session.rs</code></td>
+            </tr>
+            <tr>
+              <td><span class="status warn">Hooks</span></td>
+              <td>Claude/Codex runtime observations、tool write evidence、permission/menu signals。</td>
+              <td>直接写 live state；替 daemon 做最终状态裁决。</td>
+              <td><code>hooks.rs</code>, <code>workspace_audit.rs</code>, hook installers</td>
+            </tr>
+            <tr>
+              <td><span class="status neutral">RuntimeStore</span></td>
+              <td>events、projections、commands、reports、artifacts、leases 的持久化。</td>
+              <td>业务决策；raw terminal display。</td>
+              <td><code>store.rs</code>, <code>store_sqlite.rs</code>, <code>store_json.rs</code></td>
+            </tr>
+          </tbody>
+        </table>
+      </section>
+
+      <section id="paths" class="grid three">
+        <div class="card daemon">
+          <span class="kicker">Path A</span>
+          <h3>派工路径</h3>
+          <ol class="mini-list">
+            <li>Codex 调 <code>agentcall_route</code>。</li>
+            <li>MCP 转发到 <code>/api/mcp/call</code>。</li>
+            <li>daemon 校验 route、租约、write/report/scratch 边界。</li>
+            <li>创建 handoff/context packet。</li>
+            <li>启动 PTY worker，写 route/session projection。</li>
+          </ol>
+        </div>
+        <div class="card hook">
+          <span class="kicker">Path B</span>
+          <h3>观测写入路径</h3>
+          <ol class="mini-list">
+            <li>Claude worker 执行工具或出现菜单。</li>
+            <li>hook POST <code>/api/hooks/ingest</code>。</li>
+            <li>daemon 绑定 wrapper session，记录 file claim / policy / report evidence。</li>
+            <li><code>append_agent_event</code> 更新 event + projection。</li>
+            <li>store writer 顺序落库。</li>
+          </ol>
+        </div>
+        <div class="card store">
+          <span class="kicker">Path C</span>
+          <h3>观察读取路径</h3>
+          <ol class="mini-list">
+            <li>Codex 调 <code>agentcall_board</code> 或 <code>agentcall_session</code>。</li>
+            <li>daemon 读取 projection / summary。</li>
+            <li>返回 compact state、why、primary_action。</li>
+            <li>只有 debug/raw 才展开 terminal/events。</li>
+          </ol>
+        </div>
+      </section>
+
+      <section id="state" class="panel">
+        <h2>状态与读写边界</h2>
+        <div class="callout good">
+          <strong>核心原则：</strong>写路径可以重，读路径必须轻。hook、route、command 可以写 store；board/session 默认应读 projection，不应顺手 cleanup、不应扫大日志、不应重算 PTY 状态墙。
+        </div>
+        <div class="grid two">
+          <div class="card hook">
+            <h3>写路径：会改变系统</h3>
+            <ul class="mini-list">
+              <li><code>POST /api/routes</code> 创建 route、lease、session。</li>
+              <li><code>POST /api/hooks/ingest</code> 记录 hook event、policy、claim、report evidence。</li>
+              <li><code>agentcall_session_send</code> 生成 command envelope 并进入 SessionActor。</li>
+              <li>SQLite 使用 WAL + single daemon writer，避免多 writer 争抢。</li>
+            </ul>
+          </div>
+          <div class="card store">
+            <h3>读路径：默认不改变系统</h3>
+            <ul class="mini-list">
+              <li><code>GET /api/board?view=compact</code> 应只返回当前 compact projection。</li>
+              <li><code>agentcall_session(view=summary)</code> 是 projection-first summary。</li>
+              <li><code>runtime_health</code> 用于可用性，不应做维护写入。</li>
+              <li>debug/raw 读取才允许大 payload、大 terminal、事件展开。</li>
+            </ul>
+          </div>
+        </div>
+        <div class="callout bad">
+          <strong>当前最容易乱的点：</strong>“冷读 projection”不自动等于“返回小而当前的集合”。如果 projection store 里保留大量历史 session，compact board 必须有当前性过滤或冷却索引，否则 HTTP 可能很快但 payload 过大，MCP/前端仍会超时。
+        </div>
+      </section>
+
+      <section id="workspace" class="panel">
+        <h2>Workspace 模型</h2>
+        <div class="grid four">
+          <div class="card">
+            <span class="kicker">daemon workspace</span>
+            <h3>AgentCall 仓库</h3>
+            <p>daemon state、logs、runtime config、plugin、docs 所在目录，例如 <code>E:\Project\AgentCall</code>。</p>
+          </div>
+          <div class="card">
+            <span class="kicker">target workspace</span>
+            <h3>任务目标目录</h3>
+            <p><code>agentcall_route(workspace=...)</code> 指向的项目。write_paths、report_path、workspace audit 都围绕它判断。</p>
+          </div>
+          <div class="card">
+            <span class="kicker">claude_workspace</span>
+            <h3>Claude 进程 cwd</h3>
+            <p>来自 <code>config/agentcall.local.json</code>。Claude Code PTY worker 在这里启动，并读取该目录 hooks。</p>
+          </div>
+          <div class="card">
+            <span class="kicker">report workspace</span>
+            <h3>报告落点</h3>
+            <p>route 明确或 daemon minted 的 <code>report_path</code>。report worker 可共享 workspace lease，但只写 report/scratch。</p>
+          </div>
+        </div>
+      </section>
+
+      <section id="tools" class="panel">
+        <h2>MCP 工具面</h2>
+        <table>
+          <thead>
+            <tr>
+              <th>工具</th>
+              <th>正常用途</th>
+              <th>背后 HTTP / daemon 模块</th>
+              <th>注意事项</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td><code>agentcall_daemon</code></td>
+              <td>status/start，确认 daemon 可用和版本。</td>
+              <td><code>bootstrap.rs</code>, <code>/api/runtime/health</code></td>
+              <td>v6.9.1 用 manifest 校验 daemon 版本和 binary path。</td>
+            </tr>
+            <tr>
+              <td><code>agentcall_board</code></td>
+              <td>默认 compact/attention，查看当前需要关注的 worker。</td>
+              <td><code>mcp.rs</code> → <code>summary.rs</code> → <code>projection.rs</code></td>
+              <td>不应返回历史 projection；历史属于 debug/raw。</td>
+            </tr>
+            <tr>
+              <td><code>agentcall_route</code></td>
+              <td>启动 daemon-owned PTY worker。</td>
+              <td><code>routes.rs</code>, <code>session.rs</code>, <code>prompt_gate.rs</code></td>
+              <td>正常 worker 只有 <code>coding</code> 和 <code>report</code> 两类。</td>
+            </tr>
+            <tr>
+              <td><code>agentcall_session</code></td>
+              <td>读取单 worker summary、primary_action、policy、report。</td>
+              <td><code>worker_state.rs</code>, <code>summary.rs</code></td>
+              <td>默认 summary；raw/TUI/events 是显式调试面。</td>
+            </tr>
+            <tr>
+              <td><code>agentcall_session_send</code></td>
+              <td>选择菜单、请求报告、stop/kill、approve_changed_dir。</td>
+              <td><code>commands.rs</code>, <code>actor.rs</code>, <code>workspace_audit.rs</code></td>
+              <td>破坏性/阶段切换动作需要 control token。</td>
+            </tr>
+            <tr>
+              <td><code>agentcall_report</code></td>
+              <td>request/accept 报告，读取 confidence。</td>
+              <td><code>mcp.rs</code>, <code>confidence.rs</code></td>
+              <td><code>overall=high</code> 需要 daemon-observed evidence。</td>
+            </tr>
+          </tbody>
+        </table>
+      </section>
+
+      <section id="lifecycle" class="panel">
+        <h2>Worker 生命周期</h2>
+        <div class="swimlane">
+          <div class="lane">
+            <div class="lane-title codex">Codex</div>
+            <div class="lane-body">
+              <div class="step"><strong>Plan</strong><span>决定 objective / write_paths / report_path</span></div>
+              <div class="step"><strong>Route</strong><span>调用 agentcall_route</span></div>
+              <div class="step"><strong>Observe</strong><span>读 board/session primary_action</span></div>
+              <div class="step"><strong>Accept</strong><span>验收 report confidence</span></div>
+            </div>
+          </div>
+          <div class="lane">
+            <div class="lane-title daemon">Daemon</div>
+            <div class="lane-body">
+              <div class="step"><strong>Validate</strong><span>schema, leases, containment</span></div>
+              <div class="step"><strong>Spawn</strong><span>SessionActor + PTY</span></div>
+              <div class="step"><strong>Project</strong><span>events reduce to state</span></div>
+              <div class="step"><strong>Close</strong><span>release leases/claims</span></div>
+            </div>
+          </div>
+          <div class="lane">
+            <div class="lane-title worker">Claude PTY</div>
+            <div class="lane-body">
+              <div class="step"><strong>Start</strong><span>cwd = claude_workspace</span></div>
+              <div class="step"><strong>Prompt Ack</strong><span>UserPromptSubmit closes gate</span></div>
+              <div class="step"><strong>Work</strong><span>tools, reads, writes, report</span></div>
+              <div class="step"><strong>Exit</strong><span>stop/kill/normal close</span></div>
+            </div>
+          </div>
+          <div class="lane">
+            <div class="lane-title hook">Hooks</div>
+            <div class="lane-body">
+              <div class="step"><strong>Bind</strong><span>wrapper session ↔ Claude session</span></div>
+              <div class="step"><strong>Audit</strong><span>permission/menu/write evidence</span></div>
+              <div class="step"><strong>Heartbeat</strong><span>changed folders, not file list</span></div>
+              <div class="step"><strong>Report</strong><span>PostToolUse marks report_ready</span></div>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <section id="modules" class="panel">
+        <h2>代码地图</h2>
+        <div class="grid two">
+          <div>
+            <h3>Daemon crate</h3>
+            <table>
+              <tbody>
+                <tr><td><code>http.rs</code></td><td>HTTP router、auth、static board、MCP call endpoint。</td></tr>
+                <tr><td><code>mcp.rs</code></td><td>daemon-side tool implementation；board/route/session/report 的 MCP handler。</td></tr>
+                <tr><td><code>routes.rs</code></td><td>route 创建、context packet、PTY prompt、containment。</td></tr>
+                <tr><td><code>session.rs</code></td><td>PTY spawn/read/stop/cwd policy。</td></tr>
+                <tr><td><code>actor.rs</code></td><td>SessionActor command queue、ordered input、completion events。</td></tr>
+                <tr><td><code>hooks.rs</code></td><td>hook ingest、binding、claims、policy、report-ready detection。</td></tr>
+                <tr><td><code>projection.rs</code></td><td>event reducer、session projection、compact board items。</td></tr>
+                <tr><td><code>worker_state.rs</code></td><td>Codex-facing normalized worker state and actions。</td></tr>
+                <tr><td><code>summary.rs</code></td><td>board/session/runtime health summaries。</td></tr>
+                <tr><td><code>store*.rs</code></td><td>SQLite/JSON RuntimeStore、single writer wrapper。</td></tr>
+              </tbody>
+            </table>
+          </div>
+          <div>
+            <h3>MCP / Scripts / Plugin</h3>
+            <table>
+              <tbody>
+                <tr><td><code>agentcall-mcp/protocol.rs</code></td><td>MCP stdio loop、response cap。</td></tr>
+                <tr><td><code>agentcall-mcp/tools.rs</code></td><td>canonical tool schema，优先 live daemon schema。</td></tr>
+                <tr><td><code>agentcall-mcp/bootstrap.rs</code></td><td>daemon status/start、runtime identity manifest 校验。</td></tr>
+                <tr><td><code>agentcall_runtime_release.py</code></td><td>版本对齐、build、stop stale processes、sync runtime binaries、写 manifest、restart。</td></tr>
+                <tr><td><code>agentcall_arch_audit.py</code></td><td>架构静态约束：schema 对齐、compact board fast path、store transaction boundary。</td></tr>
+                <tr><td><code>plugins/agentcall</code></td><td>Codex plugin manifest、MCP command、supervisor skill。</td></tr>
+                <tr><td><code>web/board.*</code></td><td>浏览器控制面板。</td></tr>
+                <tr><td><code>config/*.json</code></td><td>daemon local config template and local-only token/cwd/store settings。</td></tr>
+              </tbody>
+            </table>
+          </div>
+        </div>
+      </section>
+
+      <section id="timeouts" class="panel">
+        <h2>超时排查入口</h2>
+        <div class="grid three">
+          <div class="card mcp">
+            <span class="kicker">1. Transport</span>
+            <h3>MCP 是否旧版本</h3>
+            <p>看 MCP 进程是否来自 <code>target/runtime/&lt;version&gt;</code>，以及 <code>agentcall-version.json</code> 是否匹配 daemon health。</p>
+          </div>
+          <div class="card daemon">
+            <span class="kicker">2. HTTP</span>
+            <h3>Daemon 是否慢</h3>
+            <p>直接测 <code>/api/runtime/health</code>、<code>/api/board?view=compact</code>、<code>/api/mcp/tools</code> 的耗时和响应体大小。</p>
+          </div>
+          <div class="card store">
+            <span class="kicker">3. Payload</span>
+            <h3>Board 是否过胖</h3>
+            <p>如果 HTTP 很快但响应体几百 KB，问题通常不是锁，而是 compact 返回了历史或过多字段。</p>
+          </div>
+        </div>
+        <details>
+          <summary>推荐现场命令</summary>
+          <pre>python agentcall.py daemon-health
+python agentcall.py verify-runtime-build
+powershell -NoProfile -Command "Get-CimInstance Win32_Process | ? { $_.Name -like 'agentcall*' } | select ProcessId,Name,ExecutablePath,CommandLine"
+curl -H "X-AgentCall-Token: &lt;token&gt;" "http://127.0.0.1:3293/api/board?view=compact&amp;filter=attention"</pre>
+        </details>
+      </section>
+
+      <section id="rules" class="panel">
+        <h2>架构规则</h2>
+        <div class="grid two">
+          <div class="callout good">
+            <strong>应该坚持</strong>
+            <ul class="mini-list">
+              <li>Codex 默认读 compact board/session projection。</li>
+              <li>daemon 是 live state authority。</li>
+              <li>SQLite 一条 daemon writer 写入；普通 reads 不做维护写。</li>
+              <li>worker 默认 PTY-first，可见、可 hook、可 report。</li>
+              <li>control token 只在需要控制权时短期暴露。</li>
+            </ul>
+          </div>
+          <div class="callout bad">
+            <strong>必须避免</strong>
+            <ul class="mini-list">
+              <li>board 读路径顺手 cleanup 或扫所有历史 projection。</li>
+              <li>MCP 用旧 debug binary 连接新 daemon。</li>
+              <li>把 route workspace 误认为 Claude process cwd。</li>
+              <li>用 raw terminal 文本替代 hook/report/daemon structured state。</li>
+              <li>让 Python 脚本成为 live state writer。</li>
+            </ul>
+          </div>
+        </div>
+      </section>
+
+      <section class="footer">
+        <p>Generated for AgentCall v6.9.1 architecture review. Source references: <code>README.md</code>, <code>docs/architecture.md</code>, <code>crates/agentcall-daemon/src</code>, <code>crates/agentcall-mcp/src</code>.</p>
+      </section>
+    </main>
+  </div>
+</body>
+</html>

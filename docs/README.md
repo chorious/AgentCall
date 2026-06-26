@@ -1,8 +1,8 @@
 # AgentCall Docs
 
-v6.9.1 keeps lightweight folder audit for monitored Bash, hardens MCP/daemon runtime identity with a release-injected manifest, and makes compact board a cold store-projection read.
+v6.9.2 keeps lightweight folder audit for coding/edit Bash, gates compact board through the current live-session index, introduces `workspace_contract.v1`, tightens report/review created-artifact writes, and repository-manages `agentcall-flow`.
 
-这是 AgentCall 的文档索引。当前主线是 `v6.9.1`：Codex 通过 AgentCall MCP/daemon 指挥 Claude Code PTY utility workers，daemon 负责状态权威、hook-aware projection、bounded write policy、folder heartbeat audit、cold compact board、枚举化安全锁错误、SQLite single-writer WAL store、prompt gate 自动自愈，以及按 Codex session/thread owner 隔离的 worker 并发额度。正常 worker 只剩 `coding` 与 `report` 两类；`read_only` route 线已移除。
+这是 AgentCall 的文档索引。当前主线是 `v6.9.2`：Codex 通过 AgentCall MCP/daemon 指挥 Claude Code PTY utility workers，daemon 负责状态权威、hook-aware projection、bounded write policy、folder heartbeat audit、cold compact board、枚举化安全锁错误、SQLite single-writer WAL store、prompt gate 自动自愈，以及按 Codex session/thread owner 隔离的 worker 并发额度。正常 worker 只剩 `coding` 与 `report` 两类；`read_only` route 线已移除。
 
 ## 当前入口
 
